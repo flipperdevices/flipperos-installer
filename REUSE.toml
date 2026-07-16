@@ -1,0 +1,24 @@
+version = 1
+
+# Everything in this repository that we author is MIT-licensed. Files that
+# cannot carry an SPDX header (configs, lockfiles, the shell script, etc.) are
+# covered here. The vendored font lives in the third_party/flipctl-fonts git
+# submodule and carries its own licenses.
+
+[[annotations]]
+path = [
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    ".gitignore",
+    ".gitmodules",
+    ".cargo/config.toml",
+    "REUSE.toml",
+    "src/**",
+    "config/**",
+    "scripts/**",
+    "examples/**",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Flipper FZCO"
+SPDX-License-Identifier = "MIT"

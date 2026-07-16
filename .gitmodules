@@ -1,0 +1,4 @@
+[submodule "third_party/flipctl-fonts"]
+	path = third_party/flipctl-fonts
+	url = https://github.com/flipperdevices/flipctl-fonts.git
+	branch = dev

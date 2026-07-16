@@ -1,0 +1,319 @@
+//! Image catalog: reads the two-level build listings published by the image
+//! server (and any removable-media mirror of the same layout).
+//!
+//! Layout:
+//!   `<base>/u-boot/manifest.json`            -> list of U-Boot build dirs
+//!   `<base>/u-boot/<dir>/manifest.json`      -> files incl. `<board>/u-boot-rockchip.bin`
+//!   `<base>/rootfs/manifest.json`            -> list of rootfs build dirs
+//!   `<base>/rootfs/<dir>/manifest.json`      -> `<Profile>_<build>_stock[_inc]_pack.zst`
+//!
+//! `<base>` is an HTTP(S) URL for the server or a filesystem path for media.
+
+use std::io::Read;
+use std::time::Duration;
+
+use serde::Deserialize;
+
+use crate::core::model::{BuildDetails, PackFile, ProfilePack, SnapshotBuild, Source, UbootBuild};
+
+/// A place to read the catalog from.
+#[derive(Clone, Debug)]
+pub enum Origin {
+    /// The remote image server, rooted at an HTTP(S) base URL.
+    Server { base: String },
+    /// A mounted removable-media mirror, rooted at a directory.
+    Media { device: String, root: String },
+}
+
+impl Origin {
+    fn base(&self) -> &str {
+        match self {
+            Origin::Server { base } => base,
+            Origin::Media { root, .. } => root,
+        }
+    }
+
+    fn source(&self) -> Source {
+        match self {
+            Origin::Server { .. } => Source::Server,
+            Origin::Media { device, root } => Source::Removable {
+                device: device.clone(),
+                mountpoint: root.clone(),
+            },
+        }
+    }
+
+    /// Join a relative path onto the base, preserving a trailing slash in `rel`.
+    fn join(&self, rel: &str) -> String {
+        let base = self.base().trim_end_matches('/');
+        format!("{base}/{}", rel.trim_start_matches('/'))
+    }
+}
+
+/// Map a detected board id to the server's per-board U-Boot directory.
+pub fn board_dir(board_id: &str) -> &'static str {
+    match board_id {
+        "flipper-one" => "flipper-one",
+        _ => "generic",
+    }
+}
+
+/// The device types (image-server board ids) offered by the latest U-Boot build.
+///
+/// The newest U-Boot build directory's manifest lists a
+/// `<device-type>/u-boot-rockchip.bin` for every supported board, so the set of
+/// those `<device-type>` path segments is exactly the list of devices we can
+/// install onto. Returns an empty vector if the server is unreachable.
+pub fn supported_device_types(origin: &Origin) -> Vec<String> {
+    let list: ListManifest = match fetch_json(&origin.join("u-boot/manifest.json")) {
+        Ok(l) => l,
+        Err(_) => return Vec::new(),
+    };
+    let Some(newest) = newest_first(list.directories, 1).into_iter().next() else {
+        return Vec::new();
+    };
+    // Directory names already carry a trailing slash; normalise so we don't emit
+    // a double slash that the object store would reject.
+    let manifest_loc = origin.join(&format!(
+        "u-boot/{}/manifest.json",
+        newest.name.trim_end_matches('/')
+    ));
+    let bm: BuildManifest = match fetch_json(&manifest_loc) {
+        Ok(m) => m,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut types: Vec<String> = Vec::new();
+    for f in &bm.files {
+        if let Some(dir) = f.path.strip_suffix("/u-boot-rockchip.bin") {
+            let id = dir.rsplit('/').next().unwrap_or(dir).to_string();
+            if !id.is_empty() && !types.contains(&id) {
+                types.push(id);
+            }
+        }
+    }
+    types.sort();
+    types
+}
+
+/// List the available U-Boot builds for `board_dir`, newest first (capped).
+pub fn uboot_builds(origin: &Origin, board_dir: &str, limit: usize) -> Vec<UbootBuild> {
+    let list: ListManifest = match fetch_json(&origin.join("u-boot/manifest.json")) {
+        Ok(l) => l,
+        Err(_) => return Vec::new(),
+    };
+    newest_first(list.directories, limit)
+        .into_iter()
+        .map(|d| {
+            let base_location = origin.join(&format!("u-boot/{}", d.name));
+            let image_location = format!("{base_location}{board_dir}/u-boot-rockchip.bin");
+            UbootBuild {
+                id: d.name.clone(),
+                label: uboot_label(&d.name),
+                mtime: d.mtime.unwrap_or_default(),
+                image_location,
+                manifest_location: format!("{base_location}manifest.json"),
+                source: origin.source(),
+                size_bytes: 0,
+                details: None,
+            }
+        })
+        .collect()
+}
+
+/// List the available snapshot (rootfs) builds, newest first (capped). Profile
+/// packs are loaded lazily via [`load_profiles`].
+pub fn snapshot_builds(origin: &Origin, limit: usize) -> Vec<SnapshotBuild> {
+    let list: ListManifest = match fetch_json(&origin.join("rootfs/manifest.json")) {
+        Ok(l) => l,
+        Err(_) => return Vec::new(),
+    };
+    newest_first(list.directories, limit)
+        .into_iter()
+        .map(|d| SnapshotBuild {
+            id: d.name.clone(),
+            label: snapshot_label(&d.name),
+            mtime: d.mtime.unwrap_or_default(),
+            source: origin.source(),
+            base_location: origin.join(&format!("rootfs/{}", d.name)),
+            build_number: None,
+            profiles: Vec::new(),
+            loaded: false,
+            details: None,
+        })
+        .collect()
+}
+
+/// Fetch a build's `manifest.json` and return its `build` + `sourcestamps`
+/// sections (the build metadata and the source revisions that went into it).
+pub fn load_details(manifest_location: &str) -> Result<BuildDetails, String> {
+    fetch_json(manifest_location)
+}
+
+/// Fetch a build's manifest and extract its per-profile packs.
+pub fn load_profiles(build: &SnapshotBuild) -> Result<(Option<u64>, Vec<ProfilePack>), String> {
+    let manifest_loc = format!("{}manifest.json", build.base_location);
+    let bm: BuildManifest = fetch_json(&manifest_loc)?;
+
+    let mut profiles: Vec<ProfilePack> = Vec::new();
+    for f in &bm.files {
+        let fname = f.path.rsplit('/').next().unwrap_or(&f.path);
+        let Some((name, build_num, is_inc)) = parse_pack(fname) else {
+            continue;
+        };
+        let pack = PackFile {
+            location: format!("{}{}", build.base_location, fname),
+            source: build.source.clone(),
+            size_bytes: f.size,
+        };
+        let entry = match profiles.iter_mut().find(|p| p.name == name) {
+            Some(p) => p,
+            None => {
+                profiles.push(ProfilePack {
+                    name: name.clone(),
+                    build: build_num.clone(),
+                    full: None,
+                    incremental: None,
+                });
+                profiles.last_mut().unwrap()
+            }
+        };
+        if is_inc {
+            entry.incremental = Some(pack);
+        } else {
+            entry.full = Some(pack);
+        }
+    }
+
+    // Minimal first, then the rest alphabetically.
+    profiles.sort_by(|a, b| {
+        b.is_minimal()
+            .cmp(&a.is_minimal())
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    Ok((bm.build.number, profiles))
+}
+
+// --- manifest schema -------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct ListManifest {
+    #[serde(default)]
+    directories: Vec<DirEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DirEntry {
+    name: String,
+    #[serde(default)]
+    mtime: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BuildManifest {
+    #[serde(default)]
+    build: BuildMeta,
+    #[serde(default)]
+    files: Vec<FileEntry>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct BuildMeta {
+    #[serde(default)]
+    number: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FileEntry {
+    path: String,
+    #[serde(default)]
+    size: u64,
+}
+
+// --- helpers ---------------------------------------------------------------
+
+/// Sort directory entries by mtime descending and cap the count.
+fn newest_first(mut dirs: Vec<DirEntry>, limit: usize) -> Vec<DirEntry> {
+    dirs.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+    dirs.truncate(limit);
+    dirs
+}
+
+fn uboot_label(dir: &str) -> String {
+    let first = dir.split('/').next().unwrap_or(dir);
+    let hash = first.strip_prefix("u=").unwrap_or(first);
+    format!("u-boot {}", short(hash))
+}
+
+fn snapshot_label(dir: &str) -> String {
+    for seg in dir.trim_end_matches('/').split("__") {
+        if let Some(h) = seg.strip_prefix("linux-mainline=") {
+            return format!("rootfs ml:{}", short(h));
+        }
+    }
+    "rootfs".to_string()
+}
+
+fn short(hash: &str) -> String {
+    hash.chars().take(7).collect()
+}
+
+/// Parse a pack filename into `(profile, build, is_incremental)`.
+/// Accepts `<Profile>_<build>_stock_pack.zst` and `..._stock_inc_pack.zst`.
+fn parse_pack(fname: &str) -> Option<(String, String, bool)> {
+    let stem = fname.strip_suffix(".zst")?;
+    let (rest, is_inc) = if let Some(r) = stem.strip_suffix("_stock_inc_pack") {
+        (r, true)
+    } else if let Some(r) = stem.strip_suffix("_stock_pack") {
+        (r, false)
+    } else {
+        return None;
+    };
+    // `rest` is `<Profile>_<build>`; strip the trailing `_<digits>`.
+    let idx = rest.rfind('_')?;
+    let (name, num) = rest.split_at(idx);
+    let num = &num[1..];
+    if name.is_empty() || num.is_empty() || !num.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some((name.to_string(), num.to_string(), is_inc))
+}
+
+fn fetch_json<T: serde::de::DeserializeOwned>(location: &str) -> Result<T, String> {
+    let bytes = fetch_bytes(location)?;
+    serde_json::from_slice(&bytes).map_err(|e| format!("parse {location}: {e}"))
+}
+
+/// Read a (small) manifest into memory from an HTTP URL or a local path.
+fn fetch_bytes(location: &str) -> Result<Vec<u8>, String> {
+    if location.starts_with("http://") || location.starts_with("https://") {
+        let resp = ureq::get(location)
+            .timeout(Duration::from_secs(20))
+            .call()
+            .map_err(|e| format!("GET {location}: {e}"))?;
+        let mut buf = Vec::new();
+        // Manifests are small; cap to guard against surprises.
+        resp.into_reader()
+            .take(32 * 1024 * 1024)
+            .read_to_end(&mut buf)
+            .map_err(|e| format!("read {location}: {e}"))?;
+        Ok(buf)
+    } else {
+        std::fs::read(location).map_err(|e| format!("read {location}: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_pack;
+
+    #[test]
+    fn parses_pack_names() {
+        assert_eq!(parse_pack("Minimal_688_stock_pack.zst"), Some(("Minimal".to_string(), "688".to_string(), false)));
+        assert_eq!(parse_pack("Desktop_688_stock_inc_pack.zst"), Some(("Desktop".to_string(), "688".to_string(), true)));
+        assert_eq!(parse_pack("TV-Media-Box_688_stock_inc_pack.zst"), Some(("TV-Media-Box".to_string(), "688".to_string(), true)));
+        assert_eq!(parse_pack("No-Graphics_688_stock_pack.zst"), Some(("No-Graphics".to_string(), "688".to_string(), false)));
+        assert_eq!(parse_pack("debian-rootfs.img.zst"), None);
+        assert_eq!(parse_pack("debian-rootfs.img.bmap"), None);
+    }
+}

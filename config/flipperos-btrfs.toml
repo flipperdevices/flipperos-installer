@@ -1,0 +1,51 @@
+# FlipperOS Btrfs layout.
+#
+# Describes the shared, top-level Btrfs subvolume skeleton that the installer
+# creates on every install. It mirrors the build recipe
+# (flipperone-linux-build-scripts/debian-rk3576-img.yaml).
+#
+# The per-profile root subvolumes (@Minimal, @Desktop, @Router, …) are NOT
+# listed here: they are received from the selected snapshot streams and are
+# recreated at the Btrfs top level by `btrfs receive`.
+#
+# To override this on a per-image basis, ship a customised copy next to your
+# image manifest as `btrfs-layout.toml`:
+#   - removable media: <mount>/flipperos/<board_id>/btrfs-layout.toml
+#   - image server:    <server>/boards/<board_id>/btrfs-layout.toml
+# The installer prefers the image-shipped file and falls back to this built-in one.
+
+# Filesystem label passed to mkfs.btrfs, and the fs-wide mount options used while
+# laying out the volume. `ssd` is intentional: loopback/eMMC is not reliably
+# detected as non-rotational.
+label = "flipperos"
+options = "compress=zstd,noatime,ssd,discard=async"
+
+# /boot is a shared TOP-LEVEL subvolume named "boot" (not "@boot"), so it sits
+# outside the per-profile roots: one shared /boot that profile snapshots never
+# capture, which U-Boot (reading the default/top-level subvolume) resolves
+# /boot/... straight into. Kept uncompressed so U-Boot can always read the
+# kernel/dtb/initrd regardless of whether its Btrfs driver has zstd support.
+[[subvolume]]
+name = "boot"
+mountpoint = "/boot"
+compression = "none"
+
+[[subvolume]]
+name = "@home"
+mountpoint = "/home"
+
+[[subvolume]]
+name = "@var-log"
+mountpoint = "/var/log"
+# journald's append-heavy writes fragment badly under Btrfs copy-on-write.
+# Pre-create the journal directory NODATACOW so the files written on first boot
+# inherit it.
+nodatacow = ["journal"]
+
+[[subvolume]]
+name = "@var-cache"
+mountpoint = "/var/cache"
+
+# Runtime snapshots live here; created but never auto-mounted (no fstab entry).
+[[subvolume]]
+name = "@snapshots"

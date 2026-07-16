@@ -1,0 +1,25 @@
+# Static, self-contained builds for the initramfs binary.
+#
+# The installer is meant to be linked against musl so it can run from a minimal
+# initramfs without a dynamic loader or glibc. Build with one of:
+#
+#   # On-device target (RK3576 is ARMv8):
+#   rustup target add aarch64-unknown-linux-musl
+#   cargo build --release --target aarch64-unknown-linux-musl
+#
+#   # Host testing:
+#   rustup target add x86_64-unknown-linux-musl
+#   cargo build --release --target x86_64-unknown-linux-musl
+#
+# The GUI (Slint LinuxKMS) links against libdrm/libinput/libudev. For a fully
+# static build those must be available as static libraries for the target, or
+# build the slim TUI-only variant:
+#
+#   cargo build --release --no-default-features --features tui \
+#       --target aarch64-unknown-linux-musl
+
+[target.aarch64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-feature=+crt-static"]

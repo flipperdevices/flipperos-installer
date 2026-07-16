@@ -1,0 +1,68 @@
+[package]
+name = "flipperos-installer"
+version = "0.1.0"
+edition = "2021"
+description = "On-device installer for Rockchip RK3576 FlipperOS boards, run from initramfs."
+license = "MIT"
+readme = "README.md"
+
+# The installer is meant to be a tiny, statically linked initramfs binary. Keep the
+# release profile aggressive about size.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[features]
+# By default we ship both frontends so a single binary can drive the serial
+# console (TUI) and the on-device screen (GUI) at the same time. Slim builds can
+# select a single frontend, e.g. `--no-default-features --features tui`.
+default = ["tui", "gui"]
+tui = ["dep:cursive"]
+gui = ["dep:slint"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Small, rustls-based HTTP client so we can link statically without OpenSSL.
+ureq = { version = "2", default-features = false, features = ["json", "tls"] }
+log = "0.4"
+# Pure-Rust GPT partitioning so we don't need to shell out to sgdisk (which would
+# also drag libstdc++ into the initramfs).
+gpt = "4"
+# Random partition GUIDs for the GPT entries.
+uuid = { version = "1", features = ["v4"] }
+# Human-editable Btrfs layout config.
+toml = "0.8"
+# Pure-Rust zstd decompressor for the snapshot packs (decompress-only, so no C
+# dependency — keeps the static musl build simple).
+ruzstd = "0.7"
+
+# TUI frontend (serial console / any terminal).
+[dependencies.cursive]
+version = "0.21"
+default-features = false
+features = ["crossterm-backend"]
+optional = true
+
+# GUI frontend for the Flipper One DRM/KMS screen. The `-noseat` backend variant
+# talks to DRM/libinput directly, which is what we want inside an initramfs where
+# there is no seatd/logind session.
+[dependencies.slint]
+version = "1.8"
+default-features = false
+features = ["compat-1-2", "renderer-software", "backend-linuxkms-noseat"]
+optional = true
+
+# Off-device visual testing: render the GUI through the same Slint software
+# renderer used on-device and save PNGs. Only pulled in for the screenshot
+# example, so it never touches the shipped initramfs binary.
+[dev-dependencies]
+png = "0.17"
+
+[[example]]
+name = "gui_screenshot"
+required-features = ["gui"]
+
