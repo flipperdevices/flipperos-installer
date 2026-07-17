@@ -75,6 +75,10 @@ pub struct StorageDevice {
     pub model: String,
     pub size_bytes: u64,
     pub removable: bool,
+    /// Native logical block (sector) size in bytes, as reported by the kernel.
+    /// 512 for most eMMC/SD, typically 4096 for UFS. GPT geometry must be
+    /// written in these units or the kernel won't recognise the table.
+    pub logical_block_size: u64,
 }
 
 impl StorageDevice {

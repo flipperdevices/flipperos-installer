@@ -34,6 +34,12 @@ pub fn enumerate() -> Vec<StorageDevice> {
         if size_bytes == 0 {
             continue;
         }
+        // `size` above is always in 512-byte units, but the *native* logical
+        // block size (needed to write a recognisable GPT) is separate — 512 on
+        // most eMMC/SD, 4096 on UFS. Fall back to 512 if the queue attribute is
+        // missing (e.g. an unusual virtual device).
+        let logical_block_size =
+            read_u64(&sysdir.join("queue/logical_block_size")).unwrap_or(SECTOR_SIZE);
         let removable = read_u64(&sysdir.join("removable")).unwrap_or(0) == 1;
         let model = read_trimmed(&sysdir.join("device/model"))
             .or_else(|| read_trimmed(&sysdir.join("device/name")))
@@ -46,6 +52,7 @@ pub fn enumerate() -> Vec<StorageDevice> {
             model,
             size_bytes,
             removable,
+            logical_block_size,
         });
     }
 

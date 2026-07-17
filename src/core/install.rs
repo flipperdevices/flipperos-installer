@@ -21,15 +21,16 @@ use crate::core::controller::{Config, Controller};
 use crate::core::layout::{self, Layout};
 use crate::core::model::{PackFile, ProfilePack, Source, StorageDevice, UbootBuild};
 
-/// RK3576 mask ROM reads `idbloader`/U-Boot starting at LBA 64 (32 KiB), which
-/// is the start of the `loader` partition (p1) below, so the image is written
-/// to that partition from its beginning.
-const SECTOR_SIZE: u64 = 512;
-
 // GPT layout used by FlipperOS images, as byte offsets from the start of disk.
+// These are absolute byte offsets, independent of the device's sector size;
+// `write_gpt` converts them to LBAs using the target's native block size.
 // loader:   [32 KiB, 60 MiB)  (holds idbloader + U-Boot)
 // metadata: [60 MiB, 64 MiB)
 // root:     [64 MiB, end]     (Btrfs)
+//
+// The RK3576 mask ROM reads `idbloader`/U-Boot starting at byte offset 32 KiB,
+// which is the start of the `loader` partition (p1), so the image is written
+// to that partition from its beginning.
 const LOADER_START: u64 = 32 * 1024;
 const METADATA_START: u64 = 60 * 1024 * 1024;
 const ROOT_START: u64 = 64 * 1024 * 1024;
@@ -121,7 +122,13 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
 
     // 2. Partition.
     tick(ctrl, "writing GPT");
-    write_gpt(cfg, ctrl, &device.path, device.size_bytes)?;
+    write_gpt(
+        cfg,
+        ctrl,
+        &device.path,
+        device.size_bytes,
+        device.logical_block_size,
+    )?;
 
     // 3. Bootloader.
     tick(ctrl, &format!("installing u-boot {}", uboot.label));
@@ -240,17 +247,30 @@ fn partition_path(disk: &str, index: u32) -> String {
     }
 }
 
-fn write_gpt(cfg: &Config, ctrl: &Controller, disk: &str, size_bytes: u64) -> Result<()> {
+fn write_gpt(
+    cfg: &Config,
+    ctrl: &Controller,
+    disk: &str,
+    size_bytes: u64,
+    sector_size: u64,
+) -> Result<()> {
     // Three-partition FlipperOS layout (loader / metadata / root), written
     // entirely in-process with the `gpt` crate (no sgdisk).
-    let s = SECTOR_SIZE;
+    //
+    // GPT geometry is expressed in logical blocks, so it must be laid out in
+    // the device's *native* sector size (512 on eMMC/SD, 4096 on UFS). The
+    // crate only knows 512 and 4096, so anything else is an error rather than a
+    // silent fall-back to a wrong size.
+    let lb_size = gpt::disk::LogicalBlockSize::try_from(sector_size)
+        .map_err(|_| format!("{disk}: unsupported logical block size {sector_size} (must be 512 or 4096)"))?;
+    let s = sector_size;
     let loader_first = LOADER_START / s;
     let metadata_first = METADATA_START / s;
     let root_first = ROOT_START / s;
 
     if cfg.dry_run {
         ctrl.log(format!(
-            "[dry-run] GPT on {disk}: loader[LBA {loader_first}..{}], metadata[{metadata_first}..{}], root[{root_first}..end]",
+            "[dry-run] GPT on {disk} ({sector_size}-byte sectors): loader[LBA {loader_first}..{}], metadata[{metadata_first}..{}], root[{root_first}..end]",
             metadata_first - 1,
             root_first - 1,
         ));
@@ -274,7 +294,7 @@ fn write_gpt(cfg: &Config, ctrl: &Controller, disk: &str, size_bytes: u64) -> Re
 
     let mut gdisk = gpt::GptConfig::new()
         .writable(true)
-        .logical_block_size(gpt::disk::LogicalBlockSize::Lb512)
+        .logical_block_size(lb_size)
         .create_from_device(file, None)
         .map_err(|e| format!("initialise GPT on {disk}: {e}"))?;
 
