@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use crate::core::controller::{Config, Controller};
 use crate::core::layout::{self, Layout};
-use crate::core::model::{PackFile, ProfilePack, Source, StorageDevice, UbootBuild};
+use crate::core::model::{PackFile, ProfilePack, Source, StorageDevice, StorageKind, UbootBuild};
 
 // GPT layout used by FlipperOS images, as byte offsets from the start of disk.
 // These are absolute byte offsets, independent of the device's sector size;
@@ -132,7 +132,7 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
 
     // 3. Bootloader.
     tick(ctrl, &format!("installing u-boot {}", uboot.label));
-    install_uboot(cfg, ctrl, &device.path, &uboot)?;
+    install_uboot(cfg, ctrl, &device, &uboot)?;
 
     // 4. Filesystem + subvolumes.
     tick(ctrl, &format!("mkfs.btrfs {root_part}"));
@@ -373,14 +373,48 @@ fn write_gpt(
     Ok(())
 }
 
-fn install_uboot(cfg: &Config, ctrl: &Controller, disk: &str, build: &UbootBuild) -> Result<()> {
+fn install_uboot(
+    cfg: &Config,
+    ctrl: &Controller,
+    device: &StorageDevice,
+    build: &UbootBuild,
+) -> Result<()> {
     // Write the image directly onto the loader partition (p1) from its start.
     // The GPT places p1 at the RK3576 mask-ROM offset, so this lands the
     // bootloader exactly where the boot ROM expects it. Wait for the freshly
     // created node before opening it.
-    let loader = partition_path(disk, LOADER_PART_INDEX);
+    let loader = partition_path(&device.path, LOADER_PART_INDEX);
     wait_for_device(cfg, ctrl, &loader)?;
-    write_source_to_offset(cfg, ctrl, &build.image_location, &build.source, &loader, 0)
+    write_source_to_offset(cfg, ctrl, &build.image_location, &build.source, &loader, 0, false)?;
+
+    // On UFS the RK3576 mask ROM fetches DRAM init + SPL from Boot LU A, and
+    // ignores the copy on the main LU's loader partition. Duplicate the leading
+    // part of the image onto Boot LU A at the same 32 KiB offset. The boot LU is
+    // small (typically 4 MiB) while the image is ~10 MiB, so we fill it and
+    // discard the tail: only the DRAM init + SPL at the front is needed there.
+    if device.kind == StorageKind::Ufs {
+        match crate::core::storage::find_ufs_boot_lu_a(&device.path) {
+            Some(boot_lu) => {
+                ctrl.log(format!("UFS target: mirroring u-boot to Boot LU A ({boot_lu})"));
+                wait_for_device(cfg, ctrl, &boot_lu)?;
+                write_source_to_offset(
+                    cfg,
+                    ctrl,
+                    &build.image_location,
+                    &build.source,
+                    &boot_lu,
+                    LOADER_START,
+                    true,
+                )?;
+            }
+            None => ctrl.log(format!(
+                "warning: {} is UFS but no Boot LU A was found — the mask ROM may \
+                 fail to load the bootloader; check the device's UFS provisioning",
+                device.path
+            )),
+        }
+    }
+    Ok(())
 }
 
 fn receive_pack(cfg: &Config, ctrl: &Controller, mnt: &str, pack: &PackFile) -> Result<()> {
@@ -655,6 +689,11 @@ fn open_source(location: &str, source: &Source) -> Result<Box<dyn Read + Send>> 
 
 /// Stream a source (HTTP URL for [`Source::Server`], local path otherwise)
 /// directly onto `device`, starting at `offset` bytes, then flush to disk.
+///
+/// When `fill` is set, the source is expected to be larger than the target: we
+/// write until the device runs out of space and treat that as success, so only
+/// the leading part that fits is kept (used to seed a small UFS boot LU with the
+/// front of the full U-Boot image). Otherwise a short write is an error.
 fn write_source_to_offset(
     cfg: &Config,
     ctrl: &Controller,
@@ -662,9 +701,13 @@ fn write_source_to_offset(
     source: &Source,
     device: &str,
     offset: u64,
+    fill: bool,
 ) -> Result<()> {
     if cfg.dry_run {
-        ctrl.log(format!("[dry-run] write {location} -> {device} @ offset {offset} B"));
+        ctrl.log(format!(
+            "[dry-run] write {location} -> {device} @ offset {offset} B{}",
+            if fill { " (fill, discarding overflow)" } else { "" }
+        ));
         return Ok(());
     }
     ctrl.log(format!("writing {location} -> {device} @ offset {offset} B"));
@@ -676,12 +719,51 @@ fn write_source_to_offset(
         .map_err(|e| format!("open {device}: {e}"))?;
     file.seek(SeekFrom::Start(offset))
         .map_err(|e| format!("seek {device} to {offset}: {e}"))?;
-    let written = io::copy(&mut reader, &mut file)
-        .map_err(|e| format!("write {location} to {device}: {e}"))?;
+    let written = if fill {
+        copy_until_full(&mut reader, &mut file)
+    } else {
+        io::copy(&mut reader, &mut file)
+    }
+    .map_err(|e| format!("write {location} to {device}: {e}"))?;
     file.sync_all()
         .map_err(|e| format!("sync {device}: {e}"))?;
     ctrl.log(format!("wrote {written} bytes to {device}"));
     Ok(())
+}
+
+/// Linux `errno` for "No space left on device" — what a `write(2)` past the end
+/// of a block device returns.
+const ENOSPC: i32 = 28;
+
+/// Copy `reader` into `writer` until the reader is exhausted *or* the writer
+/// runs out of space, returning the bytes written. Hitting the end of a
+/// fixed-size block device (a short write or `ENOSPC`) ends the copy cleanly
+/// rather than erroring — the caller intends to keep only the leading part.
+fn copy_until_full(reader: &mut dyn Read, writer: &mut impl io::Write) -> io::Result<u64> {
+    let mut buf = [0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        let mut off = 0;
+        while off < n {
+            match writer.write(&buf[off..n]) {
+                Ok(0) => return Ok(total), // device full: nothing more accepted
+                Ok(w) => {
+                    off += w;
+                    total += w as u64;
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(ref e) if e.raw_os_error() == Some(ENOSPC) => return Ok(total),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(total)
 }
 
 /// Spawn `cmd` and pump an arbitrary reader into its stdin, then wait.

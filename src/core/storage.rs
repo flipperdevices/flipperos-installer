@@ -16,6 +16,11 @@ const SYS_BLOCK: &str = "/sys/block";
 /// Linux reports sizes in 512-byte sectors regardless of physical block size.
 const SECTOR_SIZE: u64 = 512;
 
+/// Value of the UFS unit-descriptor `bBootLunID` attribute that marks a logical
+/// unit as Boot LU A (the one the RK3576 mask ROM reads early bootloader from).
+/// `0` means not bootable, `2` means Boot LU B.
+const BOOT_LUN_ID_A: u64 = 1;
+
 /// Smallest device we consider a viable *install target*. Anything smaller
 /// cannot hold the main GPT+Btrfs image; in particular it filters out the tiny
 /// UFS boot LUs (typically 4 MiB), so the operator never has to pick between a
@@ -131,6 +136,55 @@ fn has_ufs_host(real: &Path) -> bool {
         }
     }
     false
+}
+
+/// Given a whole-disk UFS device node (e.g. `/dev/sda`), find the block node
+/// backing Boot LU A (the "W-LU-A") on the *same physical device*, if present.
+///
+/// All logical units of one UFS device share a SCSI `host:channel:target` and
+/// differ only by LUN, appearing as sibling directories under the target dir in
+/// sysfs. On RK3576 the boot LU is a normal (small) LU rather than a well-known
+/// LUN, so we can't derive it from the LUN number; instead we read each
+/// sibling's UFS unit descriptor and pick the one whose `bBootLunID` marks it as
+/// Boot LU A. Returns `None` when no such LU exists (the caller then warns).
+pub fn find_ufs_boot_lu_a(disk: &str) -> Option<String> {
+    let name = disk.trim_start_matches("/dev/");
+    // The target LU's SCSI device dir, e.g. `.../target0:0:0/0:0:0:0`; its
+    // parent is the SCSI target shared by every LU of this physical device.
+    let scsi_dev = fs::canonicalize(Path::new(SYS_BLOCK).join(name).join("device")).ok()?;
+    let target_dir = scsi_dev.parent()?;
+
+    for entry in fs::read_dir(target_dir).ok()?.flatten() {
+        let lu = entry.path();
+        if read_boot_lun_id(&lu) != Some(BOOT_LUN_ID_A) {
+            continue;
+        }
+        // Resolve this LU's block node; skip it if it *is* the target (a data LU
+        // that also happens to be flagged bootable) — that's not a separate area.
+        if let Some(node) = lu_block_node(&lu) {
+            if node != disk {
+                return Some(node);
+            }
+        }
+    }
+    None
+}
+
+/// Read a UFS LU's `unit_descriptor/boot_lun_id` (`bBootLunID`). The kernel
+/// prints single-byte descriptor fields as `0x%02X`, so accept a `0x` prefix as
+/// well as a plain decimal value.
+fn read_boot_lun_id(lu_dir: &Path) -> Option<u64> {
+    let raw = read_trimmed(&lu_dir.join("unit_descriptor/boot_lun_id"))?;
+    match raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+        Some(hex) => u64::from_str_radix(hex, 16).ok(),
+        None => raw.parse().ok(),
+    }
+}
+
+/// The `/dev/...` node for a UFS LU given its sysfs SCSI-device directory.
+fn lu_block_node(lu_dir: &Path) -> Option<String> {
+    let entry = fs::read_dir(lu_dir.join("block")).ok()?.flatten().next()?;
+    Some(format!("/dev/{}", entry.file_name().to_string_lossy()))
 }
 
 fn read_u64(path: &Path) -> Option<u64> {
