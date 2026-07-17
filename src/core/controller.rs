@@ -402,5 +402,5 @@ impl Controller {
 /// Enumerate local storage; kept as a free function so tests and the
 /// [`Controller`] share one implementation.
 fn storage_list() -> Vec<StorageDevice> {
-    crate::core::storage::enumerate()
+    crate::core::storage::enumerate(crate::core::storage::MIN_TARGET_SIZE_BYTES)
 }

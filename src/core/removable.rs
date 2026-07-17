@@ -59,7 +59,8 @@ fn unescape_mount(s: &str) -> String {
 
 /// Map removable whole-disk devices to their kind for quick lookup.
 fn removable_devices() -> HashMap<String, StorageKind> {
-    storage::enumerate()
+    // Pass 0: source media may legitimately be smaller than an install target.
+    storage::enumerate(0)
         .into_iter()
         .filter(|d| d.removable)
         .map(|d| (d.path, d.kind))

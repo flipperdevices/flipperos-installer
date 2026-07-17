@@ -16,8 +16,16 @@ const SYS_BLOCK: &str = "/sys/block";
 /// Linux reports sizes in 512-byte sectors regardless of physical block size.
 const SECTOR_SIZE: u64 = 512;
 
-/// Enumerate candidate whole-disk storage devices.
-pub fn enumerate() -> Vec<StorageDevice> {
+/// Smallest device we consider a viable *install target*. Anything smaller
+/// cannot hold the main GPT+Btrfs image; in particular it filters out the tiny
+/// UFS boot LUs (typically 4 MiB), so the operator never has to pick between a
+/// UFS device's logical units in the target list.
+pub const MIN_TARGET_SIZE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Enumerate candidate whole-disk storage devices at least `min_size_bytes`
+/// large. Pass `0` to list every device regardless of size (e.g. when mapping
+/// removable *source* media, which may be smaller than an install target).
+pub fn enumerate(min_size_bytes: u64) -> Vec<StorageDevice> {
     let mut out = Vec::new();
     let entries = match fs::read_dir(SYS_BLOCK) {
         Ok(e) => e,
@@ -31,7 +39,7 @@ pub fn enumerate() -> Vec<StorageDevice> {
         }
         let sysdir = entry.path();
         let size_bytes = read_u64(&sysdir.join("size")).unwrap_or(0) * SECTOR_SIZE;
-        if size_bytes == 0 {
+        if size_bytes < min_size_bytes.max(1) {
             continue;
         }
         // `size` above is always in 512-byte units, but the *native* logical
