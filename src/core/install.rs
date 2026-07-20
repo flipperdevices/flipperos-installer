@@ -41,6 +41,12 @@ const LOADER_PART_INDEX: u32 = 1;
 /// The Btrfs root is the third partition.
 const ROOT_PART_INDEX: u32 = 3;
 
+/// Dedicated top-level directory that holds the read-only `*_stock` golden
+/// bases. The build scripts nest every received stock snapshot under it (see
+/// flipperone-linux-build-scripts@80dbfc8), keeping the Btrfs top level for
+/// profile roots and shared subvolumes; the installer mirrors that layout.
+const STOCK_SNAPSHOTS_DIR: &str = "@stock-snapshots";
+
 /// POSIX shell glue that chroots into a deployed profile and runs
 /// `kernel-install` for every installed kernel. Written to a temp path and
 /// executed once per profile at install time.
@@ -192,6 +198,16 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
     // block so we can always unmount afterwards, even when a btrfs command
     // fails partway through.
     let deploy = (|| -> Result<()> {
+        // The golden `*_stock` bases are all received under a dedicated
+        // @stock-snapshots directory; create it before the first receive.
+        exec(
+            cfg,
+            ctrl,
+            Command::new("mkdir")
+                .arg("-p")
+                .arg(format!("{mnt}/{STOCK_SNAPSHOTS_DIR}")),
+        )?;
+
         // 5a. Minimal base: full stock pack.
         let minimal_full = minimal
             .full
@@ -534,12 +550,13 @@ fn receive_pack(
     on_progress: &mut dyn FnMut(u64),
 ) -> Result<()> {
     // The packs are zstd-compressed `btrfs send` streams. Decompress in-process
-    // (libzstd via the `zstd` crate) and pipe the stream into `btrfs receive` at
-    // the top level, which recreates the profile's stock subvolume from the
-    // stream.
+    // (libzstd via the `zstd` crate) and pipe the stream into `btrfs receive`
+    // under @stock-snapshots, which recreates the profile's stock subvolume
+    // there. Incrementals find their Minimal parent in the same directory.
+    let target = format!("{mnt}/{STOCK_SNAPSHOTS_DIR}");
     if cfg.dry_run {
         ctrl.log(format!(
-            "[dry-run] zstd -d {} | btrfs receive {mnt}",
+            "[dry-run] zstd -d {} | btrfs receive {target}",
             pack.location
         ));
         return Ok(());
@@ -554,7 +571,7 @@ fn receive_pack(
     let decoder = zstd::stream::read::Decoder::new(reader)
         .map_err(|e| format!("zstd {}: {e}", pack.location))?;
     let mut recv = Command::new("btrfs");
-    recv.arg("receive").arg(mnt);
+    recv.arg("receive").arg(&target);
     pump_reader_into(ctrl, decoder, recv, &pack.location)
 }
 
@@ -565,15 +582,16 @@ fn make_writable_snapshot(
     stock: &str,
     root: &str,
 ) -> Result<()> {
-    // The received `*_stock` subvolume is the RO golden base; snapshot a writable
-    // deployable root from it (matching the build recipe).
+    // The received `*_stock` subvolume (under @stock-snapshots) is the RO golden
+    // base; snapshot a writable deployable root from it at the top level
+    // (matching the build recipe).
     exec(
         cfg,
         ctrl,
         Command::new("btrfs")
             .arg("subvolume")
             .arg("snapshot")
-            .arg(format!("{mnt}/{stock}"))
+            .arg(format!("{mnt}/{STOCK_SNAPSHOTS_DIR}/{stock}"))
             .arg(format!("{mnt}/{root}")),
     )
 }
@@ -595,8 +613,9 @@ fn make_filesystem(cfg: &Config, ctrl: &Controller, part: &str, layout: &Layout)
 
     let mnt = "/run/flipperos-install".to_string();
     exec(cfg, ctrl, Command::new("mkdir").arg("-p").arg(&mnt))?;
-    // Mount the Btrfs top level (subvolid=5) so we create the shared subvolumes
-    // and receive profile roots directly on it.
+    // Mount the Btrfs top level (subvolid=5) so we can create the shared
+    // subvolumes, the @stock-snapshots receive target, and the profile roots
+    // relative to it.
     exec(
         cfg,
         ctrl,
