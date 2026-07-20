@@ -66,6 +66,7 @@ fn main() {
     ui.set_installing(false);
     ui.set_progress(0.0);
     ui.set_can_install(true);
+    ui.set_install_status_text("ready".into());
     ui.set_status_text("unpacking Minimal_stock…".into());
 
     // Split into name (left) + detail (right, gray); builds also get a source
@@ -138,9 +139,11 @@ fn main() {
     ui.set_busy(true); // Phase::Installing is busy → Refresh soft button hidden.
     ui.set_progress(0.42);
     ui.set_can_install(false);
+    ui.set_install_status_text("in progress".into());
     shoot(&window, "02b-summary-installing");
     ui.set_installing(false);
     ui.set_busy(false);
+    ui.set_install_status_text("ready".into());
     ui.set_can_install(true);
     ui.set_progress(0.0);
 

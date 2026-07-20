@@ -19,7 +19,9 @@ use std::sync::Arc;
 
 use crate::core::controller::{Config, Controller};
 use crate::core::layout::{self, Layout};
-use crate::core::model::{PackFile, ProfilePack, Source, StorageDevice, StorageKind, UbootBuild};
+use crate::core::model::{
+    human_bytes, PackFile, ProfilePack, Source, StorageDevice, StorageKind, UbootBuild,
+};
 
 // GPT layout used by FlipperOS images, as byte offsets from the start of disk.
 // These are absolute byte offsets, independent of the device's sector size;
@@ -45,6 +47,59 @@ const ROOT_PART_INDEX: u32 = 3;
 const INSTALL_KERNEL_SH: &str = include_str!("../../scripts/flipperos-install-kernel.sh");
 
 type Result<T> = std::result::Result<T, String>;
+
+/// Coarse, step-based progress reporter for an install run. Each [`Ticker::begin`]
+/// marks the start of a discrete step and moves the bar to the fraction of steps
+/// completed so far; long steps can additionally animate within their own slice
+/// via [`Ticker::step_span`] + [`Controller::set_progress`].
+struct Ticker {
+    step: u32,
+    total: u32,
+}
+
+impl Ticker {
+    fn new(total: u32) -> Self {
+        Ticker { step: 0, total }
+    }
+
+    /// Advance to the next step: log `msg` and set the bar to the fraction of
+    /// steps completed *before* this one (so the step's own slice is left free
+    /// to fill in as it progresses).
+    fn begin(&mut self, ctrl: &Controller, msg: &str) {
+        self.step += 1;
+        ctrl.set_progress((self.step - 1) as f32 / self.total as f32);
+        ctrl.log(msg.to_string());
+    }
+
+    /// `(base, span)` of the current step's slice of the overall bar, so a step
+    /// can report intra-step progress as `set_progress(base + span * frac)`.
+    fn step_span(&self) -> (f32, f32) {
+        (
+            (self.step - 1) as f32 / self.total as f32,
+            1.0 / self.total as f32,
+        )
+    }
+}
+
+/// A `Read` adapter that reports the running total of bytes read to a callback
+/// after each read, used to surface transfer progress for the long profile
+/// receive step.
+struct ProgressReader<'a, R> {
+    inner: R,
+    read: u64,
+    on_progress: &'a mut dyn FnMut(u64),
+}
+
+impl<R: Read> Read for ProgressReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.read += n as u64;
+            (self.on_progress)(self.read);
+        }
+        Ok(n)
+    }
+}
 
 /// Run the whole installation. Called on a worker thread by the controller.
 pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
@@ -107,21 +162,16 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
     // 4 fixed steps, then receive + snapshot + kernel per deployed profile.
     let deployed = 1 + extras.len();
     let total_steps = 4 + deployed as u32 * 3;
-    let mut step = 0u32;
-    let mut tick = |ctrl: &Controller, msg: &str| {
-        step += 1;
-        ctrl.set_progress(step as f32 / total_steps as f32);
-        ctrl.log(msg.to_string());
-    };
+    let mut ticker = Ticker::new(total_steps);
 
     let root_part = partition_path(&device.path, ROOT_PART_INDEX);
 
     // 1. Wipe.
-    tick(ctrl, &format!("blkdiscard {}", device.path));
+    ticker.begin(ctrl, &format!("blkdiscard {}", device.path));
     exec(cfg, ctrl, Command::new("blkdiscard").arg("-f").arg(&device.path))?;
 
     // 2. Partition.
-    tick(ctrl, "writing GPT");
+    ticker.begin(ctrl, "writing GPT");
     write_gpt(
         cfg,
         ctrl,
@@ -131,11 +181,11 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
     )?;
 
     // 3. Bootloader.
-    tick(ctrl, &format!("installing u-boot {}", uboot.label));
+    ticker.begin(ctrl, &format!("installing u-boot {}", uboot.label));
     install_uboot(cfg, ctrl, &device, &uboot)?;
 
     // 4. Filesystem + subvolumes.
-    tick(ctrl, &format!("mkfs.btrfs {root_part}"));
+    ticker.begin(ctrl, &format!("mkfs.btrfs {root_part}"));
     let mnt = make_filesystem(cfg, ctrl, &root_part, &fs_layout)?;
 
     // The target is mounted from here on. Run the remaining steps in an inner
@@ -156,7 +206,7 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
             &minimal,
             minimal_full,
             "full",
-            &mut tick,
+            &mut ticker,
         )?;
 
         // 5b. Extra profiles: incremental packs on top of Minimal.
@@ -174,7 +224,7 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
                 p,
                 inc,
                 "incremental",
-                &mut tick,
+                &mut ticker,
             )?;
         }
         Ok(())
@@ -203,15 +253,57 @@ fn deploy_profile(
     profile: &ProfilePack,
     pack: &PackFile,
     kind: &str,
-    tick: &mut impl FnMut(&Controller, &str),
+    ticker: &mut Ticker,
 ) -> Result<()> {
-    tick(ctrl, &format!("receiving {} ({kind})", profile.name));
-    receive_pack(cfg, ctrl, mnt, pack)?;
+    ticker.begin(ctrl, &format!("receiving {} ({kind})", profile.name));
 
-    tick(ctrl, &format!("snapshotting {}", profile.root_subvol()));
+    // The receive is by far the longest step: decompressing and streaming a
+    // multi-hundred-MiB pack. Animate the bar within this step's slice and log a
+    // periodic percentage so neither frontend sits on a frozen bar. Progress is
+    // measured against the compressed pack size (what we read off the wire/disk).
+    let (base, span) = ticker.step_span();
+    let total = pack.size_bytes;
+    let name = profile.name.clone();
+    let mut last_pct: i64 = -1;
+    let mut last_bucket: i64 = -1;
+    let mut on_progress = |read: u64| {
+        if total > 0 {
+            let read = read.min(total);
+            let pct = (read * 100 / total) as i64;
+            if pct == last_pct {
+                return;
+            }
+            last_pct = pct;
+            ctrl.set_progress(base + span * (read as f32 / total as f32));
+            // Log at coarser 10% milestones to keep the activity log readable.
+            let bucket = pct / 10;
+            if bucket != last_bucket {
+                last_bucket = bucket;
+                ctrl.log(format!(
+                    "receiving {name} ({kind}): {pct}% ({} / {})",
+                    human_bytes(read),
+                    human_bytes(total),
+                ));
+            }
+        } else {
+            // Unknown pack size: can't scale the bar, but still show throughput
+            // every 32 MiB so the step isn't silent.
+            let bucket = (read / (32 * 1024 * 1024)) as i64;
+            if bucket != last_bucket {
+                last_bucket = bucket;
+                ctrl.log(format!(
+                    "receiving {name} ({kind}): {} received",
+                    human_bytes(read)
+                ));
+            }
+        }
+    };
+    receive_pack(cfg, ctrl, mnt, pack, &mut on_progress)?;
+
+    ticker.begin(ctrl, &format!("snapshotting {}", profile.root_subvol()));
     make_writable_snapshot(cfg, ctrl, mnt, &profile.stock_subvol(), &profile.root_subvol())?;
 
-    tick(ctrl, &format!("installing kernel for {}", profile.name));
+    ticker.begin(ctrl, &format!("installing kernel for {}", profile.name));
     install_kernel(
         cfg,
         ctrl,
@@ -434,7 +526,13 @@ fn install_uboot(
     Ok(())
 }
 
-fn receive_pack(cfg: &Config, ctrl: &Controller, mnt: &str, pack: &PackFile) -> Result<()> {
+fn receive_pack(
+    cfg: &Config,
+    ctrl: &Controller,
+    mnt: &str,
+    pack: &PackFile,
+    on_progress: &mut dyn FnMut(u64),
+) -> Result<()> {
     // The packs are zstd-compressed `btrfs send` streams. Decompress in-process
     // (libzstd via the `zstd` crate) and pipe the stream into `btrfs receive` at
     // the top level, which recreates the profile's stock subvolume from the
@@ -446,12 +544,18 @@ fn receive_pack(cfg: &Config, ctrl: &Controller, mnt: &str, pack: &PackFile) -> 
         ));
         return Ok(());
     }
-    let reader = open_source(&pack.location, &pack.source)?;
+    // Count bytes on the compressed source (before the decoder) so the reported
+    // progress lines up with the known compressed pack size.
+    let reader = ProgressReader {
+        inner: open_source(&pack.location, &pack.source)?,
+        read: 0,
+        on_progress,
+    };
     let decoder = zstd::stream::read::Decoder::new(reader)
         .map_err(|e| format!("zstd {}: {e}", pack.location))?;
     let mut recv = Command::new("btrfs");
     recv.arg("receive").arg(mnt);
-    pump_reader_into(ctrl, Box::new(decoder), recv, &pack.location)
+    pump_reader_into(ctrl, decoder, recv, &pack.location)
 }
 
 fn make_writable_snapshot(
@@ -586,7 +690,7 @@ fn install_kernel(
     sh.arg("-s").arg(&root).arg(&boot).arg(profile_name);
     let ran = pump_reader_into(
         ctrl,
-        Box::new(std::io::Cursor::new(INSTALL_KERNEL_SH.as_bytes())),
+        std::io::Cursor::new(INSTALL_KERNEL_SH.as_bytes()),
         sh,
         "kernel-install script",
     );
@@ -840,7 +944,7 @@ fn copy_until_full(reader: &mut dyn Read, writer: &mut impl io::Write) -> io::Re
 /// Spawn `cmd` and pump an arbitrary reader into its stdin, then wait.
 fn pump_reader_into(
     ctrl: &Controller,
-    mut reader: Box<dyn Read + Send>,
+    mut reader: impl Read,
     mut cmd: Command,
     label: &str,
 ) -> Result<()> {
@@ -899,4 +1003,48 @@ fn render(cmd: &Command) -> String {
         parts.push(arg.to_string_lossy().into_owned());
     }
     parts.join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn progress_reader_reports_cumulative_bytes() {
+        let mut seen: Vec<u64> = Vec::new();
+        let mut cb = |n: u64| seen.push(n);
+        let mut r = ProgressReader {
+            inner: Cursor::new(vec![0u8; 10]),
+            read: 0,
+            on_progress: &mut cb,
+        };
+        let mut buf = [0u8; 4];
+        let mut total = 0usize;
+        while let Ok(n) = r.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            total += n;
+        }
+        assert_eq!(total, 10);
+        // The callback sees a strictly increasing running total that ends at the
+        // full length (EOF's zero-length read reports nothing).
+        assert_eq!(seen.last().copied(), Some(10));
+        assert!(seen.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn ticker_step_spans_tile_the_bar() {
+        let mut t = Ticker::new(4);
+        t.step = 1;
+        let (base, span) = t.step_span();
+        assert!(base.abs() < 1e-6);
+        assert!((span - 0.25).abs() < 1e-6);
+        // The last step's slice ends exactly at a full bar.
+        t.step = 4;
+        let (base, span) = t.step_span();
+        assert!((base - 0.75).abs() < 1e-6);
+        assert!((base + span - 1.0).abs() < 1e-6);
+    }
 }

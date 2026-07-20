@@ -611,7 +611,7 @@ fn overview_labels(state: &AppState) -> Vec<String> {
     } else {
         "Minimal".to_string()
     };
-    let inst = if state.can_install() { "ready" } else { "incomplete" };
+    let inst = state.install_status_label();
     vec![
         format!("{:<9}{}", "Device", dev),
         format!("{:<9}{}", "U-Boot", ub),

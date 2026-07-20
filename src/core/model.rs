@@ -390,6 +390,17 @@ impl AppState {
             && self.selected_build().and_then(|b| b.minimal()).is_some()
     }
 
+    /// Short label for the "Install" summary row shared by both frontends:
+    /// "in progress" during a healthy run, "ready" when a run can be started,
+    /// else "incomplete" (a selection is still missing).
+    pub fn install_status_label(&self) -> &'static str {
+        match self.phase {
+            Phase::Installing => "in progress",
+            _ if self.can_install() => "ready",
+            _ => "incomplete",
+        }
+    }
+
     /// The currently selected target device, if any.
     pub fn target(&self) -> Option<&StorageDevice> {
         let path = self.selection.target_device.as_deref()?;

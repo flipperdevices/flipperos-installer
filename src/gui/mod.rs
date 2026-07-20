@@ -412,6 +412,8 @@ slint::slint! {
         in property <string> status-text;
         in property <float> progress;
         in property <bool> can-install;
+        // "ready" / "in progress" / "incomplete" for the Install summary row.
+        in property <string> install-status-text;
         // True once installation has started; gates the progress bar + log line
         // (which replace the idle info line).
         in property <bool> installing;
@@ -695,8 +697,10 @@ slint::slint! {
                 }
                 MenuRow {
                     label: "Install";
-                    value: root.can-install ? "ready" : "incomplete";
-                    dim-value: !root.can-install;
+                    value: root.install-status-text;
+                    // Dim only when nothing can happen yet; a running install
+                    // ("in progress") stays bright even though can-install is false.
+                    dim-value: !root.can-install && !root.installing;
                     selected: root.menu-index == 4;
                     action: true;
                 }
@@ -1226,6 +1230,7 @@ fn apply(win: &MainWindow, state: &AppState) {
     );
     win.set_progress(state.progress);
     win.set_can_install(state.can_install());
+    win.set_install_status_text(state.install_status_label().into());
 
     // The progress bar + log line only appear once installation has started;
     // until then the freed line shows a discovery/summary count instead.
