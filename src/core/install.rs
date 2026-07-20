@@ -9,7 +9,9 @@
 //!   2. Write a fresh GPT reserving the RK3576 bootloader area.
 //!   3. Write the selected U-Boot image directly to the reserved boot area.
 //!   4. `mkfs.btrfs` on the root partition and create the subvolume skeleton.
-//!   5. For each selected profile: `btrfs receive` its snapshot stream, then
+//!   5. If the build ships a `/home` seed, `btrfs receive` it to a transient
+//!      base and snapshot a writable `@home` from it so /home starts populated.
+//!   6. For each selected profile: `btrfs receive` its snapshot stream, then
 //!      chroot into it and run `kernel-install` for every installed kernel.
 
 use std::fs::OpenOptions;
@@ -46,6 +48,10 @@ const ROOT_PART_INDEX: u32 = 3;
 /// flipperone-linux-build-scripts@80dbfc8), keeping the Btrfs top level for
 /// profile roots and shared subvolumes; the installer mirrors that layout.
 const STOCK_SNAPSHOTS_DIR: &str = "@stock-snapshots";
+
+/// Shared `/home` subvolume. Normally created empty by the layout skeleton, but
+/// prepopulated from the build's `home_*_pack.zst` seed when one is available.
+const HOME_SUBVOL: &str = "@home";
 
 /// POSIX shell glue that chroots into a deployed profile and runs
 /// `kernel-install` for every installed kernel. Written to a temp path and
@@ -107,6 +113,48 @@ impl<R: Read> Read for ProgressReader<'_, R> {
     }
 }
 
+/// Build a throttled byte-progress callback for a receive step: it animates the
+/// bar within this step's `(base, span)` slice on each 1% change and logs a
+/// `<what>: N%` line every 10%. `total` is the expected (compressed) byte count;
+/// when it is 0 (unknown) the bar is left alone and throughput is logged every
+/// 32 MiB so the step is never silent.
+fn receive_progress(
+    ctrl: &Controller,
+    what: String,
+    base: f32,
+    span: f32,
+    total: u64,
+) -> impl FnMut(u64) + '_ {
+    let mut last_pct: i64 = -1;
+    let mut last_bucket: i64 = -1;
+    move |read: u64| {
+        if total > 0 {
+            let read = read.min(total);
+            let pct = (read * 100 / total) as i64;
+            if pct == last_pct {
+                return;
+            }
+            last_pct = pct;
+            ctrl.set_progress(base + span * (read as f32 / total as f32));
+            let bucket = pct / 10;
+            if bucket != last_bucket {
+                last_bucket = bucket;
+                ctrl.log(format!(
+                    "{what}: {pct}% ({} / {})",
+                    human_bytes(read),
+                    human_bytes(total),
+                ));
+            }
+        } else {
+            let bucket = (read / (32 * 1024 * 1024)) as i64;
+            if bucket != last_bucket {
+                last_bucket = bucket;
+                ctrl.log(format!("{what}: {} received", human_bytes(read)));
+            }
+        }
+    }
+}
+
 /// Run the whole installation. Called on a worker thread by the controller.
 pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
     let state = ctrl.snapshot();
@@ -165,9 +213,10 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
         fs_layout.subvolumes.len()
     ));
 
-    // 4 fixed steps, then receive + snapshot + kernel per deployed profile.
+    // 4 fixed steps, then receive + snapshot + kernel per deployed profile, plus
+    // one receive step for the shared /home seed when the build ships one.
     let deployed = 1 + extras.len();
-    let total_steps = 4 + deployed as u32 * 3;
+    let total_steps = 4 + deployed as u32 * 3 + build.home_pack.is_some() as u32;
     let mut ticker = Ticker::new(total_steps);
 
     let root_part = partition_path(&device.path, ROOT_PART_INDEX);
@@ -207,6 +256,57 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
                 .arg("-p")
                 .arg(format!("{mnt}/{STOCK_SNAPSHOTS_DIR}")),
         )?;
+
+        // Prepopulate the shared /home from its seed pack, if the build ships
+        // one. The seed is a full `btrfs send` of @home. A received subvolume is
+        // read-only and carries a `received_uuid`; we can't simply clear the ro
+        // flag (btrfs refuses while received_uuid is set, and forcing it would
+        // leave a writable @home still advertising a received_uuid that a
+        // hand-crafted incremental could target). Instead: receive the seed into
+        // a transient staging subvolume, snapshot a writable @home from it (a
+        // snapshot is never assigned a received_uuid), then delete the staging
+        // base — copy-on-write keeps the data with @home, and no golden base for
+        // the version-independent @home lingers.
+        if let Some(home_pack) = &build.home_pack {
+            ticker.begin(ctrl, "receiving /home seed");
+            let (base, span) = ticker.step_span();
+            let mut on_progress = receive_progress(
+                ctrl,
+                "receiving /home seed".to_string(),
+                base,
+                span,
+                home_pack.size_bytes,
+            );
+            // The seed stream names its subvolume @home (from `btrfs send
+            // $TOP/@home`), so it lands at @stock-snapshots/@home.
+            let stock_dir = format!("{mnt}/{STOCK_SNAPSHOTS_DIR}");
+            let staged = format!("{stock_dir}/{HOME_SUBVOL}");
+            receive_pack(cfg, ctrl, &stock_dir, home_pack, &mut on_progress)?;
+            // Drop the empty placeholder the skeleton created (if it did) so the
+            // writable @home snapshot can take its place; a custom layout that
+            // omits @home leaves nothing to remove.
+            if fs_layout.subvolumes.iter().any(|s| s.name == HOME_SUBVOL) {
+                exec(
+                    cfg,
+                    ctrl,
+                    Command::new("btrfs")
+                        .arg("subvolume")
+                        .arg("delete")
+                        .arg(format!("{mnt}/{HOME_SUBVOL}")),
+                )?;
+            }
+            make_writable_snapshot(cfg, ctrl, &mnt, HOME_SUBVOL, HOME_SUBVOL)?;
+            // Remove the transient received base (received_uuid and all); @home
+            // retains the shared extents.
+            exec(
+                cfg,
+                ctrl,
+                Command::new("btrfs")
+                    .arg("subvolume")
+                    .arg("delete")
+                    .arg(&staged),
+            )?;
+        }
 
         // 5a. Minimal base: full stock pack.
         let minimal_full = minimal
@@ -278,43 +378,15 @@ fn deploy_profile(
     // periodic percentage so neither frontend sits on a frozen bar. Progress is
     // measured against the compressed pack size (what we read off the wire/disk).
     let (base, span) = ticker.step_span();
-    let total = pack.size_bytes;
-    let name = profile.name.clone();
-    let mut last_pct: i64 = -1;
-    let mut last_bucket: i64 = -1;
-    let mut on_progress = |read: u64| {
-        if total > 0 {
-            let read = read.min(total);
-            let pct = (read * 100 / total) as i64;
-            if pct == last_pct {
-                return;
-            }
-            last_pct = pct;
-            ctrl.set_progress(base + span * (read as f32 / total as f32));
-            // Log at coarser 10% milestones to keep the activity log readable.
-            let bucket = pct / 10;
-            if bucket != last_bucket {
-                last_bucket = bucket;
-                ctrl.log(format!(
-                    "receiving {name} ({kind}): {pct}% ({} / {})",
-                    human_bytes(read),
-                    human_bytes(total),
-                ));
-            }
-        } else {
-            // Unknown pack size: can't scale the bar, but still show throughput
-            // every 32 MiB so the step isn't silent.
-            let bucket = (read / (32 * 1024 * 1024)) as i64;
-            if bucket != last_bucket {
-                last_bucket = bucket;
-                ctrl.log(format!(
-                    "receiving {name} ({kind}): {} received",
-                    human_bytes(read)
-                ));
-            }
-        }
-    };
-    receive_pack(cfg, ctrl, mnt, pack, &mut on_progress)?;
+    let mut on_progress = receive_progress(
+        ctrl,
+        format!("receiving {} ({kind})", profile.name),
+        base,
+        span,
+        pack.size_bytes,
+    );
+    let stock_dir = format!("{mnt}/{STOCK_SNAPSHOTS_DIR}");
+    receive_pack(cfg, ctrl, &stock_dir, pack, &mut on_progress)?;
 
     ticker.begin(ctrl, &format!("snapshotting {}", profile.root_subvol()));
     make_writable_snapshot(cfg, ctrl, mnt, &profile.stock_subvol(), &profile.root_subvol())?;
@@ -545,15 +617,15 @@ fn install_uboot(
 fn receive_pack(
     cfg: &Config,
     ctrl: &Controller,
-    mnt: &str,
+    target: &str,
     pack: &PackFile,
     on_progress: &mut dyn FnMut(u64),
 ) -> Result<()> {
     // The packs are zstd-compressed `btrfs send` streams. Decompress in-process
-    // (libzstd via the `zstd` crate) and pipe the stream into `btrfs receive`
-    // under @stock-snapshots, which recreates the profile's stock subvolume
-    // there. Incrementals find their Minimal parent in the same directory.
-    let target = format!("{mnt}/{STOCK_SNAPSHOTS_DIR}");
+    // (libzstd via the `zstd` crate) and pipe the stream into `btrfs receive` at
+    // `target`, which recreates the sent subvolume there. Stock packs go under
+    // @stock-snapshots (incrementals find their Minimal parent in the same
+    // directory); the /home seed is received at the Btrfs top level.
     if cfg.dry_run {
         ctrl.log(format!(
             "[dry-run] zstd -d {} | btrfs receive {target}",
@@ -571,7 +643,7 @@ fn receive_pack(
     let decoder = zstd::stream::read::Decoder::new(reader)
         .map_err(|e| format!("zstd {}: {e}", pack.location))?;
     let mut recv = Command::new("btrfs");
-    recv.arg("receive").arg(&target);
+    recv.arg("receive").arg(target);
     pump_reader_into(ctrl, decoder, recv, &pack.location)
 }
 

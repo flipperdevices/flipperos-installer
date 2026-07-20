@@ -138,6 +138,7 @@ pub fn snapshot_builds(origin: &Origin, limit: usize) -> Vec<SnapshotBuild> {
             base_location: origin.join(&format!("rootfs/{}", d.name)),
             build_number: None,
             profiles: Vec::new(),
+            home_pack: None,
             loaded: false,
             details: None,
         })
@@ -150,21 +151,32 @@ pub fn load_details(manifest_location: &str) -> Result<BuildDetails, String> {
     fetch_json(manifest_location)
 }
 
-/// Fetch a build's manifest and extract its per-profile packs.
-pub fn load_profiles(build: &SnapshotBuild) -> Result<(Option<u64>, Vec<ProfilePack>), String> {
+/// Parsed contents of a build manifest: build number, per-profile packs, and the
+/// optional shared `/home` seed pack.
+pub type BuildContents = (Option<u64>, Vec<ProfilePack>, Option<PackFile>);
+
+/// Fetch a build's manifest and extract its per-profile packs plus the optional
+/// shared `/home` seed pack.
+pub fn load_profiles(build: &SnapshotBuild) -> Result<BuildContents, String> {
     let manifest_loc = format!("{}manifest.json", build.base_location);
     let bm: BuildManifest = fetch_json(&manifest_loc)?;
 
     let mut profiles: Vec<ProfilePack> = Vec::new();
+    let mut home_pack: Option<PackFile> = None;
     for f in &bm.files {
         let fname = f.path.rsplit('/').next().unwrap_or(&f.path);
-        let Some((name, build_num, is_inc)) = parse_pack(fname) else {
-            continue;
-        };
         let pack = PackFile {
             location: format!("{}{}", build.base_location, fname),
             source: build.source.clone(),
             size_bytes: f.size,
+        };
+        // The shared /home seed (`home_<build>_pack.zst`) is not a profile.
+        if parse_home_pack(fname).is_some() {
+            home_pack = Some(pack);
+            continue;
+        }
+        let Some((name, build_num, is_inc)) = parse_pack(fname) else {
+            continue;
         };
         let entry = match profiles.iter_mut().find(|p| p.name == name) {
             Some(p) => p,
@@ -191,7 +203,7 @@ pub fn load_profiles(build: &SnapshotBuild) -> Result<(Option<u64>, Vec<ProfileP
             .cmp(&a.is_minimal())
             .then_with(|| a.name.cmp(&b.name))
     });
-    Ok((bm.build.number, profiles))
+    Ok((bm.build.number, profiles, home_pack))
 }
 
 // --- manifest schema -------------------------------------------------------
@@ -279,6 +291,21 @@ fn parse_pack(fname: &str) -> Option<(String, String, bool)> {
     Some((name.to_string(), num.to_string(), is_inc))
 }
 
+/// Parse a shared `/home` seed filename `home_<build>_pack.zst`, returning the
+/// build number. This is a full `btrfs send` of `@home` (version-independent,
+/// no incremental), distinct from the per-profile `_stock` packs.
+fn parse_home_pack(fname: &str) -> Option<String> {
+    let num = fname
+        .strip_suffix(".zst")?
+        .strip_prefix("home_")?
+        .strip_suffix("_pack")?;
+    if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
+        Some(num.to_string())
+    } else {
+        None
+    }
+}
+
 fn fetch_json<T: serde::de::DeserializeOwned>(location: &str) -> Result<T, String> {
     let bytes = fetch_bytes(location)?;
     serde_json::from_slice(&bytes).map_err(|e| format!("parse {location}: {e}"))
@@ -305,7 +332,7 @@ fn fetch_bytes(location: &str) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_pack;
+    use super::{parse_home_pack, parse_pack};
 
     #[test]
     fn parses_pack_names() {
@@ -315,5 +342,16 @@ mod tests {
         assert_eq!(parse_pack("No-Graphics_688_stock_pack.zst"), Some(("No-Graphics".to_string(), "688".to_string(), false)));
         assert_eq!(parse_pack("debian-rootfs.img.zst"), None);
         assert_eq!(parse_pack("debian-rootfs.img.bmap"), None);
+    }
+
+    #[test]
+    fn parses_home_pack_names() {
+        assert_eq!(parse_home_pack("home_688_pack.zst"), Some("688".to_string()));
+        // Not a home seed: profile packs, missing build number, wrong suffix.
+        assert_eq!(parse_home_pack("home_pack.zst"), None);
+        assert_eq!(parse_home_pack("home_688_stock_pack.zst"), None);
+        assert_eq!(parse_home_pack("Minimal_688_stock_pack.zst"), None);
+        // A profile literally named "home" still parses as a profile, not a seed.
+        assert_eq!(parse_pack("home_688_stock_pack.zst"), Some(("home".to_string(), "688".to_string(), false)));
     }
 }

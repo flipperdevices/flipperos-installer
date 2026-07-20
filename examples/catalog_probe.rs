@@ -30,7 +30,7 @@ fn main() {
     if let Some(first) = snaps.first() {
         println!("\n== Profiles for newest build: {} ==", first.label);
         match catalog::load_profiles(first) {
-            Ok((number, profiles)) => {
+            Ok((number, profiles, home_pack)) => {
                 println!("  build #{number:?}, {} profile(s)", profiles.len());
                 for p in &profiles {
                     println!(
@@ -40,6 +40,7 @@ fn main() {
                         p.incremental.is_some()
                     );
                 }
+                println!("  home seed: {}", home_pack.is_some());
             }
             Err(e) => println!("  load_profiles error: {e}"),
         }

@@ -249,12 +249,13 @@ impl Controller {
         }
         self.log(format!("loading profiles for {}…", build.label));
         match catalog::load_profiles(&build) {
-            Ok((number, profiles)) => {
+            Ok((number, profiles, home_pack)) => {
                 self.log(format!("{} profile(s) available", profiles.len()));
                 self.update(|s| {
                     if let Some(b) = s.snapshot_builds.iter_mut().find(|b| b.id == id) {
                         b.profiles = profiles;
                         b.build_number = number;
+                        b.home_pack = home_pack;
                         b.loaded = true;
                         // The build number now surfaces via `display_name()`; no
                         // need to splice it into the label.

@@ -253,6 +253,9 @@ pub struct SnapshotBuild {
     pub build_number: Option<u64>,
     /// Profiles available in this build (empty until loaded).
     pub profiles: Vec<ProfilePack>,
+    /// Shared, version-independent `/home` seed pack (a full `btrfs send` of
+    /// `@home`), if the build ships one. Filled when profiles are loaded.
+    pub home_pack: Option<PackFile>,
     /// Whether [`Self::profiles`] has been fetched.
     pub loaded: bool,
     /// Build + source details from the manifest; `None` until fetched.
