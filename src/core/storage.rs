@@ -187,6 +187,90 @@ fn lu_block_node(lu_dir: &Path) -> Option<String> {
     Some(format!("/dev/{}", entry.file_name().to_string_lossy()))
 }
 
+/// Report the reasons the whole-disk `disk` (or any of its partitions) is
+/// currently in use: a mounted filesystem, active swap, or a device-mapper / MD
+/// / RAID holder. An empty result means the disk is free to repartition. Used
+/// as a safety gate before destructive operations so we never wipe a disk that
+/// backs a live mount — most importantly the removable media the snapshots are
+/// being read from, or the running system.
+pub fn device_in_use(disk: &str) -> Vec<String> {
+    let mut reasons = Vec::new();
+
+    // Mounts: `/proc/mounts` columns are `source mountpoint fstype …`.
+    if let Ok(mounts) = fs::read_to_string("/proc/mounts") {
+        for line in mounts.lines() {
+            let mut cols = line.split_whitespace();
+            if let (Some(src), Some(mnt)) = (cols.next(), cols.next()) {
+                if src == disk || is_partition_of(src, disk) {
+                    reasons.push(format!("{src} is mounted at {mnt}"));
+                }
+            }
+        }
+    }
+
+    // Swap: the first column of `/proc/swaps` (past its header) is the device.
+    if let Ok(swaps) = fs::read_to_string("/proc/swaps") {
+        for line in swaps.lines().skip(1) {
+            if let Some(src) = line.split_whitespace().next() {
+                if src == disk || is_partition_of(src, disk) {
+                    reasons.push(format!("{src} is an active swap device"));
+                }
+            }
+        }
+    }
+
+    // Device-mapper / MD holders on the whole disk or any of its partitions.
+    reasons.extend(holder_reasons(disk));
+    reasons
+}
+
+/// Whether `node` is a partition of whole-disk `disk` (`/dev/sda1` of
+/// `/dev/sda`, `/dev/mmcblk0p2` of `/dev/mmcblk0`) — a name suffix that is an
+/// optional `p` followed by digits, rejecting sibling disks like `/dev/sdaa`.
+fn is_partition_of(node: &str, disk: &str) -> bool {
+    let suffix = match node.strip_prefix(disk) {
+        Some(s) if !s.is_empty() => s,
+        _ => return false,
+    };
+    let digits = suffix.strip_prefix('p').unwrap_or(suffix);
+    !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Reasons drawn from sysfs `holders/` links: a non-empty `holders` directory on
+/// the whole disk or a partition means an LVM/MD/dm/crypt device sits on top.
+fn holder_reasons(disk: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let name = disk.trim_start_matches("/dev/");
+    let block = Path::new(SYS_BLOCK).join(name);
+
+    // The whole disk plus each partition (a sub-dir carrying a `partition` file).
+    let mut dirs = vec![block.clone()];
+    if let Ok(entries) = fs::read_dir(&block) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.join("partition").exists() {
+                dirs.push(p);
+            }
+        }
+    }
+
+    for dir in dirs {
+        let owner = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if let Ok(holders) = fs::read_dir(dir.join("holders")) {
+            for h in holders.flatten() {
+                out.push(format!(
+                    "/dev/{owner} is held by {}",
+                    h.file_name().to_string_lossy()
+                ));
+            }
+        }
+    }
+    out
+}
+
 fn read_u64(path: &Path) -> Option<u64> {
     read_trimmed(path)?.parse().ok()
 }

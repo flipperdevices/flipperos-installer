@@ -92,7 +92,7 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
         if cfg.dry_run { "  [DRY RUN]" } else { "" },
     ));
 
-    guard_target(&device)?;
+    guard_target(cfg, ctrl, &device)?;
 
     // Resolve the Btrfs layout: prefer one shipped with the images, else the
     // built-in default.
@@ -224,14 +224,31 @@ fn deploy_profile(
 }
 
 /// Refuse to touch a device that is not boot-ROM capable (avoids nuking a USB
-/// stick that just happens to hold the snapshots).
-fn guard_target(device: &StorageDevice) -> Result<()> {
+/// stick that just happens to hold the snapshots) or that is currently in use
+/// (a mounted partition, active swap, or an LVM/MD/dm holder) — wiping a live
+/// disk, e.g. the media the snapshots are being read from, would corrupt it.
+fn guard_target(cfg: &Config, ctrl: &Controller, device: &StorageDevice) -> Result<()> {
     if !device.boot_rom_capable() {
         return Err(format!(
             "{} ({}) is not a boot-ROM capable target",
             device.path,
             device.kind.as_str()
         ));
+    }
+
+    let in_use = crate::core::storage::device_in_use(&device.path);
+    if !in_use.is_empty() {
+        let detail = in_use.join("; ");
+        // In dry-run we never touch the disk, so warn but let the flow proceed;
+        // a real run refuses outright.
+        if cfg.dry_run {
+            ctrl.log(format!(
+                "[dry-run] warning: {} is in use ({detail}) — a real run would refuse it",
+                device.path
+            ));
+        } else {
+            return Err(format!("{} is in use: {detail}", device.path));
+        }
     }
     Ok(())
 }
