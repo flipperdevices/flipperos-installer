@@ -1,0 +1,34 @@
+# Configuration for `cargo about generate` — see scripts/gen-third-party-licenses.sh.
+#
+# We regenerate THIRD-PARTY-LICENSES.md from this so the attribution shipped with
+# the binary always matches Cargo.lock. Our own code is MIT, but the binary links
+# the Slint toolkit, for which we elect the GPL-3.0-only option of its tri-license
+# (we hold no separate Slint agreement); that makes the combined binary
+# GPL-3.0-only.
+
+# Evaluate the dependency graph for the target the binary actually ships on, so
+# we don't pull in licenses of platform crates (Windows/macOS/WASM) we never link.
+targets = ["aarch64-unknown-linux-gnu"]
+
+# Ignore dev-dependencies (test/example only, e.g. `png` for gui_screenshot) —
+# they are not part of the distributed binary.
+ignore-dev-dependencies = true
+
+# Licenses we are willing to comply under, in preference order. For a crate
+# offering a choice (e.g. "MIT OR Apache-2.0"), the first match wins, so MIT is
+# chosen wherever possible and extra texts are kept to a minimum. GPL-3.0-only is
+# accepted solely to satisfy Slint's tri-license.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    "Unlicense",
+    "0BSD",
+    "BSL-1.0",
+    "GPL-3.0-only",
+]

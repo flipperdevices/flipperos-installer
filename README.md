@@ -165,3 +165,29 @@ that `chroot`s into each deployed profile and runs the profile's own
 `kernel-install` for every installed kernel, writing into the shared `/boot`
 subvolume. These tools (`mount`/`umount`, `chroot`, `sh`, and the profile's
 `kernel-install`) must be present in the initramfs / profile.
+
+## Licensing
+
+The installer's own source in this repository is **MIT-licensed** (see
+[`LICENSES/MIT.txt`](LICENSES/MIT.txt); the repository follows the
+[REUSE](https://reuse.software) specification, so `reuse lint` is green).
+
+However, the shipped binary links the [Slint](https://slint.dev) GUI toolkit,
+which we use under the **GNU GPL v3.0** option of its tri-license (wehold no
+separate Slint agreement, and want the binary to be buildable purely from
+public sources). Linking GPL code makes the **combined binary as a whole
+GPL-3.0-only**. MIT is GPL-compatible, so our own sources are unaffected and
+may still be reused under MIT on their own.
+
+Full license texts for every crate linked into the binary are collected in
+[`THIRD-PARTY-LICENSES.md`](THIRD-PARTY-LICENSES.md). Regenerate it from the
+current `Cargo.lock` whenever dependencies change:
+
+```sh
+cargo install cargo-about --features cli   # once
+sh scripts/gen-third-party-licenses.sh
+```
+
+The bundled fonts live in the `third_party/flipctl-fonts` submodule and carry
+their own licenses (HaxrCorp 4090 — CC BY-SA 3.0; Born2bSportyV2 — The Unlicense;
+Busy9px — MIT); see the `LICENSE` file in each font's folder.
