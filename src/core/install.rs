@@ -594,7 +594,7 @@ fn install_kernel(
     // Always unmount the profile root (recursively, in case the script left an
     // API mount behind), surfacing the script error in preference to any
     // unmount error.
-    let unmounted = exec(cfg, ctrl, Command::new("umount").arg("-R").arg(&root));
+    let unmounted = umount_recursive(cfg, ctrl, &root);
     ran?;
     unmounted?;
     Ok(())
@@ -602,12 +602,65 @@ fn install_kernel(
 
 fn unmount(cfg: &Config, ctrl: &Controller, mnt: &str) -> Result<()> {
     exec(cfg, ctrl, &mut Command::new("sync"))?;
-    // A recursive unmount handles any nested btrfs subvolumes; fall back to a
-    // lazy detach if the mount is still busy (e.g. after a partial receive).
-    if exec(cfg, ctrl, Command::new("umount").arg("-R").arg(mnt)).is_err() {
-        exec(cfg, ctrl, Command::new("umount").arg("-l").arg(mnt)).ok();
+    umount_recursive(cfg, ctrl, mnt)
+}
+
+/// Recursively unmount `target` and everything mounted beneath it, deepest
+/// first, falling back to a lazy detach when a plain unmount is busy.
+///
+/// `umount -R` is a util-linux extension that BusyBox's `umount` does not
+/// implement, and the installer runs in a BusyBox initramfs — so we enumerate
+/// the mount table ourselves instead of relying on the flag.
+fn umount_recursive(cfg: &Config, ctrl: &Controller, target: &str) -> Result<()> {
+    if cfg.dry_run {
+        ctrl.log(format!("[dry-run] umount -R {target}"));
+        return Ok(());
     }
-    Ok(())
+    let mut failed: Option<String> = None;
+    for mp in mountpoints_under(target) {
+        // Plain unmount first; if the mount is busy, detach lazily so we never
+        // leave the target mounted. Only a lazy detach that also fails is an error.
+        if exec(cfg, ctrl, Command::new("umount").arg(&mp)).is_err() {
+            if let Err(e) = exec(cfg, ctrl, Command::new("umount").arg("-l").arg(&mp)) {
+                failed.get_or_insert(e);
+            }
+        }
+    }
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Mountpoints at or under `dir`, deepest first (children before parents), read
+/// from `/proc/mounts`. The trailing-slash prefix test avoids matching a sibling
+/// whose name merely extends `dir` (e.g. `/run/x` must not swallow `/run/x-root`).
+fn mountpoints_under(dir: &str) -> Vec<String> {
+    let content = match std::fs::read_to_string("/proc/mounts") {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let prefix = format!("{dir}/");
+    let mut mps: Vec<String> = content
+        .lines()
+        // `/proc/mounts` columns: device mountpoint fstype options dump pass.
+        .filter_map(|l| l.split_whitespace().nth(1))
+        .map(unescape_mount)
+        .filter(|mp| mp == dir || mp.starts_with(&prefix))
+        .collect();
+    mps.sort();
+    mps.dedup();
+    // Deepest first: a child mountpoint is always a longer string than its parent.
+    mps.sort_by_key(|mp| std::cmp::Reverse(mp.len()));
+    mps
+}
+
+/// Decode the octal escapes the kernel writes into `/proc/mounts` mountpoints.
+fn unescape_mount(s: &str) -> String {
+    s.replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
 }
 
 /// Give udev/the kernel a moment to create partition nodes.
