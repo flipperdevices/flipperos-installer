@@ -36,9 +36,10 @@ gpt = "4"
 uuid = { version = "1", features = ["v4"] }
 # Human-editable Btrfs layout config.
 toml = "0.8"
-# Pure-Rust zstd decompressor for the snapshot packs (decompress-only, so no C
-# dependency — keeps the static musl build simple).
-ruzstd = "0.7"
+# libzstd-backed decompressor for the snapshot packs. zstd-sys compiles the
+# vendored C library straight into the binary (no runtime .so; needs a C
+# compiler at build time), and is much faster than a pure-Rust decoder.
+zstd = "0.13"
 
 # TUI frontend (serial console / any terminal).
 [dependencies.cursive]

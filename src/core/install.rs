@@ -436,8 +436,9 @@ fn install_uboot(
 
 fn receive_pack(cfg: &Config, ctrl: &Controller, mnt: &str, pack: &PackFile) -> Result<()> {
     // The packs are zstd-compressed `btrfs send` streams. Decompress in-process
-    // (pure-Rust ruzstd) and pipe the stream into `btrfs receive` at the top
-    // level, which recreates the profile's stock subvolume from the stream.
+    // (libzstd via the `zstd` crate) and pipe the stream into `btrfs receive` at
+    // the top level, which recreates the profile's stock subvolume from the
+    // stream.
     if cfg.dry_run {
         ctrl.log(format!(
             "[dry-run] zstd -d {} | btrfs receive {mnt}",
@@ -446,7 +447,7 @@ fn receive_pack(cfg: &Config, ctrl: &Controller, mnt: &str, pack: &PackFile) -> 
         return Ok(());
     }
     let reader = open_source(&pack.location, &pack.source)?;
-    let decoder = ruzstd::StreamingDecoder::new(reader)
+    let decoder = zstd::stream::read::Decoder::new(reader)
         .map_err(|e| format!("zstd {}: {e}", pack.location))?;
     let mut recv = Command::new("btrfs");
     recv.arg("receive").arg(mnt);
