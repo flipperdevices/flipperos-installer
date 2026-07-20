@@ -1,8 +1,8 @@
 # flipperos-installer
 
-A tiny, statically-linked installer for Rockchip **RK3576** boards (the
-**Flipper One** and other RK3576 boards used for testing), designed to run from
-a Linux **initramfs** for on-device installs.
+A small installer for Rockchip **RK3576** boards (the **Flipper One** and other
+RK3576 boards used for testing), designed to run from a Linux **initramfs** for
+on-device installs.
 
 It can:
 
@@ -64,20 +64,25 @@ git submodule update --init --recursive
 ```
 
 ```sh
-# Default: both frontends, dynamic host build (for development).
+# Default: both frontends, host build (for development).
 cargo build
 
-# Slim, TUI-only static build for the device:
-rustup target add aarch64-unknown-linux-musl
+# Release build for the device (RK3576 is ARMv8):
+rustup target add aarch64-unknown-linux-gnu
+cargo build --release --target aarch64-unknown-linux-gnu
+
+# Slim, TUI-only variant (no GUI shared-library dependencies):
 cargo build --release --no-default-features --features tui \
-    --target aarch64-unknown-linux-musl
+    --target aarch64-unknown-linux-gnu
 ```
 
-The GUI links against `libinput`, `libudev`, `libxkbcommon`, `libfontconfig` and
-`libfreetype` (the last two pulled in by Slint for font discovery/rendering),
-all located via `pkg-config`. The `drm` crate talks to the kernel directly via
-ioctls (pregenerated bindings), so no `libdrm` is needed. Install the build
-tools and dev packages (Debian/Ubuntu):
+The binary links dynamically against the system C library and, for the GUI,
+against `libinput`, `libudev`, `libxkbcommon`, `libfontconfig` and `libfreetype`
+(the last two pulled in by Slint for font discovery/rendering), all located via
+`pkg-config`. These shared libraries must therefore be present in the initramfs
+alongside the binary (the TUI-only build needs none of them). The `drm` crate
+talks to the kernel directly via ioctls (pregenerated bindings), so no `libdrm`
+is needed. Install the build tools and dev packages (Debian/Ubuntu):
 
 ```sh
 sudo apt install pkg-config libinput-dev libudev-dev libxkbcommon-dev \

@@ -6,8 +6,8 @@ description = "On-device installer for Rockchip RK3576 FlipperOS boards, run fro
 license = "MIT"
 readme = "README.md"
 
-# The installer is meant to be a tiny, statically linked initramfs binary. Keep the
-# release profile aggressive about size.
+# The installer runs from a minimal initramfs, so keep the release profile
+# aggressive about binary size.
 [profile.release]
 opt-level = "z"
 lto = true
@@ -26,11 +26,11 @@ gui = ["dep:slint"]
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Small, rustls-based HTTP client so we can link statically without OpenSSL.
+# Small, rustls-based HTTP client so we avoid a system OpenSSL dependency.
 ureq = { version = "2", default-features = false, features = ["json", "tls"] }
 log = "0.4"
-# Pure-Rust GPT partitioning so we don't need to shell out to sgdisk (which would
-# also drag libstdc++ into the initramfs).
+# Pure-Rust GPT partitioning so we don't need to ship sgdisk (and its libstdc++)
+# in the initramfs.
 gpt = "4"
 # Random partition GUIDs for the GPT entries.
 uuid = { version = "1", features = ["v4"] }

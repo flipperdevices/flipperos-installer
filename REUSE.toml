@@ -12,7 +12,6 @@ path = [
     "README.md",
     ".gitignore",
     ".gitmodules",
-    ".cargo/config.toml",
     "REUSE.toml",
     "src/**",
     "config/**",
