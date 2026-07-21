@@ -1,0 +1,191 @@
+// Application row and button components, built on the pixel-art primitives.
+// Icon PNGs are the Flipper One's own FlipCTL icons (first-party art), kept at
+// src/gui/icons/ and referenced relative to this file.
+import { OutlineFrame } from "widgets.slint";
+
+// One row inside a scrolling submenu list, in FlipCTL's compact info-list
+// style (Wi-Fi settings / visible networks): a single HaxrCorp 4090 label
+// with NO font swap on selection — selection is shown only by the raised
+// (shadowed) rounded frame — plus a 1px separator beneath. The bold
+// Born2bSportyV2 swap is a 20px-menu convention and clips at this height.
+export component ListRow inherits Rectangle {
+    in property <string> text;
+    // Right-justified gray detail (build timestamp, device/profile size).
+    in property <string> detail;
+    // Trailing source icon: 0 none, 1 network (server), 2 sdcard (media).
+    // The PNGs are the Flipper One's own FlipCTL icons, decoded from its
+    // icons.js (first-party art) to stay pixel-exact at this size.
+    in property <int> icon-kind;
+    in property <bool> selected;
+    in property <bool> dim;
+    in property <bool> checkbox;
+    in property <bool> checked;
+    height: 13px;
+    // 1px separator beneath the row, inset to the selection box width minus
+    // its rounded corners (so it stops short of the frame's rounded parts,
+    // like the reference popup's row dividers).
+    Rectangle { x: 4px; y: parent.height - 1px; width: parent.width - 9px; height: 1px; background: #cccccc; }
+    if root.selected : OutlineFrame {
+        x: 1px;
+        y: 0px;
+        width: parent.width - 3px;
+        height: parent.height - 2px;
+        shadow: true;
+    }
+    HorizontalLayout {
+        padding-left: 5px;
+        padding-right: 5px;
+        spacing: 3px;
+        if root.checkbox : Text {
+            text: root.checked ? "[x]" : "[ ]";
+            font-family: "HaxrCorp 4090";
+            color: root.dim ? #999999 : #000000;
+            vertical-alignment: center;
+            width: 18px;
+        }
+        // Name — takes the slack so the detail + icon sit flush right.
+        Text {
+            text: root.text;
+            font-family: "HaxrCorp 4090";
+            color: root.dim ? #999999 : #000000;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+        if root.detail != "" : Text {
+            text: root.detail;
+            font-family: "HaxrCorp 4090";
+            color: #767676;
+            vertical-alignment: center;
+            horizontal-stretch: 0;
+        }
+        if root.icon-kind == 1 : Image {
+            source: @image-url("../icons/network.png");
+            width: 13px;
+            height: 11px;
+        }
+        if root.icon-kind == 2 : Image {
+            source: @image-url("../icons/sdcard.png");
+            width: 14px;
+            height: 10px;
+        }
+    }
+}
+
+// One row on the summary screen, modelled on the recorder's MenuDropdownLine:
+// a left-aligned HaxrCorp 4090 caption (no font swap on selection) paired with
+// the current value in a right-anchored light-grey chip — FlipCTL's cue for a
+// configurable field. Drill-in rows (all but the Install action) also raise a
+// shadowed selection frame with the grey/white ">" chevron when selected; the
+// Install action instead shows a plain value with no chip and no chevron.
+export component MenuRow inherits Rectangle {
+    in property <string> label;
+    in property <string> value;
+    in property <bool> selected;
+    in property <bool> dim-value;
+    in property <bool> action;
+    property <bool> chevron: root.selected && !root.action;
+    height: 16px;
+
+    // Caption — HaxrCorp 4090 throughout (matches the recorder's row titles).
+    Text {
+        x: 6px;
+        height: parent.height;
+        text: root.label;
+        font-family: "HaxrCorp 4090";
+        color: #000000;
+        vertical-alignment: center;
+    }
+
+    // Configurable-field value in a #E5E5E5 chip, right-anchored (5px gutter).
+    // Sized so the selection box (y0..parent.height-2) leaves an even 1px gap
+    // above and below the chip.
+    if !root.action : OutlineFrame {
+        x: parent.width - 5px - self.width;
+        y: 1px;
+        width: 158px;
+        height: parent.height - 4px;
+        filled: true;
+        fill: #e5e5e5;
+        stroke: #e5e5e5;
+        Text {
+            x: 3px;
+            width: parent.width - 6px;
+            height: parent.height;
+            text: root.value;
+            font-family: "HaxrCorp 4090";
+            color: root.dim-value ? #767676 : #000000;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+    // Install (action) value — plain text, no chip.
+    if root.action : Text {
+        x: parent.width - 5px - self.width;
+        height: parent.height;
+        text: root.value;
+        font-family: "HaxrCorp 4090";
+        color: root.dim-value ? #999999 : #000000;
+        vertical-alignment: center;
+    }
+
+    // Selection frame + chevron on top, so the chevron sits over the chip's
+    // right end exactly as ComponentSelectorFrame does in the reference.
+    if root.selected : OutlineFrame {
+        x: 1px;
+        y: 0px;
+        width: parent.width - 3px;
+        height: parent.height - 2px;
+        shadow: true;
+        chevron: root.chevron;
+    }
+}
+
+// A bottom-bar soft button in Flipper's notched-tab style: a white body with
+// black outline whose top two corners are radius-3 pixel staircases and whose
+// bottom sits flush against the screen edge (square bottom corners). Mirrors
+// the physical action buttons; hidden when it has no caption.
+export component SoftButton inherits Rectangle {
+    in property <string> caption;
+    in property <bool> primary;   // accepted for API compatibility (unused)
+    in property <bool> enabled: true;
+    property <brush> ink: root.enabled ? #000000 : #999999;
+    visible: root.caption != "";
+    // Fixed width — the tab is aligned to a physical button under the
+    // screen, so callers pin both width and x to a slot. 48px matches the
+    // reference bar's MAX_BTN_W and is the widest that lets five slots sit
+    // flush across 256px without overlapping. Overridable per instance.
+    width: 48px;
+    height: 14px;
+
+    // White body, top two rows inset to clear the rounded top corners.
+    Rectangle { x: 0px; y: 2px; width: parent.width; height: parent.height - 2px; background: #ffffff; }
+    Rectangle { x: 2px; y: 0px; width: parent.width - 4px; height: 1px; background: #ffffff; }
+    Rectangle { x: 1px; y: 1px; width: parent.width - 2px; height: 1px; background: #ffffff; }
+
+    // Outline: top edge (inset 3) and full-height sides. No bottom edge —
+    // the tab sits flush against the screen bottom, so its lower edge is open.
+    Rectangle { x: 3px; y: 0px; width: parent.width - 6px; height: 1px; background: root.ink; }
+    Rectangle { x: 0px; y: 3px; width: 1px; height: parent.height - 3px; background: root.ink; }
+    Rectangle { x: parent.width - 1px; y: 3px; width: 1px; height: parent.height - 3px; background: root.ink; }
+    // Top-corner staircases (bottom corners left square, flush to the edge).
+    Rectangle { x: 0px; y: 2px; width: 1px; height: 1px; background: root.ink; }
+    Rectangle { x: 1px; y: 1px; width: 1px; height: 1px; background: root.ink; }
+    Rectangle { x: 2px; y: 0px; width: 1px; height: 1px; background: root.ink; }
+    Rectangle { x: parent.width - 3px; y: 0px; width: 1px; height: 1px; background: root.ink; }
+    Rectangle { x: parent.width - 2px; y: 1px; width: 1px; height: 1px; background: root.ink; }
+    Rectangle { x: parent.width - 1px; y: 2px; width: 1px; height: 1px; background: root.ink; }
+
+    label := Text {
+        x: 0px;
+        width: parent.width;
+        y: 0px;
+        height: parent.height - 1px;
+        text: root.caption;
+        font-family: "HaxrCorp 4090";
+        color: root.ink;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}

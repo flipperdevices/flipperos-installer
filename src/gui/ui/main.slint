@@ -1,0 +1,551 @@
+// The FlipperOS installer window for the Flipper One 256x144 DRM/KMS screen.
+//
+// HaxrCorp 4090 (FlipCTL): a compiled-in pixel font, vendored as a git
+// submodule under third_party/flipctl-fonts. Embedding it (the Slint compiler
+// pre-renders the glyphs into the binary) means the on-device GUI needs no
+// system fonts and no fontconfig at runtime. Paths are relative to this file.
+//
+// Three fonts, matching Flipper's own role split: HaxrCorp 4090 for values,
+// status and titles; Busy9px for normal menu labels; Born2bSportyV2 (heavier)
+// for the selected/active label. All three are pixel fonts with a 16px native
+// size, so the UI is pinned to 16px to keep them crisp.
+import "../../../third_party/flipctl-fonts/HaxrCorp4090-FlipCTL/HaxrCorp4090-FlipCTL.ttf";
+import "../../../third_party/flipctl-fonts/Busy9px-FlipCTL/Busy9px-FlipCTL.ttf";
+import "../../../third_party/flipctl-fonts/Born2bSportyV2-FlipCTL/Born2bSportyV2-FlipCTL.ttf";
+
+import { OutlineFrame, ProgressBar, ScrollBar, DarkTab } from "widgets.slint";
+import { ListRow, MenuRow, SoftButton } from "rows.slint";
+
+export component MainWindow inherits Window {
+    // The Flipper One panel is a fixed 256x144 DRM/KMS device.
+    width: 256px;
+    height: 144px;
+    background: #ffffff;
+    default-font-family: "HaxrCorp 4090";
+    // HaxrCorp 4090 is a pixel font whose design pixel is 64 font units
+    // (1024 units/em), so it is only crisp at an integer multiple of its
+    // 16px native size. Rendering it smaller (e.g. 8px) antialiases every
+    // glyph into an illegible blur, so we pin it to 16px.
+    default-font-size: 16px;
+    title: "FlipperOS Installer";
+
+    // Row height for submenu lists and how many rows are visible at once.
+    // Compact 13px rows, matching FlipCTL's info-packed screens (Wi-Fi
+    // settings, saved/visible networks) rather than the 20px MenuLine used
+    // for icon menus. More builds on screen at once, no per-row icons.
+    property <length> row-h: 13px;
+    property <int> visible-rows: 8;
+
+    // Soft-button geometry. The five FlipCTL keys (Escape, View, Power,
+    // Edit, Run) sit at fixed positions under the screen, so their on-screen
+    // tabs are fixed-width and pinned to five evenly-spaced slots: slot 0
+    // flush left, slot 4 flush right. `sb-x(i)` is the left edge of slot i.
+    property <length> sb-w: 48px;
+    pure function sb-x(slot: int) -> length {
+        return slot * (root.width - root.sb-w) / 4;
+    }
+
+    // --- inputs from Rust (shared state) ---
+    // "Device type: <model> [<id>]" for the header's second line.
+    in property <string> device-type-text;
+    // Idle summary line, e.g. "3 targets, 14 builds found".
+    in property <string> info-text;
+    // Latest activity-log line, shown under the progress bar while running.
+    in property <string> status-text;
+    in property <float> progress;
+    in property <bool> can-install;
+    // "ready" / "in progress" / "incomplete" for the Install summary row.
+    in property <string> install-status-text;
+    // True once installation has started; gates the progress bar + log line
+    // (which replace the idle info line).
+    in property <bool> installing;
+    // True while discovery or an install is running (Phase::is_busy). Hides
+    // the Refresh soft button — re-scanning mid-run makes no sense.
+    in property <bool> busy;
+
+    // Full selectable lists, shown one section at a time in a submenu. Each
+    // list carries the row NAME (left); parallel `-detail` arrays hold the
+    // gray right-justified detail (size / timestamp), and the build lists add
+    // an `-icon` array (0 none, 1 network, 2 sdcard) for the source glyph.
+    in property <[string]> devices;
+    in property <[string]> devices-detail;
+    in property <[bool]> devices-dim;
+    in property <[string]> uboots;
+    in property <[string]> uboots-detail;
+    in property <[int]> uboots-icon;
+    in property <[string]> snapshots;
+    in property <[string]> snapshots-detail;
+    in property <[int]> snapshots-icon;
+    in property <[string]> profiles;
+    in property <[string]> profiles-detail;
+    in property <[bool]> profile-checked;
+
+    // Current selection, shown as the value on each summary row.
+    in property <string> device-sel-text;
+    in property <string> uboot-sel-text;
+    in property <string> snapshot-sel-text;
+    in property <string> profiles-sel-text;
+    in property <bool> has-device;
+    in property <bool> has-uboot;
+    in property <bool> has-snapshot;
+
+    // Details popup (screen 2): sourcestamps for the highlighted build,
+    // pre-wrapped into display lines for line-based scrolling.
+    in property <string> details-title;
+    in property <[string]> details-model;
+
+    // --- actions back to Rust ---
+    callback select-device(int);
+    callback select-uboot(int);
+    callback select-snapshot(int);
+    callback toggle-profile(int, bool);
+    callback start-install();
+    // Re-query the image server / removable media for builds (the Edit
+    // soft button on the summary). Mirrors the TUI's Refresh action.
+    callback refresh();
+    // Open the details popup for a U-Boot / snapshot list entry (by index).
+    callback show-uboot-details(int);
+    callback show-snapshot-details(int);
+    // Per-keypress trace (text, screen, menu-index, cursor) for input
+    // debugging. Only wired by Rust when `--debug-keys` is set — otherwise it
+    // is a no-op, so nothing hits stderr / the shared console.
+    callback trace-key(string, int, int, int);
+    // Ask Rust to lazily fetch the manifest (for the build number shown in
+    // the row) of the entries currently on screen: (section, first-row,
+    // count). Fired when a build submenu opens and as it scrolls.
+    callback ensure-loaded(int, int, int);
+
+    // --- navigation state ---
+    // screen: 0 = summary, 1 = submenu. Exposed as in-out so an off-device
+    // screenshot harness can drive the view; on-device it is set by the keys.
+    in-out property <int> screen: 0;
+    // Highlighted summary row: 0 device, 1 u-boot, 2 snapshot, 3 profiles, 4 install.
+    in-out property <int> menu-index: 0;
+    // Active submenu section: 0 device, 1 u-boot, 2 snapshot, 3 profiles.
+    in-out property <int> sub-section: 0;
+    in-out property <int> cursor: 0;
+    // Scroll offset (in rows) for the details popup on screen 2.
+    in-out property <int> details-scroll: 0;
+
+    function sub-count() -> int {
+        if (root.sub-section == 0) { return root.devices.length; }
+        if (root.sub-section == 1) { return root.uboots.length; }
+        if (root.sub-section == 2) { return root.snapshots.length; }
+        return root.profiles.length;
+    }
+    // First visible row, chosen so the cursor stays on screen.
+    function sub-offset() -> int {
+        return min(max(root.cursor - root.visible-rows + 1, 0),
+                   max(root.sub-count() - root.visible-rows, 0));
+    }
+    function sub-title() -> string {
+        if (root.sub-section == 0) { return "Target device"; }
+        if (root.sub-section == 1) { return "U-Boot build"; }
+        if (root.sub-section == 2) { return "Snapshot build"; }
+        return "Profiles";
+    }
+    // --- submenu popup geometry (a modal over the dimmed summary) ---
+    // Rows the popup shows at once: the whole list until it exceeds the cap.
+    function popup-rows() -> int { return min(root.sub-count(), root.visible-rows); }
+    // List-body frame height: visible rows + 2px top / 1px bottom inner pad.
+    function popup-frame-h() -> length { return popup-rows() * root.row-h + 3px; }
+    // Frame top y. The tab overhangs ~14px above the frame; centre the whole
+    // tab+frame block in the area above the 14px soft-button bar.
+    function popup-frame-y() -> length {
+        return (root.height - 14px - 14px - popup-frame-h()) / 2 + 14px;
+    }
+    // Confirm the highlighted submenu item. Selecting a device/build closes
+    // the submenu; toggling a profile stays put so several can be picked.
+    function confirm-sub() {
+        if (root.sub-section == 0) { root.select-device(root.cursor); root.screen = 0; }
+        else if (root.sub-section == 1) { root.select-uboot(root.cursor); root.screen = 0; }
+        else if (root.sub-section == 2) { root.select-snapshot(root.cursor); root.screen = 0; }
+        else { root.toggle-profile(root.cursor, !root.profile-checked[root.cursor]); }
+    }
+    // Rows visible at once in the details popup (screen 2), at the 14px pitch.
+    function details-visible() -> int { return 7; }
+
+    forward-focus: fs;
+    fs := FocusScope {
+        width: 100%;
+        height: 100%;
+        key-pressed(event) => {
+            // Trace every key the backend delivers, before any matching, so
+            // an operator can tell "libinput delivered nothing" (no events at
+            // all) apart from "delivered the wrong text". Routed to Rust so it
+            // only prints under `--debug-keys`; unwired it is a no-op (no
+            // stderr output to garble the TUI on the shared kernel console).
+            root.trace-key(event.text, root.screen, root.menu-index, root.cursor);
+
+            // Input model:
+            //   D-pad Up/Down  — move the selection
+            //   ENTER (centre) — confirm the current action
+            //   BACKSPACE      — go back (dedicated back key)
+            // The five soft action buttons keep their conventional meanings;
+            // the two used here are RUN (B = execute/start) and EXIT
+            // (Z = cancel/stop). Confirm and back live on ENTER/BACKSPACE, so
+            // they never depend on a soft button. Escape/Left are kept as
+            // conveniences for desktop testing against a vkms device.
+
+            // Back / exit.
+            if (event.text == Key.Backspace || event.text == Key.Escape
+                || event.text == "z" || event.text == "Z") {
+                if (root.screen == 2) { root.screen = 1; }
+                else if (root.screen == 1) { root.screen = 0; }
+                return accept;
+            }
+
+            // Details popup (screen 2): scroll only.
+            if (root.screen == 2) {
+                if (event.text == Key.UpArrow) {
+                    if (root.details-scroll > 0) { root.details-scroll -= 1; }
+                    return accept;
+                }
+                if (event.text == Key.DownArrow) {
+                    if (root.details-scroll < max(0, root.details-model.length - root.details-visible())) {
+                        root.details-scroll += 1;
+                    }
+                    return accept;
+                }
+                return reject;
+            }
+
+            // RUN (B): the dedicated execute button. Starts the install from
+            // the summary; confirms the current item inside a submenu.
+            if (event.text == "b" || event.text == "B") {
+                if (root.screen == 0) { root.start-install(); }
+                else { root.confirm-sub(); }
+                return accept;
+            }
+
+            // VIEW (X): open the details popup for a U-Boot / snapshot entry.
+            if (event.text == "x" || event.text == "X") {
+                if (root.screen == 1 && root.sub-section == 1) {
+                    root.show-uboot-details(root.cursor);
+                    root.details-scroll = 0;
+                    root.screen = 2;
+                } else if (root.screen == 1 && root.sub-section == 2) {
+                    root.show-snapshot-details(root.cursor);
+                    root.details-scroll = 0;
+                    root.screen = 2;
+                }
+                return accept;
+            }
+
+            // EDIT (V): refresh the source lists. Available on the summary
+            // and inside the U-Boot / snapshot build lists (where it is most
+            // useful — those are the lists it repopulates). Suppressed while
+            // discovery / install is running, matching where the soft button
+            // is shown.
+            if ((event.text == "v" || event.text == "V") && !root.busy
+                    && (root.screen == 0
+                        || (root.screen == 1
+                            && (root.sub-section == 1 || root.sub-section == 2)))) {
+                root.refresh();
+                return accept;
+            }
+
+            if (root.screen == 0) {
+                // Wrap-around at both ends, like the FlipCTL menus.
+                if (event.text == Key.UpArrow) {
+                    root.menu-index = root.menu-index > 0 ? root.menu-index - 1 : 4;
+                    return accept;
+                }
+                if (event.text == Key.DownArrow) {
+                    root.menu-index = root.menu-index < 4 ? root.menu-index + 1 : 0;
+                    return accept;
+                }
+                if (event.text == Key.Return) {
+                    if (root.menu-index == 4) {
+                        root.start-install();
+                    } else {
+                        root.sub-section = root.menu-index;
+                        root.cursor = 0;
+                        root.screen = 1;
+                        // Fetch build numbers for the rows now on screen.
+                        root.ensure-loaded(root.sub-section, 0, root.visible-rows);
+                    }
+                    return accept;
+                }
+                return reject;
+            } else {
+                if (event.text == Key.LeftArrow) { root.screen = 0; return accept; }
+                // Wrap-around at both ends, like the FlipCTL menus. After each
+                // move, (re)fetch the build numbers of the now-visible rows.
+                if (event.text == Key.UpArrow) {
+                    root.cursor = root.cursor > 0 ? root.cursor - 1 : root.sub-count() - 1;
+                    root.ensure-loaded(root.sub-section, root.sub-offset(), root.visible-rows);
+                    return accept;
+                }
+                if (event.text == Key.DownArrow) {
+                    root.cursor = root.cursor < root.sub-count() - 1 ? root.cursor + 1 : 0;
+                    root.ensure-loaded(root.sub-section, root.sub-offset(), root.visible-rows);
+                    return accept;
+                }
+                if (event.text == Key.Return) {
+                    root.confirm-sub();
+                    return accept;
+                }
+                return reject;
+            }
+        }
+
+        // ===== SUMMARY SCREEN =====
+        // Rendered for the submenu (screen 1) too, so it shows (dimmed) behind
+        // the submenu popup. Its own soft-button bar is gated to screen 0.
+        if root.screen == 0 || root.screen == 1 : VerticalLayout {
+            width: 100%;
+            height: 100%;
+
+            VerticalLayout {
+                vertical-stretch: 1;
+                padding: 3px;
+                padding-bottom: 0px;
+                spacing: 1px;
+
+            Text {
+                text: "FlipperOS Installation";
+                color: #000000;
+            }
+            Text {
+                text: root.device-type-text;
+                color: #000000;
+                overflow: elide;
+            }
+            Rectangle { height: 1px; background: #000000; }
+
+            MenuRow {
+                label: "Device";
+                value: root.device-sel-text;
+                dim-value: !root.has-device;
+                selected: root.menu-index == 0;
+            }
+            MenuRow {
+                label: "U-Boot";
+                value: root.uboot-sel-text;
+                dim-value: !root.has-uboot;
+                selected: root.menu-index == 1;
+            }
+            MenuRow {
+                label: "Snapshot";
+                value: root.snapshot-sel-text;
+                dim-value: !root.has-snapshot;
+                selected: root.menu-index == 2;
+            }
+            MenuRow {
+                label: "Profiles";
+                value: root.profiles-sel-text;
+                selected: root.menu-index == 3;
+            }
+            MenuRow {
+                label: "Install";
+                value: root.install-status-text;
+                // Dim only when nothing can happen yet; a running install
+                // ("in progress") stays bright even though can-install is false.
+                dim-value: !root.can-install && !root.installing;
+                selected: root.menu-index == 4;
+                action: true;
+            }
+
+            Rectangle { vertical-stretch: 1; }
+
+            // Idle: a one-line summary. Running: progress bar + latest log.
+            if !root.installing : Text {
+                text: root.info-text;
+                color: #8c8c8c;
+                overflow: elide;
+            }
+            if root.installing : ProgressBar { progress: root.progress; }
+            if root.installing : Text {
+                text: root.status-text;
+                color: #8c8c8c;
+                overflow: elide;
+            }
+            }
+
+            // Soft-button bar: fixed-width tabs on physical-button slots.
+            // Refresh = Edit (slot 3), Install = Run (slot 4). Refresh drops
+            // out while busy (discovery/install), leaving its slot empty.
+            // Hidden while a submenu popup is open (screen 1).
+            if root.screen == 0 : Rectangle {
+                height: 14px;
+                if !root.busy : SoftButton {
+                    x: root.sb-x(3); width: root.sb-w; caption: "Refresh";
+                }
+                SoftButton {
+                    x: root.sb-x(4); width: root.sb-w;
+                    caption: root.installing ? "" : "Install";
+                    primary: true;
+                    enabled: root.can-install;
+                }
+            }
+        }
+
+        // ===== SUBMENU POPUP (screen 1) =====
+        // A modal list floating over the dimmed summary, styled like the Wi-Fi
+        // "Visible networks" popup: a dark heading tab, a white rounded body
+        // frame sized to the visible rows, inset row dividers, and a scrollbar
+        // in the right gutter. The summary renders behind (see its condition)
+        // beneath a semi-transparent wash.
+        if root.screen == 1 : Rectangle {
+            width: 100%;
+            height: 100%;
+
+            // Semi-transparent wash dimming the summary behind the popup.
+            Rectangle { background: #ffffffcc; }
+
+            // White body frame, sized to the number of visible rows.
+            OutlineFrame {
+                x: 4px;
+                y: root.popup-frame-y();
+                width: 248px;
+                height: root.popup-frame-h();
+                filled: true;
+                fill: #ffffff;
+                clip: true;
+
+                if root.sub-section == 0 : VerticalLayout {
+                    x: 2px;
+                    width: parent.width - 4px;
+                    y: 2px - root.sub-offset() * root.row-h;
+                    for name[idx] in root.devices : ListRow {
+                        text: name;
+                        detail: root.devices-detail[idx];
+                        selected: idx == root.cursor;
+                        dim: root.devices-dim[idx];
+                    }
+                }
+                if root.sub-section == 1 : VerticalLayout {
+                    x: 2px;
+                    width: parent.width - 4px;
+                    y: 2px - root.sub-offset() * root.row-h;
+                    for name[idx] in root.uboots : ListRow {
+                        text: name;
+                        detail: root.uboots-detail[idx];
+                        icon-kind: root.uboots-icon[idx];
+                        selected: idx == root.cursor;
+                    }
+                }
+                if root.sub-section == 2 : VerticalLayout {
+                    x: 2px;
+                    width: parent.width - 4px;
+                    y: 2px - root.sub-offset() * root.row-h;
+                    for name[idx] in root.snapshots : ListRow {
+                        text: name;
+                        detail: root.snapshots-detail[idx];
+                        icon-kind: root.snapshots-icon[idx];
+                        selected: idx == root.cursor;
+                    }
+                }
+                if root.sub-section == 3 : VerticalLayout {
+                    x: 2px;
+                    width: parent.width - 4px;
+                    y: 2px - root.sub-offset() * root.row-h;
+                    for name[idx] in root.profiles : ListRow {
+                        text: name;
+                        detail: root.profiles-detail[idx];
+                        selected: idx == root.cursor;
+                        checkbox: true;
+                        checked: root.profile-checked[idx];
+                    }
+                }
+            }
+
+            // Scrollbar in the frame's right gutter (collapses when it fits).
+            ScrollBar {
+                x: 4px + 248px - 5px;
+                y: root.popup-frame-y() + 2px;
+                height: root.popup-frame-h() - 4px;
+                total: root.sub-count();
+                visible-count: root.visible-rows;
+                offset: root.sub-offset();
+            }
+
+            // Dark heading tab, overhanging above the frame's top-left corner
+            // (its bottom merges into the frame's top border, clear of row 1).
+            DarkTab {
+                x: 6px;
+                y: root.popup-frame-y() - 14px;
+                caption: root.sub-title();
+            }
+
+            // Soft-button bar (kept for discoverability), over the wash.
+            // Back = Escape (0), Details = View (1), Refresh = Edit (3),
+            // Select/Toggle = Run (4).
+            Rectangle {
+                x: 0px;
+                y: parent.height - 14px;
+                width: parent.width;
+                height: 14px;
+                SoftButton { x: root.sb-x(0); width: root.sb-w; caption: "Back"; }
+                if (root.sub-section == 1 || root.sub-section == 2) : SoftButton {
+                    x: root.sb-x(1); width: root.sb-w; caption: "Details";
+                }
+                if (!root.busy && (root.sub-section == 1 || root.sub-section == 2)) : SoftButton {
+                    x: root.sb-x(3); width: root.sb-w; caption: "Refresh";
+                }
+                SoftButton {
+                    x: root.sb-x(4); width: root.sb-w;
+                    caption: root.sub-section == 3 ? "Toggle" : "Select";
+                    primary: true;
+                }
+            }
+        }
+
+        // ===== DETAILS POPUP (screen 2) =====
+        if root.screen == 2 : VerticalLayout {
+            width: 100%;
+            height: 100%;
+
+            VerticalLayout {
+                vertical-stretch: 1;
+                padding: 3px;
+                padding-bottom: 0px;
+                spacing: 2px;
+
+                // Heading tab — a 16px header like the reference popup's
+                // TabHeader, carrying the build's detail title.
+                OutlineFrame {
+                    height: 16px;
+                    Text {
+                        x: 6px;
+                        y: 0px;
+                        height: parent.height;
+                        text: root.details-title;
+                        font-family: "HaxrCorp 4090";
+                        color: #000000;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+
+                // Bordered, scrolling text panel. Roomier than before: 3px
+                // inner padding and a 14px line pitch (vs the old crammed
+                // 12px) so the sourcestamps read like the reference popup.
+                OutlineFrame {
+                    clip: true;
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        width: 100%;
+                        padding: 3px;
+                        y: -root.details-scroll * 14px;
+                        for line[i] in root.details-model : Text {
+                            height: 14px;
+                            text: line;
+                            font-family: "HaxrCorp 4090";
+                            color: #000000;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                    }
+                }
+            }
+
+            // Soft-button bar — Back on the Escape slot, matching the others.
+            Rectangle {
+                height: 14px;
+                SoftButton { x: root.sb-x(0); width: root.sb-w; caption: "Back"; }
+            }
+        }
+    }
+}
