@@ -1,14 +1,19 @@
 // The FlipperOS installer window for the Flipper One 256x144 DRM/KMS screen.
 //
-// HaxrCorp 4090 (FlipCTL): a compiled-in pixel font, vendored as a git
-// submodule under third_party/flipctl-fonts. Embedding it (the Slint compiler
-// pre-renders the glyphs into the binary) means the on-device GUI needs no
-// system fonts and no fontconfig at runtime. Paths are relative to this file.
-//
 // Three fonts, matching Flipper's own role split: HaxrCorp 4090 for values,
 // status and titles; Busy9px for normal menu labels; Born2bSportyV2 (heavier)
 // for the selected/active label. All three are pixel fonts with a 16px native
-// size, so the UI is pinned to 16px to keep them crisp.
+// size, so the UI is pinned to 16px to keep them crisp. Importing them embeds
+// the .ttf in the binary and registers the family, so rendering uses these
+// exact pixel glyphs (not a fontconfig substitute). Paths are relative to this
+// file.
+//
+// NOTE: embedding does NOT free the runtime from fonts. Slint's LinuxKMS backend
+// uses the `fontique` font engine, which links libfontconfig and panics at
+// startup (fontique fontconfig backend, NoMatch) if fontconfig resolves zero
+// fonts. So the initramfs MUST ship libfontconfig/libfreetype, a fonts.conf
+// pointing at a font dir, and at least one font — shipping these three TTFs
+// there is sufficient (they satisfy the engine and match these families).
 import "../../../third_party/flipctl-fonts/HaxrCorp4090-FlipCTL/HaxrCorp4090-FlipCTL.ttf";
 import "../../../third_party/flipctl-fonts/Busy9px-FlipCTL/Busy9px-FlipCTL.ttf";
 import "../../../third_party/flipctl-fonts/Born2bSportyV2-FlipCTL/Born2bSportyV2-FlipCTL.ttf";
