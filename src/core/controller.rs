@@ -156,7 +156,7 @@ impl Controller {
     /// snapshot builds, newest first.
     pub fn refresh_sources(&self) {
         let board_id = self.snapshot().board.board_id;
-        const LIMIT: usize = 25;
+        const LIMIT: usize = 100;
 
         let server = catalog::Origin::Server {
             base: self.config.server_url.clone(),
