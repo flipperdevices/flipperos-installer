@@ -22,12 +22,17 @@ log() { printf 'install-kernel[%s]: %s\n' "$PROFILE" "$*" >&2; }
 mkdir -p "$ROOT/dev" "$ROOT/dev/pts" "$ROOT/proc" "$ROOT/sys" "$ROOT/run" "$ROOT/boot"
 
 cleanup() {
-    # Best-effort unmount in reverse order.
-    umount -R "$ROOT/boot" 2>/dev/null || true
-    umount    "$ROOT/run"  2>/dev/null || true
-    umount    "$ROOT/sys"  2>/dev/null || true
-    umount    "$ROOT/proc" 2>/dev/null || true
-    umount -R "$ROOT/dev"  2>/dev/null || true
+    # Best-effort unmount in reverse order. Every mountpoint is listed
+    # explicitly rather than relying on `umount -R`: that is a util-linux
+    # extension BusyBox's umount does not implement, and the installer runs in a
+    # BusyBox initramfs — so `-R` silently left /dev, /dev/pts and /boot mounted,
+    # keeping the target filesystem busy after the install.
+    umount "$ROOT/boot"    2>/dev/null || true
+    umount "$ROOT/run"     2>/dev/null || true
+    umount "$ROOT/sys"     2>/dev/null || true
+    umount "$ROOT/proc"    2>/dev/null || true
+    umount "$ROOT/dev/pts" 2>/dev/null || true
+    umount "$ROOT/dev"     2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 

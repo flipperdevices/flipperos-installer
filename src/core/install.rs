@@ -53,6 +53,16 @@ const STOCK_SNAPSHOTS_DIR: &str = "@stock-snapshots";
 /// prepopulated from the build's `home_*_pack.zst` seed when one is available.
 const HOME_SUBVOL: &str = "@home";
 
+/// Mountpoint for the Btrfs top level of the target, where the subvolume
+/// skeleton is built and the packs are received.
+const TARGET_MNT: &str = "/run/flipperos-install";
+
+/// Mountpoint for a single profile root, mounted with `-o subvol=` so the
+/// chroot's `/` has a real FSROOT (see [`install_kernel`]). Deliberately a
+/// *sibling* of [`TARGET_MNT`] rather than a path under it, so unmounting one
+/// never drags the other down.
+const PROFILE_MNT: &str = "/run/flipperos-install-root";
+
 /// POSIX shell glue that chroots into a deployed profile and runs
 /// `kernel-install` for every installed kernel. Written to a temp path and
 /// executed once per profile at install time.
@@ -201,6 +211,10 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
         if cfg.dry_run { "  [DRY RUN]" } else { "" },
     ));
 
+    // An earlier attempt that failed midway can leave our own mountpoints
+    // behind. Clear them before the in-use guard, so a retry is not refused
+    // because of our own leftovers (a foreign mount still makes it refuse).
+    release_own_mounts(cfg, ctrl);
     guard_target(cfg, ctrl, &device)?;
 
     // Resolve the Btrfs layout: prefer one shipped with the images, else the
@@ -223,6 +237,7 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
 
     // 1. Wipe.
     ticker.begin(ctrl, &format!("blkdiscard {}", device.path));
+    wait_for_exclusive_access(cfg, ctrl, &device.path);
     exec(cfg, ctrl, Command::new("blkdiscard").arg("-f").arg(&device.path))?;
 
     // 2. Partition.
@@ -683,7 +698,7 @@ fn make_filesystem(cfg: &Config, ctrl: &Controller, part: &str, layout: &Layout)
             .arg(part),
     )?;
 
-    let mnt = "/run/flipperos-install".to_string();
+    let mnt = TARGET_MNT.to_string();
     exec(cfg, ctrl, Command::new("mkdir").arg("-p").arg(&mnt))?;
     // Mount the Btrfs top level (subvolid=5) so we can create the shared
     // subvolumes, the @stock-snapshots receive target, and the profile roots
@@ -700,7 +715,23 @@ fn make_filesystem(cfg: &Config, ctrl: &Controller, part: &str, layout: &Layout)
             .arg(&mnt),
     )?;
 
-    // Shared, top-level subvolume skeleton from the layout config.
+    // The target is mounted from here on, but the caller only takes over the
+    // unmount once we return `Ok` — so a failure while building the skeleton
+    // has to clean up after itself, or it strands the mount and leaves the disk
+    // claimed for the next attempt (which then fails in `blkdiscard`).
+    if let Err(e) = create_skeleton(cfg, ctrl, &mnt, layout) {
+        ctrl.log("filesystem setup failed — unmounting target".to_string());
+        if let Err(u) = umount_recursive(cfg, ctrl, &mnt) {
+            ctrl.log(format!("warning: could not unmount {mnt}: {u}"));
+        }
+        return Err(e);
+    }
+    Ok(mnt)
+}
+
+/// Create the shared, top-level subvolume skeleton from the layout config on
+/// the freshly mounted target.
+fn create_skeleton(cfg: &Config, ctrl: &Controller, mnt: &str, layout: &Layout) -> Result<()> {
     for sv in &layout.subvolumes {
         ctrl.log(format!("creating subvolume {}", sv.name));
         exec(
@@ -730,7 +761,7 @@ fn make_filesystem(cfg: &Config, ctrl: &Controller, part: &str, layout: &Layout)
             exec(cfg, ctrl, Command::new("chattr").arg("+C").arg(&path))?;
         }
     }
-    Ok(mnt)
+    Ok(())
 }
 
 fn install_kernel(
@@ -761,7 +792,7 @@ fn install_kernel(
     // `findmnt` to discover the current root subvol. A chroot into the subvolume
     // directory has no /proc/self/mountinfo entry for `/`, so that lookup fails
     // with "cannot determine current root subvol".
-    let root = format!("{mnt}-root");
+    let root = PROFILE_MNT.to_string();
     std::fs::create_dir_all(&root).map_err(|e| format!("mkdir {root}: {e}"))?;
     exec(
         cfg,
@@ -796,8 +827,90 @@ fn install_kernel(
 }
 
 fn unmount(cfg: &Config, ctrl: &Controller, mnt: &str) -> Result<()> {
-    exec(cfg, ctrl, &mut Command::new("sync"))?;
+    // Flush first, but never let a failing `sync` skip the unmount itself — a
+    // stranded mount keeps the target claimed and breaks the next attempt.
+    exec(cfg, ctrl, &mut Command::new("sync")).ok();
     umount_recursive(cfg, ctrl, mnt)
+}
+
+/// Tear down any mountpoint of ours left over from an earlier attempt, so a
+/// retry starts from a clean slate.
+///
+/// Only *our* mountpoints are touched: anything else sitting on the target is a
+/// foreign user that must make [`guard_target`] refuse, not something to
+/// silently unmount out from under whoever owns it.
+fn release_own_mounts(cfg: &Config, ctrl: &Controller) {
+    // The profile root first: it is a subvolume of the same filesystem as the
+    // top-level mount, and dropping it first lets the top level go quietly.
+    for mnt in [PROFILE_MNT, TARGET_MNT] {
+        if mountpoints_under(mnt).is_empty() {
+            continue;
+        }
+        ctrl.log(format!("clearing stale mount at {mnt} from an earlier attempt"));
+        if let Err(e) = umount_recursive(cfg, ctrl, mnt) {
+            ctrl.log(format!("warning: could not clear {mnt}: {e}"));
+        }
+    }
+}
+
+/// Wait until the whole-disk `disk` can be claimed exclusively, i.e. nothing
+/// holds it or any of its partitions any more.
+///
+/// Unmounting is not synchronous with the kernel releasing the block device.
+/// Our own busy-mount fallback (`umount -l`) detaches the mountpoint from the
+/// tree — so it disappears from `/proc/mounts`, and [`guard_target`] sees a
+/// clean disk — while the filesystem, and with it the exclusive claim on the
+/// whole disk, lives on until the last reference goes away. The next step is
+/// `blkdiscard`, whose BLKDISCARD ioctl claims the disk itself (`-f` only skips
+/// util-linux's own `O_EXCL` open, not the kernel's claim), so it fails with
+/// EBUSY. Waiting here turns that into a short pause instead of a failed run.
+///
+/// Best-effort: if the disk is still claimed when the deadline passes we log
+/// why and carry on, letting the real tool report the real error.
+fn wait_for_exclusive_access(cfg: &Config, ctrl: &Controller, disk: &str) {
+    if cfg.dry_run {
+        return;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut waited = false;
+    loop {
+        let err = match claim_exclusively(disk) {
+            // Dropping the handle releases the claim again; nothing else is
+            // competing for the target at this point.
+            Ok(_) => {
+                if waited {
+                    ctrl.log(format!("{disk} released"));
+                }
+                return;
+            }
+            Err(e) => e,
+        };
+        if !waited {
+            waited = true;
+            ctrl.log(format!(
+                "{disk} is still claimed ({err}) — waiting for it to be released…"
+            ));
+        }
+        if std::time::Instant::now() >= deadline {
+            ctrl.log(format!(
+                "warning: {disk} is still claimed after 10 s ({err}); a mount from an \
+                 earlier attempt may not have been fully released yet"
+            ));
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+/// `O_EXCL` on a block device is a claim on the whole disk (and fails if any of
+/// its partitions is claimed), which is exactly the check `blkdiscard` and the
+/// BLKDISCARD ioctl perform. Linux keeps this flag value on every architecture.
+const O_EXCL: i32 = 0o200;
+
+/// Try to open `disk` with an exclusive claim, the same way the wipe will.
+fn claim_exclusively(disk: &str) -> io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new().read(true).custom_flags(O_EXCL).open(disk)
 }
 
 /// Recursively unmount `target` and everything mounted beneath it, deepest
@@ -835,8 +948,13 @@ fn mountpoints_under(dir: &str) -> Vec<String> {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
+    mountpoints_in(&content, dir)
+}
+
+/// [`mountpoints_under`] against an already-read mount table.
+fn mountpoints_in(mounts: &str, dir: &str) -> Vec<String> {
     let prefix = format!("{dir}/");
-    let mut mps: Vec<String> = content
+    let mut mps: Vec<String> = mounts
         .lines()
         // `/proc/mounts` columns: device mountpoint fstype options dump pass.
         .filter_map(|l| l.split_whitespace().nth(1))
@@ -1137,5 +1255,45 @@ mod tests {
         let (base, span) = t.step_span();
         assert!((base - 0.75).abs() < 1e-6);
         assert!((base + span - 1.0).abs() < 1e-6);
+    }
+
+    /// A mount table as it looks mid-install: the target's top level, the
+    /// profile root mounted alongside it, and the chroot's API mounts under
+    /// that root.
+    const MOUNTS: &str = "\
+proc /proc proc rw 0 0
+/dev/mmcblk0p3 /run/flipperos-install btrfs rw,subvolid=5 0 0
+/dev/mmcblk0p3 /run/flipperos-install-root btrfs rw,subvol=/@minimal 0 0
+devtmpfs /run/flipperos-install-root/dev devtmpfs rw 0 0
+devpts /run/flipperos-install-root/dev/pts devpts rw 0 0
+/dev/mmcblk0p3 /run/flipperos-install-root/boot btrfs rw,subvol=/@boot 0 0
+/dev/sda1 /media/usb\\0401 vfat ro 0 0
+";
+
+    #[test]
+    fn mountpoints_are_listed_deepest_first() {
+        let mps = mountpoints_in(MOUNTS, PROFILE_MNT);
+        // Children before their parent, so each unmount sees an idle mountpoint.
+        assert_eq!(
+            mps,
+            vec![
+                "/run/flipperos-install-root/dev/pts",
+                "/run/flipperos-install-root/boot",
+                "/run/flipperos-install-root/dev",
+                "/run/flipperos-install-root",
+            ]
+        );
+    }
+
+    #[test]
+    fn target_mountpoint_does_not_swallow_the_profile_root() {
+        // PROFILE_MNT merely *extends* TARGET_MNT's name; unmounting the target
+        // must not pull in the profile root (or its chroot mounts) as well.
+        assert_eq!(mountpoints_in(MOUNTS, TARGET_MNT), vec![TARGET_MNT]);
+    }
+
+    #[test]
+    fn mountpoint_escapes_are_decoded() {
+        assert_eq!(mountpoints_in(MOUNTS, "/media"), vec!["/media/usb 1"]);
     }
 }
