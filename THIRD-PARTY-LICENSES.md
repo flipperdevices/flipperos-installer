@@ -9,7 +9,7 @@ a whole is licensed under GPL-3.0-only**. All sources remain publicly buildable.
 This file is generated from `Cargo.lock` by `scripts/gen-third-party-licenses.sh`
 — do not edit it by hand.
 
-- **MIT License** — 250 crate(s)
+- **MIT License** — 252 crate(s)
 - **Unicode License v3** — 26 crate(s)
 - **GNU General Public License v3.0 only** — 9 crate(s)
 - **Apache License 2.0** — 7 crate(s)
@@ -1454,6 +1454,7 @@ DEALINGS IN THE SOFTWARE.
 Used by:
   * cc 1.2.67 (https://github.com/rust-lang/cc-rs)
   * cfg-if 1.0.4 (https://github.com/rust-lang/cfg-if)
+  * filetime 0.2.29 (https://github.com/alexcrichton/filetime)
   * find-msvc-tools 0.1.9 (https://github.com/rust-lang/cc-rs)
   * jobserver 0.1.35 (https://github.com/rust-lang/jobserver-rs)
   * pkg-config 0.3.33 (https://github.com/rust-lang/pkg-config-rs)
@@ -3386,6 +3387,41 @@ Used by:
 
 ```
 Copyright (c) The rust-url developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+```
+--------------------------------------------------------------------------------
+
+## MIT License (MIT)
+
+Used by:
+  * tar 0.4.46 (https://github.com/composefs/tar-rs)
+
+```
+Copyright (c) The tar-rs Project Contributors
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated

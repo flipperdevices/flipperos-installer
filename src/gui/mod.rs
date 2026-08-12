@@ -10,20 +10,11 @@
 //! no seatd/logind session to broker DRM access; we run as root and open the
 //! DRM device directly.
 
-use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use crate::core::model::{human_bytes, human_time, AppState, Phase, Source};
+use crate::core::menu::{self, DetailsTarget, Level, LevelKind, Nav};
+use crate::core::model::{AppState, Phase};
 use crate::core::Controller;
-
-/// Source glyph for a build row: 1 = network (server), 2 = sdcard (removable
-/// media). Matches the `icon-kind` the Slint `ListRow` expects.
-fn source_icon(source: &Source) -> i32 {
-    match source {
-        Source::Server => 1,
-        Source::Removable { .. } => 2,
-    }
-}
 
 // The Slint UI is authored as external `.slint` files under `src/gui/ui/` (the
 // path is relative to this source file). We compile them with the `slint!`
@@ -35,7 +26,25 @@ fn source_icon(source: &Source) -> i32 {
 // same generated `MainWindow` type (and `flipperos_installer::gui::MainWindow`
 // export) with no extra dependencies.
 slint::slint! {
-    export { MainWindow } from "ui/main.slint";
+    export { MainWindow, MenuEntry } from "ui/main.slint";
+}
+
+/// Convert one core menu row into the struct the Slint rows render.
+fn entry(item: &menu::MenuItem) -> MenuEntry {
+    MenuEntry {
+        text: item.text.clone().into(),
+        detail: item.detail.clone().into(),
+        icon: item.icon.as_int(),
+        marker: item.marker.as_int(),
+        drill: item.drill,
+        dim: item.dim,
+        action: matches!(item.action, menu::Action::StartInstall),
+    }
+}
+
+fn entries(level: &Level) -> slint::ModelRc<MenuEntry> {
+    let rows: Vec<MenuEntry> = level.items.iter().map(entry).collect();
+    slint::ModelRc::new(slint::VecModel::from(rows))
 }
 
 /// Build the window and wire it to `ctrl`, without starting the event loop.
@@ -67,60 +76,66 @@ pub fn build(ctrl: Arc<Controller>) -> Result<MainWindow, slint::PlatformError> 
         });
     }
 
-    // A cache of the latest snapshot so index-based callbacks can resolve the
-    // concrete device/version/snapshot the operator picked.
+    // A cache of the latest snapshot, so a callback carrying only a row index can
+    // resolve it against exactly the rows that were on screen.
     let cache: Arc<Mutex<AppState>> = Arc::new(Mutex::new(ctrl.snapshot()));
 
-    // The build whose details popup is open (1 = u-boot, 2 = snapshot), so every
-    // snapshot can refresh the popup as its sourcestamps arrive.
-    let detail_target: Arc<Mutex<Option<(u8, String)>>> = Arc::new(Mutex::new(None));
+    // Where this frontend is in the menu tree. Kept here rather than in the
+    // shared state so arrow keys never take the state lock, and so the TUI can
+    // sit on a different level at the same time.
+    let nav: Arc<Mutex<Nav>> = Arc::new(Mutex::new(Nav::new()));
+
+    // What the details popup is showing, so every snapshot can refresh it as the
+    // sourcestamps arrive.
+    let detail_target: Arc<Mutex<Option<DetailsTarget>>> = Arc::new(Mutex::new(None));
 
     {
+        // Activate a row: the core performs the action and says where to go; we
+        // apply that to the stack and repaint.
         let ctrl = Arc::clone(&ctrl);
         let cache = Arc::clone(&cache);
-        win.on_select_device(move |idx| {
-            let state = cache.lock().unwrap();
-            if let Some(dev) = state.devices.get(idx as usize) {
-                ctrl.select_device(&dev.path);
+        let nav = Arc::clone(&nav);
+        let weak = win.as_weak();
+        win.on_activate(move |idx| {
+            let state = cache.lock().unwrap().clone();
+            let mut nav_now = nav.lock().unwrap();
+            let level = menu::level(&nav_now, &state);
+            let index = idx.max(0) as usize;
+            nav_now.set_cursor(index);
+            let mv = menu::activate(&ctrl, &level, index);
+            nav_now.apply(mv);
+            // A level that was just entered starts on its committed choice.
+            let opened = menu::level(&nav_now, &state);
+            if let Some(preferred) = opened.preferred_cursor {
+                nav_now.set_cursor(preferred);
+            }
+            let nav_copy = nav_now.clone();
+            drop(nav_now);
+
+            menu::on_open(&ctrl, &opened);
+            menu::on_focus(&ctrl, &opened, nav_copy.cursor());
+            if let Some(win) = weak.upgrade() {
+                apply_nav(&win, &state, &nav_copy);
             }
         });
     }
     {
+        // Leave the current level. The stack lives in Rust, so Slint delegates
+        // rather than decrementing a screen counter itself.
         let ctrl = Arc::clone(&ctrl);
         let cache = Arc::clone(&cache);
-        win.on_select_uboot(move |idx| {
-            let state = cache.lock().unwrap();
-            if let Some(b) = state.uboot_builds.get(idx as usize) {
-                ctrl.select_uboot(&b.id);
-            }
-        });
-    }
-    {
-        let ctrl = Arc::clone(&ctrl);
-        let cache = Arc::clone(&cache);
-        win.on_select_snapshot(move |idx| {
-            let id = {
-                let state = cache.lock().unwrap();
-                state.snapshot_builds.get(idx as usize).map(|b| b.id.clone())
-            };
-            if let Some(id) = id {
-                ctrl.select_snapshot_build(&id);
-            }
-        });
-    }
-    {
-        let ctrl = Arc::clone(&ctrl);
-        let cache = Arc::clone(&cache);
-        win.on_toggle_profile(move |idx, on| {
-            let name = {
-                let state = cache.lock().unwrap();
-                state
-                    .selected_build()
-                    .and_then(|b| b.profiles.get(idx as usize))
-                    .map(|p| p.name.clone())
-            };
-            if let Some(name) = name {
-                ctrl.toggle_profile(&name, on);
+        let nav = Arc::clone(&nav);
+        let weak = win.as_weak();
+        win.on_back(move || {
+            let state = cache.lock().unwrap().clone();
+            let mut nav_now = nav.lock().unwrap();
+            nav_now.pop();
+            let nav_copy = nav_now.clone();
+            drop(nav_now);
+            let level = menu::level(&nav_copy, &state);
+            menu::on_open(&ctrl, &level);
+            if let Some(win) = weak.upgrade() {
+                apply_nav(&win, &state, &nav_copy);
             }
         });
     }
@@ -128,100 +143,45 @@ pub fn build(ctrl: Arc<Controller>) -> Result<MainWindow, slint::PlatformError> 
         let ctrl = Arc::clone(&ctrl);
         win.on_start_install(move || ctrl.start_install());
     }
-    // Build ids whose manifest fetch has already been kicked off, so scrolling
-    // back and forth doesn't re-spawn duplicate in-flight fetches. Cleared on
-    // Refresh (the lists are rebuilt, so their manifests want re-fetching).
-    let requested: Arc<Mutex<HashSet<(i32, String)>>> = Arc::new(Mutex::new(HashSet::new()));
-
     {
         // Re-scan sources off the event-loop thread, like the TUI's Refresh.
         let ctrl = Arc::clone(&ctrl);
-        let requested = Arc::clone(&requested);
         win.on_refresh(move || {
-            requested.lock().unwrap().clear();
             let ctrl = Arc::clone(&ctrl);
             std::thread::spawn(move || ctrl.refresh_sources());
         });
     }
     {
-        // Lazily fetch the manifest (for the build number) of the rows currently
-        // on screen in a U-Boot (1) / snapshot (2) submenu. Fetches run off the
-        // event loop; each completion updates state and re-renders the row.
+        // Start whatever lazy fetch the rows now on screen need. Deduping happens
+        // in the controller, which both frontends share.
         let ctrl = Arc::clone(&ctrl);
-        let requested = Arc::clone(&requested);
-        win.on_ensure_loaded(move |section, first, count| {
-            if section != 1 && section != 2 {
-                return;
-            }
-            let first = first.max(0) as usize;
-            let count = count.max(0) as usize;
-            let state = ctrl.snapshot();
-            let ids: Vec<String> = if section == 1 {
-                state
-                    .uboot_builds
-                    .iter()
-                    .skip(first)
-                    .take(count)
-                    .filter(|b| b.build_number().is_none())
-                    .map(|b| b.id.clone())
-                    .collect()
-            } else {
-                state
-                    .snapshot_builds
-                    .iter()
-                    .skip(first)
-                    .take(count)
-                    .filter(|b| b.resolved_build_number().is_none())
-                    .map(|b| b.id.clone())
-                    .collect()
-            };
-            let mut req = requested.lock().unwrap();
-            for id in ids {
-                if req.insert((section, id.clone())) {
-                    let ctrl = Arc::clone(&ctrl);
-                    std::thread::spawn(move || {
-                        if section == 1 {
-                            ctrl.load_uboot_details(&id);
-                        } else {
-                            ctrl.load_snapshot_details(&id);
-                        }
-                    });
-                }
-            }
+        let cache = Arc::clone(&cache);
+        let nav = Arc::clone(&nav);
+        win.on_ensure_visible(move |first, count| {
+            let state = cache.lock().unwrap().clone();
+            let nav_now = nav.lock().unwrap().clone();
+            let level = menu::level(&nav_now, &state);
+            menu::on_visible(
+                &ctrl,
+                &level,
+                first.max(0) as usize,
+                count.max(0) as usize,
+            );
         });
     }
     {
-        let ctrl = Arc::clone(&ctrl);
         let cache = Arc::clone(&cache);
+        let nav = Arc::clone(&nav);
         let detail_target = Arc::clone(&detail_target);
         let weak = win.as_weak();
-        win.on_show_uboot_details(move |idx| {
-            let id = cache.lock().unwrap().uboot_builds.get(idx as usize).map(|b| b.id.clone());
-            if let Some(id) = id {
-                *detail_target.lock().unwrap() = Some((1, id.clone()));
-                let c = Arc::clone(&ctrl);
-                let idc = id.clone();
-                std::thread::spawn(move || c.load_uboot_details(&idc));
+        win.on_show_details(move |idx| {
+            let state = cache.lock().unwrap().clone();
+            let nav_now = nav.lock().unwrap().clone();
+            let level = menu::level(&nav_now, &state);
+            if let Some(target) = level.details_at(idx.max(0) as usize) {
+                *detail_target.lock().unwrap() = Some(target);
                 if let Some(win) = weak.upgrade() {
-                    apply_details(&win, &cache.lock().unwrap(), &detail_target.lock().unwrap());
-                }
-            }
-        });
-    }
-    {
-        let ctrl = Arc::clone(&ctrl);
-        let cache = Arc::clone(&cache);
-        let detail_target = Arc::clone(&detail_target);
-        let weak = win.as_weak();
-        win.on_show_snapshot_details(move |idx| {
-            let id = cache.lock().unwrap().snapshot_builds.get(idx as usize).map(|b| b.id.clone());
-            if let Some(id) = id {
-                *detail_target.lock().unwrap() = Some((2, id.clone()));
-                let c = Arc::clone(&ctrl);
-                let idc = id.clone();
-                std::thread::spawn(move || c.load_snapshot_details(&idc));
-                if let Some(win) = weak.upgrade() {
-                    apply_details(&win, &cache.lock().unwrap(), &detail_target.lock().unwrap());
+                    apply_details(&win, &state, &detail_target.lock().unwrap());
                 }
             }
         });
@@ -230,14 +190,24 @@ pub fn build(ctrl: Arc<Controller>) -> Result<MainWindow, slint::PlatformError> 
     // Subscribe: marshal every snapshot into the Slint event loop.
     let weak = win.as_weak();
     let detail_for_sub = Arc::clone(&detail_target);
+    let nav_for_sub = Arc::clone(&nav);
     ctrl.subscribe(move |snapshot| {
         let weak = weak.clone();
         let cache = Arc::clone(&cache);
         let detail_target = Arc::clone(&detail_for_sub);
+        let nav = Arc::clone(&nav_for_sub);
         let _ = slint::invoke_from_event_loop(move || {
             if let Some(win) = weak.upgrade() {
                 *cache.lock().unwrap() = snapshot.clone();
+                let mut nav_now = nav.lock().unwrap();
+                // An install takes over the screen, so drop back to the summary.
+                if matches!(snapshot.phase, Phase::Installing) {
+                    nav_now.reset();
+                }
+                let nav_copy = nav_now.clone();
+                drop(nav_now);
                 apply(&win, &snapshot);
+                apply_nav(&win, &snapshot, &nav_copy);
                 apply_details(&win, &snapshot, &detail_target.lock().unwrap());
             }
         });
@@ -319,47 +289,60 @@ fn wrap_lines(text: &str, width: usize) -> Vec<String> {
 
 /// Fill the details popup (title + wrapped source-stamp lines) for the currently
 /// open target, resolving it against the freshest snapshot.
-fn apply_details(win: &MainWindow, state: &AppState, target: &Option<(u8, String)>) {
+fn apply_details(win: &MainWindow, state: &AppState, target: &Option<DetailsTarget>) {
     use slint::{ModelRc, SharedString, VecModel};
 
     let (title, text) = match target {
-        Some((1, id)) => (
-            "U-Boot details",
-            state
-                .uboot_builds
-                .iter()
-                .find(|b| &b.id == id)
-                .map(|b| b.details_text())
-                .unwrap_or_default(),
-        ),
-        Some((2, id)) => (
-            "Snapshot details",
-            state
-                .snapshot_builds
-                .iter()
-                .find(|b| &b.id == id)
-                .map(|b| b.details_text())
-                .unwrap_or_default(),
-        ),
-        _ => ("", String::new()),
+        Some(target) => menu::details_text(state, target),
+        None => (String::new(), String::new()),
     };
     win.set_details_title(title.into());
     let lines: Vec<SharedString> = wrap_lines(&text, 40).into_iter().map(SharedString::from).collect();
     win.set_details_model(ModelRc::new(VecModel::from(lines)));
 }
 
-/// Push a state snapshot into the Slint properties.
-fn apply(win: &MainWindow, state: &AppState) {
-    use slint::{ModelRc, SharedString, VecModel};
+/// Push the menu rows and the navigation position into the Slint properties.
+///
+/// The summary rows are set unconditionally: the GUI draws them dimmed behind an
+/// open level. `screen` follows the stack depth, so leaving the last level is
+/// what returns to the summary.
+fn apply_nav(win: &MainWindow, state: &AppState, nav: &Nav) {
+    win.set_summary_items(entries(&menu::root_level(state)));
 
+    let level = menu::level(nav, state);
+    win.set_level_items(entries(&level));
+    win.set_level_title(level.title.clone().into());
+    win.set_level_multi(level.kind == LevelKind::MultiPick);
+    win.set_level_can_refresh(level.can_refresh);
+
+    // Keep the cursor inside a level whose contents just changed — a level that
+    // was showing a single "(loading…)" row may now have a hundred entries, or
+    // none at all.
+    let cursor = (nav.cursor() as i32).min(level.items.len().saturating_sub(1) as i32);
+    win.set_cursor(cursor.max(0));
+    win.set_level_can_details(level.details_at(cursor.max(0) as usize).is_some());
+
+    if nav.depth() == 0 {
+        win.set_menu_index((nav.cursor() as i32).min(level.items.len().saturating_sub(1) as i32));
+        // The details popup belongs to a level, so it cannot outlive one.
+        if win.get_screen() != 0 {
+            win.set_screen(0);
+        }
+    } else if win.get_screen() == 0 {
+        win.set_screen(1);
+    }
+}
+
+/// Push the parts of a state snapshot that are not menu rows: the header, the
+/// progress bar and the status lines.
+fn apply(win: &MainWindow, state: &AppState) {
     // Header: "Device type: <model> [<id>]". The model is the device-tree human
-    // string; the bracketed id is the image-server device type we mapped it to.
+    // string; the bracketed id is the device type we mapped it to.
     win.set_device_type_text(
         format!("Device type: {} [{}]", state.board.model, state.board.board_id).into(),
     );
     win.set_progress(state.progress);
     win.set_can_install(state.can_install());
-    win.set_install_status_text(state.install_status_label().into());
 
     // The progress bar + log line only appear once installation has started;
     // until then the freed line shows a discovery/summary count instead.
@@ -381,96 +364,7 @@ fn apply(win: &MainWindow, state: &AppState) {
     };
     win.set_info_text(info.into());
 
-    // Device rows: name = "<path> [<kind>] <model>" (leading "! " when the boot
-    // ROM can't boot it); detail = size. Non-boot-capable devices are dimmed.
-    let mut device_names: Vec<SharedString> = Vec::new();
-    let mut device_details: Vec<SharedString> = Vec::new();
-    let mut devices_dim: Vec<bool> = Vec::new();
-    for d in &state.devices {
-        let mark = if d.boot_rom_capable() { "" } else { "! " };
-        let name = if d.model.is_empty() {
-            format!("{mark}{} [{}]", d.path, d.kind.as_str())
-        } else {
-            format!("{mark}{} [{}] {}", d.path, d.kind.as_str(), d.model)
-        };
-        device_names.push(name.into());
-        device_details.push(d.human_size().into());
-        devices_dim.push(!d.boot_rom_capable());
-    }
-    win.set_devices(ModelRc::new(VecModel::from(device_names)));
-    win.set_devices_detail(ModelRc::new(VecModel::from(device_details)));
-    win.set_devices_dim(ModelRc::new(VecModel::from(devices_dim)));
-
-    // Build rows: name = label; detail = timestamp; icon = source (server/media).
-    let mut uboot_names: Vec<SharedString> = Vec::new();
-    let mut uboot_details: Vec<SharedString> = Vec::new();
-    let mut uboot_icons: Vec<i32> = Vec::new();
-    for b in &state.uboot_builds {
-        uboot_names.push(b.display_name().into());
-        uboot_details.push(human_time(&b.mtime).into());
-        uboot_icons.push(source_icon(&b.source));
-    }
-    win.set_uboots(ModelRc::new(VecModel::from(uboot_names)));
-    win.set_uboots_detail(ModelRc::new(VecModel::from(uboot_details)));
-    win.set_uboots_icon(ModelRc::new(VecModel::from(uboot_icons)));
-
-    let mut snap_names: Vec<SharedString> = Vec::new();
-    let mut snap_details: Vec<SharedString> = Vec::new();
-    let mut snap_icons: Vec<i32> = Vec::new();
-    for b in &state.snapshot_builds {
-        snap_names.push(b.display_name().into());
-        snap_details.push(human_time(&b.mtime).into());
-        snap_icons.push(source_icon(&b.source));
-    }
-    win.set_snapshots(ModelRc::new(VecModel::from(snap_names)));
-    win.set_snapshots_detail(ModelRc::new(VecModel::from(snap_details)));
-    win.set_snapshots_icon(ModelRc::new(VecModel::from(snap_icons)));
-
-    // Profiles of the selected build: name = profile (+ " (always)" for Minimal);
-    // detail = pack size. Minimal is always deployed.
-    let build = state.selected_build();
-    let mut profile_names: Vec<SharedString> = Vec::new();
-    let mut profile_details: Vec<SharedString> = Vec::new();
-    let mut checked: Vec<bool> = Vec::new();
-    if let Some(b) = build {
-        for p in &b.profiles {
-            let suffix = if p.is_minimal() { " (always)" } else { "" };
-            profile_names.push(format!("{}{suffix}", p.name).into());
-            let size = p
-                .incremental
-                .as_ref()
-                .or(p.full.as_ref())
-                .map(|pk| human_bytes(pk.size_bytes))
-                .unwrap_or_else(|| "?".to_string());
-            profile_details.push(size.into());
-            checked.push(p.is_minimal() || state.selection.profiles.iter().any(|n| n == &p.name));
-        }
-    }
-    win.set_profiles(ModelRc::new(VecModel::from(profile_names)));
-    win.set_profiles_detail(ModelRc::new(VecModel::from(profile_details)));
-    win.set_profile_checked(ModelRc::new(VecModel::from(checked)));
-
-    // Current-selection values for the summary rows. `has_*` drives the grayed
-    // "(select)" placeholder when nothing is chosen yet.
-    let device_sel = state
-        .target()
-        .map(|d| format!("{} {}", d.path, d.human_size()));
-    win.set_has_device(device_sel.is_some());
-    win.set_device_sel_text(device_sel.unwrap_or_else(|| "(select)".to_string()).into());
-
-    let uboot_sel = state.selected_uboot().map(|b| b.display_name());
-    win.set_has_uboot(uboot_sel.is_some());
-    win.set_uboot_sel_text(uboot_sel.unwrap_or_else(|| "(select)".to_string()).into());
-
-    let snapshot_sel = state.selected_build().map(|b| b.display_name());
-    win.set_has_snapshot(snapshot_sel.is_some());
-    win.set_snapshot_sel_text(snapshot_sel.unwrap_or_else(|| "(select)".to_string()).into());
-
-    let extra = state.selection.profiles.len();
-    let profiles_sel = if extra > 0 {
-        format!("Minimal +{extra}")
-    } else {
-        "Minimal".to_string()
-    };
-    win.set_profiles_sel_text(profiles_sel.into());
+    // Everything list-shaped — the summary rows and the open level's rows, with
+    // their values, markers and chevrons — is built by `core::menu` and pushed by
+    // `apply_nav`, which the same subscriber calls.
 }

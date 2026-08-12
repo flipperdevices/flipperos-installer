@@ -6,6 +6,9 @@
 //!
 //! [`Controller`]: crate::core::Controller
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 /// Where a boot image or snapshot was found.
@@ -20,6 +23,12 @@ pub enum Source {
         /// Mount point the file was found under.
         mountpoint: String,
     },
+    /// A plain local directory: a bundle unpacked into the scratch dir, one
+    /// passed with `--bundle`, or staged artifacts verified before the install.
+    Local {
+        /// Directory the files live under.
+        root: String,
+    },
 }
 
 impl Source {
@@ -27,6 +36,7 @@ impl Source {
         match self {
             Source::Server => "server".to_string(),
             Source::Removable { device, .. } => format!("media {device}"),
+            Source::Local { .. } => "local".to_string(),
         }
     }
 }
@@ -152,13 +162,21 @@ pub struct UbootBuild {
     pub mtime: String,
     /// URL (server) or path (media) of the flashable `u-boot-rockchip.bin`.
     pub image_location: String,
-    /// Location of this build's `manifest.json`, for lazily loading details.
+    /// Location of this build's `manifest.json`, for lazily loading contents.
     pub manifest_location: String,
     pub source: Source,
-    /// Size in bytes if known, else 0.
+    /// Size of the image in bytes; 0 until the manifest has been read.
     pub size_bytes: u64,
+    /// SHA-256 the manifest publishes for the image, if it publishes one.
+    /// `None` after loading means the build shipped no digest.
+    pub sha256: Option<String>,
     /// Build + source details from the manifest; `None` until fetched.
     pub details: Option<BuildDetails>,
+    /// Whether this build's manifest has been read (filling [`Self::size_bytes`],
+    /// [`Self::sha256`] and [`Self::details`]). Mirrors
+    /// [`SnapshotBuild::loaded`]: both kinds of build carry a manifest and are
+    /// loaded through the same path.
+    pub loaded: bool,
 }
 
 impl UbootBuild {
@@ -193,6 +211,9 @@ pub struct PackFile {
     pub location: String,
     pub source: Source,
     pub size_bytes: u64,
+    /// SHA-256 the manifest publishes for this pack, if any. Covers the pack as
+    /// stored, i.e. the *compressed* bytes.
+    pub sha256: Option<String>,
 }
 
 /// A profile within a snapshot build, with its full and/or incremental packs.
@@ -299,6 +320,193 @@ impl SnapshotBuild {
     }
 }
 
+// --- update bundles --------------------------------------------------------
+
+/// Where a bundle's files live. A bundle is either served from the update
+/// server or sits unpacked in a local directory; a `*.tar.zst` bundle becomes a
+/// [`BundleLocation::Dir`] once it has been unpacked into the scratch dir.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BundleLocation {
+    /// Remote build directory, ending in `/`.
+    Remote { base: String },
+    /// Local directory holding `manifest.json`, ending in `/`.
+    Dir { root: String },
+}
+
+impl BundleLocation {
+    /// Join a path relative to the bundle root.
+    pub fn join(&self, rel: &str) -> String {
+        let base = match self {
+            BundleLocation::Remote { base } => base,
+            BundleLocation::Dir { root } => root,
+        };
+        format!("{}/{}", base.trim_end_matches('/'), rel.trim_start_matches('/'))
+    }
+
+    /// Location of the bundle's `manifest.json`.
+    pub fn manifest(&self) -> String {
+        self.join("manifest.json")
+    }
+}
+
+/// A listed bundle build directory, before its manifest has been read. Cheap:
+/// everything here comes from the listing, so browsing costs one request per
+/// level rather than one per build.
+#[derive(Clone, Debug)]
+pub struct BundleRef {
+    /// Stable id used by the UI and by [`Selection::bundle`], e.g.
+    /// `nightly/20260812-83ddb68-15` or the path of a local bundle.
+    pub id: String,
+    /// Channel path this build was listed under: `nightly`, `dev/alchark/topic`,
+    /// or `local` for a bundle found on media.
+    pub channel: String,
+    /// Build directory name, which is also how the build is labelled.
+    pub dir: String,
+    pub location: BundleLocation,
+    pub source: Source,
+    /// Set when this bundle came from a `*.tar.zst` that must be unpacked
+    /// before it can be installed from.
+    pub archive: Option<String>,
+}
+
+impl BundleRef {
+    /// Row label in the build lists.
+    pub fn label(&self) -> String {
+        self.dir.clone()
+    }
+
+    pub fn summary(&self) -> String {
+        format!("{} ({}, {})", self.dir, self.channel, self.source.label())
+    }
+}
+
+/// A bundle whose manifest has been read: one pinned U-Boot image and one
+/// fully-loaded snapshot build, so the install pipeline consumes it exactly as
+/// it consumes a hand-picked pair.
+#[derive(Clone, Debug)]
+pub struct SelectedBundle {
+    pub reference: BundleRef,
+    /// `bundle.version` from the manifest, e.g. `20260812-83ddb68`.
+    pub version: String,
+    /// `bundle.channel` from the manifest.
+    pub channel: String,
+    pub description: String,
+    /// Name of the bundle's own `*.tar.zst`, as published. Informational: the
+    /// remote install path fetches individual files instead.
+    pub archive: String,
+    /// Per-board U-Boot directory the images were taken from.
+    pub board_dir: String,
+    /// Board ids this bundle ships U-Boot images for.
+    pub device_types: Vec<String>,
+    pub uboot: UbootBuild,
+    pub build: SnapshotBuild,
+}
+
+impl SelectedBundle {
+    /// Short label for the summary row. Kept brief: the GUI's value chip is
+    /// 158 px wide and elides.
+    pub fn label(&self) -> String {
+        match self.build.resolved_build_number() {
+            Some(n) => format!("{} #{n}", self.channel),
+            None => format!("{} {}", self.channel, self.reference.dir),
+        }
+    }
+}
+
+/// Progress of a lazily fetched listing.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum LoadState {
+    /// Not requested yet.
+    #[default]
+    Idle,
+    /// A worker is fetching it.
+    Loading,
+    Loaded,
+    Failed(String),
+}
+
+/// One lazily fetched level of the bundle hierarchy.
+#[derive(Clone, Debug)]
+pub struct Listing<T> {
+    pub items: Vec<T>,
+    pub state: LoadState,
+}
+
+// Hand-written so an empty listing does not require `T: Default`.
+impl<T> Default for Listing<T> {
+    fn default() -> Self {
+        Self {
+            items: Vec::new(),
+            state: LoadState::default(),
+        }
+    }
+}
+
+impl<T> Listing<T> {
+    pub fn is_pending(&self) -> bool {
+        matches!(self.state, LoadState::Idle | LoadState::Loading)
+    }
+}
+
+/// The lazily listed bundle hierarchy. Held behind an `Arc` in [`AppState`] so
+/// the snapshot broadcast on every mutation stays a refcount bump rather than a
+/// deep copy of every level.
+#[derive(Clone, Debug, Default)]
+pub struct CatalogCache {
+    /// Channel names offered by the bucket, in listing order.
+    pub channels: Listing<String>,
+    /// Builds per channel path (`nightly`, `dev/alchark/topic`).
+    pub builds: HashMap<String, Listing<BundleRef>>,
+    /// Intermediate levels of the `dev/` tree, keyed by their prefix path
+    /// (`dev` → usernames, `dev/alchark` → branch names).
+    pub dirs: HashMap<String, Listing<String>>,
+    /// Bundles found on removable media or passed with `--bundle`.
+    pub local: Listing<BundleRef>,
+}
+
+/// Which kind of source the operator is installing from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InstallMode {
+    /// An update bundle: a pinned U-Boot + rootfs pair. The default.
+    #[default]
+    Bundle,
+    /// A hand-picked U-Boot build and rootfs build from the image server.
+    Custom,
+}
+
+impl InstallMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            InstallMode::Bundle => "bundle",
+            InstallMode::Custom => "custom",
+        }
+    }
+}
+
+/// Whether artifacts are checked before the target is touched, or as they are
+/// written.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FetchMode {
+    /// Download every needed artifact into the scratch dir and verify it
+    /// against the manifest *before* anything destructive happens, then install
+    /// from the local copies.
+    #[default]
+    VerifyFirst,
+    /// Stream straight into the install. Artifacts are still hashed on the way
+    /// through, but a mismatch can only be reported after the bytes have landed,
+    /// so it is a warning rather than a failure.
+    Stream,
+}
+
+impl FetchMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            FetchMode::VerifyFirst => "verify first",
+            FetchMode::Stream => "stream",
+        }
+    }
+}
+
 /// Detected board / SoC identity.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct BoardInfo {
@@ -317,12 +525,18 @@ pub struct BoardInfo {
 pub struct Selection {
     /// Target whole-disk device path.
     pub target_device: Option<String>,
-    /// Selected U-Boot build id.
+    /// Selected U-Boot build id. [`InstallMode::Custom`] only.
     pub uboot: Option<String>,
-    /// Selected snapshot build id.
+    /// Selected snapshot build id. [`InstallMode::Custom`] only.
     pub snapshot_build: Option<String>,
     /// Extra profile names to deploy (Minimal is always deployed implicitly).
     pub profiles: Vec<String>,
+    /// Whether we install from a bundle or from a hand-picked pair.
+    pub mode: InstallMode,
+    /// Selected bundle id ([`BundleRef::id`]). [`InstallMode::Bundle`] only.
+    pub bundle: Option<String>,
+    /// Whether artifacts are verified before the target is touched.
+    pub fetch: FetchMode,
 }
 
 /// High-level state machine of the installer.
@@ -378,9 +592,16 @@ pub struct AppState {
     pub progress: f32,
     /// Rolling activity log shared by both frontends.
     pub log: Vec<String>,
-    /// Device types the image server can install onto, taken from the latest
-    /// U-Boot build manifest. Empty until the catalog has been fetched.
+    /// Device types we can install onto: in bundle mode the boards the selected
+    /// bundle ships U-Boot for, otherwise those from the image server's latest
+    /// U-Boot build manifest. Empty until a catalog has been fetched.
     pub supported_device_types: Vec<String>,
+    /// The lazily listed bundle hierarchy.
+    pub catalog: Arc<CatalogCache>,
+    /// The selected bundle with its manifest read; `None` until it resolves.
+    pub bundle: Option<SelectedBundle>,
+    /// Why the selected bundle could not be resolved, if it could not be.
+    pub bundle_error: Option<String>,
 }
 
 impl AppState {
@@ -389,7 +610,7 @@ impl AppState {
     pub fn can_install(&self) -> bool {
         !self.phase.is_busy()
             && self.selection.target_device.is_some()
-            && self.selection.uboot.is_some()
+            && self.selected_uboot().is_some()
             && self.selected_build().and_then(|b| b.minimal()).is_some()
     }
 
@@ -410,16 +631,59 @@ impl AppState {
         self.devices.iter().find(|d| d.path == path)
     }
 
-    /// The currently selected U-Boot build, if any.
+    /// The currently selected U-Boot build: the one a bundle pins, or the one
+    /// hand-picked from the image server.
     pub fn selected_uboot(&self) -> Option<&UbootBuild> {
-        let id = self.selection.uboot.as_deref()?;
-        self.uboot_builds.iter().find(|b| b.id == id)
+        match self.selection.mode {
+            InstallMode::Bundle => self.bundle.as_ref().map(|b| &b.uboot),
+            InstallMode::Custom => {
+                let id = self.selection.uboot.as_deref()?;
+                self.uboot_builds.iter().find(|b| b.id == id)
+            }
+        }
     }
 
-    /// The currently selected snapshot build, if any.
+    /// The currently selected snapshot build: the one a bundle pins, or the one
+    /// hand-picked from the image server.
     pub fn selected_build(&self) -> Option<&SnapshotBuild> {
-        let id = self.selection.snapshot_build.as_deref()?;
-        self.snapshot_builds.iter().find(|b| b.id == id)
+        match self.selection.mode {
+            InstallMode::Bundle => self.bundle.as_ref().map(|b| &b.build),
+            InstallMode::Custom => {
+                let id = self.selection.snapshot_build.as_deref()?;
+                self.snapshot_builds.iter().find(|b| b.id == id)
+            }
+        }
+    }
+
+    /// The selected bundle's [`BundleRef`], if the selection names one.
+    pub fn selected_bundle_ref(&self) -> Option<&BundleRef> {
+        self.bundle_ref_by_id(self.selection.bundle.as_deref()?)
+    }
+
+    /// Find a listed bundle by id, across every level that has been listed
+    /// (including the local ones).
+    pub fn bundle_ref_by_id(&self, id: &str) -> Option<&BundleRef> {
+        self.catalog
+            .builds
+            .values()
+            .chain(std::iter::once(&self.catalog.local))
+            .flat_map(|l| l.items.iter())
+            .find(|b| b.id == id)
+    }
+
+    /// Value for the "Source" summary row.
+    pub fn source_label(&self) -> String {
+        match self.selection.mode {
+            InstallMode::Custom => "custom".to_string(),
+            InstallMode::Bundle => match (&self.bundle, &self.bundle_error) {
+                (Some(b), _) => b.label(),
+                (None, Some(_)) => "unavailable".to_string(),
+                (None, None) => match self.selected_bundle_ref() {
+                    Some(r) => format!("{}\u{2026}", r.dir),
+                    None => "(select)".to_string(),
+                },
+            },
+        }
     }
 }
 

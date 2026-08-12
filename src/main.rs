@@ -9,6 +9,7 @@
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use flipperos_installer::core::model::{FetchMode, InstallMode};
 use flipperos_installer::core::{Config, Controller};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -194,6 +195,53 @@ fn parse_args() -> Result<Option<Args>, String> {
                     .next()
                     .ok_or("--server requires a URL argument")?;
             }
+            "--bundle-bucket" => {
+                config.bundle_bucket = iter
+                    .next()
+                    .ok_or("--bundle-bucket requires a bucket name")?;
+            }
+            "--bundle-url" => {
+                config.bundle_base_url = iter
+                    .next()
+                    .ok_or("--bundle-url requires a URL argument")?;
+            }
+            "--bundle-list-url" => {
+                config.bundle_list_url =
+                    Some(iter.next().ok_or("--bundle-list-url requires a URL")?);
+            }
+            "--bundle-prefix" => {
+                config.bundle_prefix = iter
+                    .next()
+                    .ok_or("--bundle-prefix requires a prefix argument")?;
+            }
+            // Repeatable: several local bundles can be offered at once.
+            "--bundle" => {
+                config
+                    .bundle_paths
+                    .push(iter.next().ok_or("--bundle requires a path argument")?);
+            }
+            "--custom" => config.mode = InstallMode::Custom,
+            "--fetch" => {
+                let value = iter
+                    .next()
+                    .ok_or("--fetch requires 'verify-first' or 'stream'")?;
+                config.fetch = match value.as_str() {
+                    "verify-first" | "verify" => FetchMode::VerifyFirst,
+                    "stream" => FetchMode::Stream,
+                    other => {
+                        return Err(format!(
+                            "unknown fetch mode '{other}' (expected 'verify-first' or 'stream')"
+                        ))
+                    }
+                };
+            }
+            "--cache-dir" => {
+                config.cache_dir = iter
+                    .next()
+                    .ok_or("--cache-dir requires a path argument")?;
+            }
+            "--keep-cache" => config.keep_cache = true,
+            "--no-automount" => config.automount = false,
             "--kms-device" => {
                 config.kms_device = iter
                     .next()
@@ -219,8 +267,23 @@ FRONTEND (default: all compiled-in frontends, concurrently):\n\
     --gui              Run only the Slint LinuxKMS on-device UI\n\
     --both             Run both frontends against one shared installer state\n\
 \n\
+UPDATE BUNDLES (the default source):\n\
+    --bundle-bucket <N>   Bucket the bundles are published in\n\
+    --bundle-url <URL>    Base URL bundle files are served from\n\
+    --bundle-list-url <U> Object-listing endpoint (derived from the bucket)\n\
+    --bundle-prefix <P>   Prefix inside the bucket holding the channels\n\
+    --bundle <PATH>       Install from a local bundle directory or *.tar.zst\n\
+                          (repeatable; also auto-discovered on removable media)\n\
+    --fetch <MODE>        'verify-first' (default) checks every artifact against\n\
+                          the manifest before the target is touched; 'stream'\n\
+                          writes as it downloads and checks on the way through\n\
+    --cache-dir <DIR>     Scratch dir for verified artifacts and unpacked archives\n\
+    --keep-cache          Keep the scratch files after the run\n\
+    --no-automount        Do not mount removable media read-only during discovery\n\
+    --custom              Start on the custom development build flow instead\n\
+\n\
 OPTIONS:\n\
-    --server <URL>     Image server base URL\n\
+    --server <URL>     Image server base URL (custom development builds)\n\
     --kms-device <P>   DRM/KMS device node for the Flipper One screen\n\
     --dry-run          Log destructive steps without executing them (default)\n\
     --no-dry-run       Actually perform destructive operations\n\

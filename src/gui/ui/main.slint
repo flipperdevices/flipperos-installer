@@ -21,6 +21,25 @@ import "../../../third_party/flipctl-fonts/Born2bSportyV2-FlipCTL/Born2bSportyV2
 import { OutlineFrame, ProgressBar, ScrollBar, DarkTab } from "widgets.slint";
 import { ListRow, MenuRow, SoftButton } from "rows.slint";
 
+// One row of the summary screen or of the open menu level. Built by
+// `core::menu` and handed over whole, so this file never has to know what a
+// particular list contains — which is what lets one block render every level,
+// however deep the operator has drilled.
+export struct MenuEntry {
+    text: string,
+    detail: string,
+    // Source glyph: 0 none, 1 network, 2 sdcard.
+    icon: int,
+    // Leading state marker: 0 none, 1 unchecked, 2 checked. Only multi-choice
+    // levels use it; a single choice shows as where the cursor opens.
+    marker: int,
+    // Opens another level (drawn with a trailing chevron).
+    drill: bool,
+    dim: bool,
+    // Summary rows only: the plain Install-style row, with no value chip.
+    action: bool,
+}
+
 export component MainWindow inherits Window {
     // The Flipper One panel is a fixed 256x144 DRM/KMS device.
     width: 256px;
@@ -58,9 +77,9 @@ export component MainWindow inherits Window {
     // Latest activity-log line, shown under the progress bar while running.
     in property <string> status-text;
     in property <float> progress;
+    // Whether the Install soft button is live. The Install *row*'s own value
+    // ("ready" / "in progress" / "incomplete") arrives with `summary-items`.
     in property <bool> can-install;
-    // "ready" / "in progress" / "incomplete" for the Install summary row.
-    in property <string> install-status-text;
     // True once installation has started; gates the progress bar + log line
     // (which replace the idle info line).
     in property <bool> installing;
@@ -68,31 +87,19 @@ export component MainWindow inherits Window {
     // the Refresh soft button — re-scanning mid-run makes no sense.
     in property <bool> busy;
 
-    // Full selectable lists, shown one section at a time in a submenu. Each
-    // list carries the row NAME (left); parallel `-detail` arrays hold the
-    // gray right-justified detail (size / timestamp), and the build lists add
-    // an `-icon` array (0 none, 1 network, 2 sdcard) for the source glyph.
-    in property <[string]> devices;
-    in property <[string]> devices-detail;
-    in property <[bool]> devices-dim;
-    in property <[string]> uboots;
-    in property <[string]> uboots-detail;
-    in property <[int]> uboots-icon;
-    in property <[string]> snapshots;
-    in property <[string]> snapshots-detail;
-    in property <[int]> snapshots-icon;
-    in property <[string]> profiles;
-    in property <[string]> profiles-detail;
-    in property <[bool]> profile-checked;
-
-    // Current selection, shown as the value on each summary row.
-    in property <string> device-sel-text;
-    in property <string> uboot-sel-text;
-    in property <string> snapshot-sel-text;
-    in property <string> profiles-sel-text;
-    in property <bool> has-device;
-    in property <bool> has-uboot;
-    in property <bool> has-snapshot;
+    // The summary screen's rows (exactly five: the screen has no room for a
+    // sixth) and the rows of whichever level is open. Both come from
+    // `core::menu`, which also decides their markers, chevrons and values.
+    in property <[MenuEntry]> summary-items;
+    in property <[MenuEntry]> level-items;
+    // Heading tab of the open level.
+    in property <string> level-title;
+    // The level's rows are toggles, so confirming keeps it open.
+    in property <bool> level-multi;
+    // Whether the highlighted row has a details popup, and whether this level
+    // can be re-fetched. Both replace what used to be hardcoded section checks.
+    in property <bool> level-can-details;
+    in property <bool> level-can-refresh;
 
     // Details popup (screen 2): sourcestamps for the highlighted build,
     // pre-wrapped into display lines for line-based scrolling.
@@ -100,72 +107,56 @@ export component MainWindow inherits Window {
     in property <[string]> details-model;
 
     // --- actions back to Rust ---
-    callback select-device(int);
-    callback select-uboot(int);
-    callback select-snapshot(int);
-    callback toggle-profile(int, bool);
+    // Activate a row of the summary (screen 0) or the open level (screen 1) by
+    // index. Rust performs the action AND moves its navigation stack, then
+    // pushes the new level's rows back through `level-items`.
+    callback activate(int);
+    // Leave the open level. Rust pops one frame, restores that level's cursor,
+    // and sets `screen` back to 0 once the stack is empty.
+    callback back();
     callback start-install();
-    // Re-query the image server / removable media for builds (the Edit
-    // soft button on the summary). Mirrors the TUI's Refresh action.
+    // Re-query the bundle bucket / image server / removable media (the Edit
+    // soft button). Mirrors the TUI's Refresh action.
     callback refresh();
-    // Open the details popup for a U-Boot / snapshot list entry (by index).
-    callback show-uboot-details(int);
-    callback show-snapshot-details(int);
+    // Open the details popup for the highlighted row of the open level.
+    callback show-details(int);
     // Per-keypress trace (text, screen, menu-index, cursor) for input
     // debugging. Only wired by Rust when `--debug-keys` is set — otherwise it
     // is a no-op, so nothing hits stderr / the shared console.
     callback trace-key(string, int, int, int);
-    // Ask Rust to lazily fetch the manifest (for the build number shown in
-    // the row) of the entries currently on screen: (section, first-row,
-    // count). Fired when a build submenu opens and as it scrolls.
-    callback ensure-loaded(int, int, int);
+    // Ask Rust to start whatever lazy fetch the rows now on screen need:
+    // (first-row, count). Fired when a level opens and as it scrolls.
+    callback ensure-visible(int, int);
 
     // --- navigation state ---
-    // screen: 0 = summary, 1 = submenu. Exposed as in-out so an off-device
-    // screenshot harness can drive the view; on-device it is set by the keys.
+    // screen: 0 = summary, 1 = level popup, 2 = details popup. Exposed as
+    // in-out so an off-device screenshot harness can drive the view; on-device
+    // it is set by the keys and by Rust when the level stack empties.
     in-out property <int> screen: 0;
-    // Highlighted summary row: 0 device, 1 u-boot, 2 snapshot, 3 profiles, 4 install.
+    // Highlighted summary row.
     in-out property <int> menu-index: 0;
-    // Active submenu section: 0 device, 1 u-boot, 2 snapshot, 3 profiles.
-    in-out property <int> sub-section: 0;
+    // Highlighted row of the open level. Kept here rather than in Rust so an
+    // arrow key never has to round-trip through the controller; Rust reads it
+    // when a row is activated and rewrites it when a level is entered or left.
     in-out property <int> cursor: 0;
     // Scroll offset (in rows) for the details popup on screen 2.
     in-out property <int> details-scroll: 0;
 
-    function sub-count() -> int {
-        if (root.sub-section == 0) { return root.devices.length; }
-        if (root.sub-section == 1) { return root.uboots.length; }
-        if (root.sub-section == 2) { return root.snapshots.length; }
-        return root.profiles.length;
-    }
+    function level-count() -> int { return root.level-items.length; }
     // First visible row, chosen so the cursor stays on screen.
     function sub-offset() -> int {
         return min(max(root.cursor - root.visible-rows + 1, 0),
-                   max(root.sub-count() - root.visible-rows, 0));
+                   max(root.level-count() - root.visible-rows, 0));
     }
-    function sub-title() -> string {
-        if (root.sub-section == 0) { return "Target device"; }
-        if (root.sub-section == 1) { return "U-Boot build"; }
-        if (root.sub-section == 2) { return "Snapshot build"; }
-        return "Profiles";
-    }
-    // --- submenu popup geometry (a modal over the dimmed summary) ---
+    // --- level popup geometry (a modal over the dimmed summary) ---
     // Rows the popup shows at once: the whole list until it exceeds the cap.
-    function popup-rows() -> int { return min(root.sub-count(), root.visible-rows); }
+    function popup-rows() -> int { return min(root.level-count(), root.visible-rows); }
     // List-body frame height: visible rows + 2px top / 1px bottom inner pad.
     function popup-frame-h() -> length { return popup-rows() * root.row-h + 3px; }
     // Frame top y. The tab overhangs ~14px above the frame; centre the whole
     // tab+frame block in the area above the 14px soft-button bar.
     function popup-frame-y() -> length {
         return (root.height - 14px - 14px - popup-frame-h()) / 2 + 14px;
-    }
-    // Confirm the highlighted submenu item. Selecting a device/build closes
-    // the submenu; toggling a profile stays put so several can be picked.
-    function confirm-sub() {
-        if (root.sub-section == 0) { root.select-device(root.cursor); root.screen = 0; }
-        else if (root.sub-section == 1) { root.select-uboot(root.cursor); root.screen = 0; }
-        else if (root.sub-section == 2) { root.select-snapshot(root.cursor); root.screen = 0; }
-        else { root.toggle-profile(root.cursor, !root.profile-checked[root.cursor]); }
     }
     // Rows visible at once in the details popup (screen 2), at the 14px pitch.
     function details-visible() -> int { return 7; }
@@ -192,11 +183,13 @@ export component MainWindow inherits Window {
             // they never depend on a soft button. Escape/Left are kept as
             // conveniences for desktop testing against a vkms device.
 
-            // Back / exit.
+            // Back / exit. From a level this asks Rust to pop one frame: the
+            // stack lives there (Slint has no growable state), and Rust sets
+            // `screen` back to 0 once the last level has been left.
             if (event.text == Key.Backspace || event.text == Key.Escape
                 || event.text == "z" || event.text == "Z") {
                 if (root.screen == 2) { root.screen = 1; }
-                else if (root.screen == 1) { root.screen = 0; }
+                else if (root.screen == 1) { root.back(); }
                 return accept;
             }
 
@@ -216,36 +209,30 @@ export component MainWindow inherits Window {
             }
 
             // RUN (B): the dedicated execute button. Starts the install from
-            // the summary; confirms the current item inside a submenu.
+            // the summary; confirms the current row inside a level.
             if (event.text == "b" || event.text == "B") {
                 if (root.screen == 0) { root.start-install(); }
-                else { root.confirm-sub(); }
+                else { root.activate(root.cursor); }
                 return accept;
             }
 
-            // VIEW (X): open the details popup for a U-Boot / snapshot entry.
+            // VIEW (X): open the details popup, when the highlighted row has
+            // one (the core decides, so it works at any depth).
             if (event.text == "x" || event.text == "X") {
-                if (root.screen == 1 && root.sub-section == 1) {
-                    root.show-uboot-details(root.cursor);
-                    root.details-scroll = 0;
-                    root.screen = 2;
-                } else if (root.screen == 1 && root.sub-section == 2) {
-                    root.show-snapshot-details(root.cursor);
+                if (root.screen == 1 && root.level-can-details) {
+                    root.show-details(root.cursor);
                     root.details-scroll = 0;
                     root.screen = 2;
                 }
                 return accept;
             }
 
-            // EDIT (V): refresh the source lists. Available on the summary
-            // and inside the U-Boot / snapshot build lists (where it is most
-            // useful — those are the lists it repopulates). Suppressed while
-            // discovery / install is running, matching where the soft button
-            // is shown.
+            // EDIT (V): re-query the sources. Available on the summary and on
+            // any level that lists fetched data. Suppressed while discovery /
+            // an install is running, matching where the soft button is shown.
             if ((event.text == "v" || event.text == "V") && !root.busy
                     && (root.screen == 0
-                        || (root.screen == 1
-                            && (root.sub-section == 1 || root.sub-section == 2)))) {
+                        || (root.screen == 1 && root.level-can-refresh))) {
                 root.refresh();
                 return accept;
             }
@@ -253,42 +240,44 @@ export component MainWindow inherits Window {
             if (root.screen == 0) {
                 // Wrap-around at both ends, like the FlipCTL menus.
                 if (event.text == Key.UpArrow) {
-                    root.menu-index = root.menu-index > 0 ? root.menu-index - 1 : 4;
+                    root.menu-index = root.menu-index > 0
+                        ? root.menu-index - 1
+                        : max(root.summary-items.length - 1, 0);
                     return accept;
                 }
                 if (event.text == Key.DownArrow) {
-                    root.menu-index = root.menu-index < 4 ? root.menu-index + 1 : 0;
+                    root.menu-index = root.menu-index < root.summary-items.length - 1
+                        ? root.menu-index + 1
+                        : 0;
                     return accept;
                 }
                 if (event.text == Key.Return) {
-                    if (root.menu-index == 4) {
-                        root.start-install();
-                    } else {
-                        root.sub-section = root.menu-index;
-                        root.cursor = 0;
-                        root.screen = 1;
-                        // Fetch build numbers for the rows now on screen.
-                        root.ensure-loaded(root.sub-section, 0, root.visible-rows);
-                    }
+                    // Rust decides whether this row installs, opens a level or
+                    // does nothing, and sets `screen` accordingly.
+                    root.activate(root.menu-index);
                     return accept;
                 }
                 return reject;
             } else {
-                if (event.text == Key.LeftArrow) { root.screen = 0; return accept; }
+                if (event.text == Key.LeftArrow) { root.back(); return accept; }
                 // Wrap-around at both ends, like the FlipCTL menus. After each
-                // move, (re)fetch the build numbers of the now-visible rows.
+                // move, start whatever the now-visible rows need fetched.
                 if (event.text == Key.UpArrow) {
-                    root.cursor = root.cursor > 0 ? root.cursor - 1 : root.sub-count() - 1;
-                    root.ensure-loaded(root.sub-section, root.sub-offset(), root.visible-rows);
+                    root.cursor = root.cursor > 0
+                        ? root.cursor - 1
+                        : max(root.level-count() - 1, 0);
+                    root.ensure-visible(root.sub-offset(), root.visible-rows);
                     return accept;
                 }
                 if (event.text == Key.DownArrow) {
-                    root.cursor = root.cursor < root.sub-count() - 1 ? root.cursor + 1 : 0;
-                    root.ensure-loaded(root.sub-section, root.sub-offset(), root.visible-rows);
+                    root.cursor = root.cursor < root.level-count() - 1
+                        ? root.cursor + 1
+                        : 0;
+                    root.ensure-visible(root.sub-offset(), root.visible-rows);
                     return accept;
                 }
                 if (event.text == Key.Return) {
-                    root.confirm-sub();
+                    root.activate(root.cursor);
                     return accept;
                 }
                 return reject;
@@ -319,37 +308,15 @@ export component MainWindow inherits Window {
             }
             Rectangle { height: 1px; background: #000000; }
 
-            MenuRow {
-                label: "Device";
-                value: root.device-sel-text;
-                dim-value: !root.has-device;
-                selected: root.menu-index == 0;
-            }
-            MenuRow {
-                label: "U-Boot";
-                value: root.uboot-sel-text;
-                dim-value: !root.has-uboot;
-                selected: root.menu-index == 1;
-            }
-            MenuRow {
-                label: "Snapshot";
-                value: root.snapshot-sel-text;
-                dim-value: !root.has-snapshot;
-                selected: root.menu-index == 2;
-            }
-            MenuRow {
-                label: "Profiles";
-                value: root.profiles-sel-text;
-                selected: root.menu-index == 3;
-            }
-            MenuRow {
-                label: "Install";
-                value: root.install-status-text;
-                // Dim only when nothing can happen yet; a running install
-                // ("in progress") stays bright even though can-install is false.
-                dim-value: !root.can-install && !root.installing;
-                selected: root.menu-index == 4;
-                action: true;
+            // The five summary rows, as built by `core::menu::root_level`.
+            // Five is the ceiling: the header, rule and status line leave room
+            // for exactly this many 16px rows on a 144px panel.
+            for entry[i] in root.summary-items : MenuRow {
+                label: entry.text;
+                value: entry.detail;
+                dim-value: entry.dim;
+                action: entry.action;
+                selected: root.menu-index == i;
             }
 
             Rectangle { vertical-stretch: 1; }
@@ -409,49 +376,20 @@ export component MainWindow inherits Window {
                 fill: #ffffff;
                 clip: true;
 
-                if root.sub-section == 0 : VerticalLayout {
+                // One block for every level, however deep: the rows carry their
+                // own markers, icons and chevrons.
+                VerticalLayout {
                     x: 2px;
                     width: parent.width - 4px;
                     y: 2px - root.sub-offset() * root.row-h;
-                    for name[idx] in root.devices : ListRow {
-                        text: name;
-                        detail: root.devices-detail[idx];
+                    for entry[idx] in root.level-items : ListRow {
+                        text: entry.text;
+                        detail: entry.detail;
+                        icon-kind: entry.icon;
+                        marker: entry.marker;
+                        drill: entry.drill;
+                        dim: entry.dim;
                         selected: idx == root.cursor;
-                        dim: root.devices-dim[idx];
-                    }
-                }
-                if root.sub-section == 1 : VerticalLayout {
-                    x: 2px;
-                    width: parent.width - 4px;
-                    y: 2px - root.sub-offset() * root.row-h;
-                    for name[idx] in root.uboots : ListRow {
-                        text: name;
-                        detail: root.uboots-detail[idx];
-                        icon-kind: root.uboots-icon[idx];
-                        selected: idx == root.cursor;
-                    }
-                }
-                if root.sub-section == 2 : VerticalLayout {
-                    x: 2px;
-                    width: parent.width - 4px;
-                    y: 2px - root.sub-offset() * root.row-h;
-                    for name[idx] in root.snapshots : ListRow {
-                        text: name;
-                        detail: root.snapshots-detail[idx];
-                        icon-kind: root.snapshots-icon[idx];
-                        selected: idx == root.cursor;
-                    }
-                }
-                if root.sub-section == 3 : VerticalLayout {
-                    x: 2px;
-                    width: parent.width - 4px;
-                    y: 2px - root.sub-offset() * root.row-h;
-                    for name[idx] in root.profiles : ListRow {
-                        text: name;
-                        detail: root.profiles-detail[idx];
-                        selected: idx == root.cursor;
-                        checkbox: true;
-                        checked: root.profile-checked[idx];
                     }
                 }
             }
@@ -461,7 +399,7 @@ export component MainWindow inherits Window {
                 x: 4px + 248px - 5px;
                 y: root.popup-frame-y() + 2px;
                 height: root.popup-frame-h() - 4px;
-                total: root.sub-count();
+                total: root.level-count();
                 visible-count: root.visible-rows;
                 offset: root.sub-offset();
             }
@@ -471,7 +409,7 @@ export component MainWindow inherits Window {
             DarkTab {
                 x: 6px;
                 y: root.popup-frame-y() - 14px;
-                caption: root.sub-title();
+                caption: root.level-title;
             }
 
             // Soft-button bar (kept for discoverability), over the wash.
@@ -483,15 +421,15 @@ export component MainWindow inherits Window {
                 width: parent.width;
                 height: 14px;
                 SoftButton { x: root.sb-x(0); width: root.sb-w; caption: "Back"; }
-                if (root.sub-section == 1 || root.sub-section == 2) : SoftButton {
+                if root.level-can-details : SoftButton {
                     x: root.sb-x(1); width: root.sb-w; caption: "Details";
                 }
-                if (!root.busy && (root.sub-section == 1 || root.sub-section == 2)) : SoftButton {
+                if (!root.busy && root.level-can-refresh) : SoftButton {
                     x: root.sb-x(3); width: root.sb-w; caption: "Refresh";
                 }
                 SoftButton {
                     x: root.sb-x(4); width: root.sb-w;
-                    caption: root.sub-section == 3 ? "Toggle" : "Select";
+                    caption: root.level-multi ? "Toggle" : "Select";
                     primary: true;
                 }
             }

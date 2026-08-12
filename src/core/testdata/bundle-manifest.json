@@ -1,0 +1,166 @@
+{
+  "schema": 1,
+  "bundle": {
+    "name": "flipperone-update",
+    "version": "20260812-83ddb68",
+    "channel": "nightly",
+    "description": "Flipper One update bundle (nightly)",
+    "archive": "flipperone-update-20260812-83ddb68-nightly-15.tar.zst",
+    "definition": {
+      "repository": "git@github.com-bundles:flipperdevices/flipperone-update-bundles.git",
+      "branch": "nightly",
+      "revision": "83ddb68f83ca73fdf7761b2b77b44465c54e18ff",
+      "path": "bundle.yaml"
+    },
+    "build": {
+      "builder": "update-bundle",
+      "number": 15,
+      "url": "https://linux-images.flipp.dev/#/builders/14/builds/15",
+      "timestamp": "2026-08-12T02:25:47Z"
+    }
+  },
+  "sourcestamps": [
+    {
+      "codebase": "buildscripts",
+      "repository": "https://github.com/flipperdevices/flipperone-linux-build-scripts.git",
+      "branch": "dev",
+      "revision": "d0b14e8288cd0d42374506a7bf74b8d22c99c2f2"
+    },
+    {
+      "codebase": "linux-mainline",
+      "repository": "https://github.com/flipperdevices/flipper-linux-kernel.git",
+      "branch": "flipper-devel",
+      "revision": "9111dec8abe8a20e1cfb2402576b09db162557af"
+    },
+    {
+      "codebase": "u-boot",
+      "repository": "https://github.com/flipperdevices/u-boot.git",
+      "branch": "rk3576",
+      "revision": "fddd7e00447fb4c63d156aefea7177f90b8793d2"
+    }
+  ],
+  "items": [
+    {
+      "name": "mcu-firmware",
+      "builder": "mcu-firmware",
+      "artifact_key": "mcu-firmware/mcu=91da1b81cc1d1c549959695cac1b27c69b981492"
+    },
+    {
+      "name": "profile-packs",
+      "builder": "rootfs",
+      "artifact_key": "rootfs/tests=d9a8dbae66c82f2942f28d22ee49434846f4809b__scripts=d0b14e8288cd0d42374506a7bf74b8d22c99c2f2__linux-mainline=9111dec8abe8a20e1cfb2402576b09db162557af__linux-bsp=77168c8d5ab82399f65a80e9f807b50ba37cf483"
+    },
+    {
+      "name": "u-boot",
+      "builder": "u-boot",
+      "artifact_key": "u-boot/u=fddd7e00447fb4c63d156aefea7177f90b8793d2__rk=2e2961b363274470d8d805985af0dc1915e7d147__tfa=3ca70972bc4656f59d5dac4a1848c171ec0ec540__tee=5ba2ed69af2667bf59f17959be2f9e05b2d84436__scripts=d0b14e8288cd0d42374506a7bf74b8d22c99c2f2__linux=9111dec8abe8a20e1cfb2402576b09db162557af__initramfs=776e9f1e8b076d4941131d3d3b260dbe79eb788d__installer=d8542285bf79ce4b3bc747c671a5b1eb230d1a9e"
+    }
+  ],
+  "files": [
+    {
+      "path": "mcu/flipperone-mcu-firmware.uf2",
+      "size": 843264,
+      "mtime": "2026-08-11T17:45:28Z",
+      "sha256": "2cad2a936a8b9a9299dcca61112dcf8cb368936bcfb890bc35e0c7e83343912c",
+      "item": "mcu-firmware"
+    },
+    {
+      "path": "profile-packs/Desktop_917_stock_inc_pack.zst",
+      "size": 378365902,
+      "mtime": "2026-08-11T15:38:48Z",
+      "sha256": "6be04e3751e2e27bf7484ee94f13fbaa3f5f83dbb1589e836124f0061d20d303",
+      "item": "profile-packs"
+    },
+    {
+      "path": "profile-packs/Minimal_917_stock_pack.zst",
+      "size": 885256880,
+      "mtime": "2026-08-11T15:39:22Z",
+      "sha256": "8b7dfd2b6ae80d616f339ba8f9f4b80b01a640aed16858aa0d9cdad898b0019d",
+      "item": "profile-packs"
+    },
+    {
+      "path": "profile-packs/No-Graphics_917_stock_inc_pack.zst",
+      "size": 638,
+      "mtime": "2026-08-11T15:38:35Z",
+      "sha256": "390fe608df656b46545e8a2b0e10ad43122b28da43125a815bbc0a1f986931b4",
+      "item": "profile-packs"
+    },
+    {
+      "path": "profile-packs/Router_917_stock_inc_pack.zst",
+      "size": 5155,
+      "mtime": "2026-08-11T15:38:35Z",
+      "sha256": "35b694320f47bfefe112c3dbf838c68130aaa46c35993fcd91d36063731998f1",
+      "item": "profile-packs"
+    },
+    {
+      "path": "profile-packs/TV-Media-Box_917_stock_inc_pack.zst",
+      "size": 51545467,
+      "mtime": "2026-08-11T15:38:36Z",
+      "sha256": "845dc5f3ce0349c2d437ef9788a64891f4f30798f23818d7be893039d3886034",
+      "item": "profile-packs"
+    },
+    {
+      "path": "profile-packs/home_917_pack.zst",
+      "size": 3672,
+      "mtime": "2026-08-11T15:38:35Z",
+      "sha256": "2830e983204453aa92f37104dbf2399668397319fed18ec8dba7dddccfce5121",
+      "item": "profile-packs"
+    },
+    {
+      "path": "u-boot/evb/idbloader.img",
+      "size": 233472,
+      "mtime": "2026-08-11T15:26:52Z",
+      "sha256": "ff3a11e1c6212ccb9387672a29e9e0a60e5f412331458c8f770dd70dea3eef87",
+      "item": "u-boot"
+    },
+    {
+      "path": "u-boot/evb/u-boot-rockchip.bin",
+      "size": 9692672,
+      "mtime": "2026-08-11T15:26:53Z",
+      "sha256": "454f06764650465039cb2f05bf706f806150b9cd96cb1eaf8556b65bdadb3f9b",
+      "item": "u-boot"
+    },
+    {
+      "path": "u-boot/flipper-one/idbloader.img",
+      "size": 237568,
+      "mtime": "2026-08-11T15:26:52Z",
+      "sha256": "2e2e92a7988665ee8389ab9506aa98843576972ef6d2ece05d3c39171eb98658",
+      "item": "u-boot"
+    },
+    {
+      "path": "u-boot/flipper-one/u-boot-rockchip.bin",
+      "size": 9944064,
+      "mtime": "2026-08-11T15:26:54Z",
+      "sha256": "4c383d5b2c89245de80d7f3f1c84f0db7ee79995eebebf12e6479016f71255b5",
+      "item": "u-boot"
+    },
+    {
+      "path": "u-boot/generic/idbloader.img",
+      "size": 204800,
+      "mtime": "2026-08-11T15:26:53Z",
+      "sha256": "19525ef777d7f9914fd0a2916f0f94a49692d0c522aa0b9a0c4a30692a1e26ea",
+      "item": "u-boot"
+    },
+    {
+      "path": "u-boot/generic/u-boot-rockchip.bin",
+      "size": 9433600,
+      "mtime": "2026-08-11T15:26:55Z",
+      "sha256": "5b9b365f5dc506f4a22b90880e265b58ba1cbfb3bfd622d7f71a77f9af17a64e",
+      "item": "u-boot"
+    },
+    {
+      "path": "u-boot/nanopi-m5/idbloader.img",
+      "size": 237568,
+      "mtime": "2026-08-11T15:26:55Z",
+      "sha256": "31c32af62911a32d94e3cc7ae1442ac3900f83a1aa1727f06a2149797e8abf8b",
+      "item": "u-boot"
+    },
+    {
+      "path": "u-boot/nanopi-m5/u-boot-rockchip.bin",
+      "size": 9694720,
+      "mtime": "2026-08-11T15:26:56Z",
+      "sha256": "fc3a2d2c3a675d78cfd71b04c9f0e37a973b6bd22b7c616f60b50521c6f40560",
+      "item": "u-boot"
+    }
+  ]
+}

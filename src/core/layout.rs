@@ -106,11 +106,22 @@ fn try_load(cfg: &Config, board_id: &str, src: &Source) -> Option<(Layout, Strin
             let layout = Layout::parse(&text).ok()?;
             Some((layout, format!("media {path}")))
         }
+        // A bundle unpacked into the scratch dir, or a directory passed with
+        // `--bundle`: same convention as media.
+        Source::Local { root } => {
+            let path = format!(
+                "{}/flipperos/{}/btrfs-layout.toml",
+                root.trim_end_matches('/'),
+                board_id
+            );
+            let text = fs::read_to_string(&path).ok()?;
+            let layout = Layout::parse(&text).ok()?;
+            Some((layout, format!("local {path}")))
+        }
         Source::Server => {
             let base = cfg.server_url.trim_end_matches('/');
             let url = format!("{base}/boards/{board_id}/btrfs-layout.toml");
-            let resp = ureq::get(&url).call().ok()?;
-            let text = resp.into_string().ok()?;
+            let text = crate::core::fetch::read_text(&url).ok()?;
             let layout = Layout::parse(&text).ok()?;
             Some((layout, format!("server {url}")))
         }

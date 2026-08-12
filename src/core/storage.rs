@@ -224,6 +224,30 @@ pub fn device_in_use(disk: &str) -> Vec<String> {
     reasons
 }
 
+/// The partition device nodes of whole-disk `disk`, in partition-number order.
+///
+/// Read from sysfs: a child directory of `/sys/block/<disk>` that contains a
+/// `partition` file is a partition of it.
+pub fn partitions(disk: &str) -> Vec<String> {
+    let name = disk.trim_start_matches("/dev/");
+    let block = Path::new(SYS_BLOCK).join(name);
+    let Ok(entries) = fs::read_dir(&block) else {
+        return Vec::new();
+    };
+    let mut found: Vec<(u64, String)> = Vec::new();
+    for entry in entries.flatten() {
+        let child = entry.file_name().to_string_lossy().into_owned();
+        let dir = entry.path();
+        if !dir.join("partition").is_file() {
+            continue;
+        }
+        let number = read_u64(&dir.join("partition")).unwrap_or(u64::MAX);
+        found.push((number, format!("/dev/{child}")));
+    }
+    found.sort();
+    found.into_iter().map(|(_, node)| node).collect()
+}
+
 /// Whether `node` is a partition of whole-disk `disk` (`/dev/sda1` of
 /// `/dev/sda`, `/dev/mmcblk0p2` of `/dev/mmcblk0`) — a name suffix that is an
 /// optional `p` followed by digits, rejecting sibling disks like `/dev/sdaa`.

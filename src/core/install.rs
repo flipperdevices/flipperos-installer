@@ -22,8 +22,9 @@ use std::sync::Arc;
 use crate::core::controller::{Config, Controller};
 use crate::core::layout::{self, Layout};
 use crate::core::model::{
-    human_bytes, PackFile, ProfilePack, Source, StorageDevice, StorageKind, UbootBuild,
+    human_bytes, FetchMode, PackFile, ProfilePack, Source, StorageDevice, StorageKind, UbootBuild,
 };
+use crate::core::{fetch, stage};
 
 // GPT layout used by FlipperOS images, as byte offsets from the start of disk.
 // These are absolute byte offsets, independent of the device's sector size;
@@ -74,20 +75,20 @@ type Result<T> = std::result::Result<T, String>;
 /// marks the start of a discrete step and moves the bar to the fraction of steps
 /// completed so far; long steps can additionally animate within their own slice
 /// via [`Ticker::step_span`] + [`Controller::set_progress`].
-struct Ticker {
+pub(crate) struct Ticker {
     step: u32,
     total: u32,
 }
 
 impl Ticker {
-    fn new(total: u32) -> Self {
+    pub(crate) fn new(total: u32) -> Self {
         Ticker { step: 0, total }
     }
 
     /// Advance to the next step: log `msg` and set the bar to the fraction of
     /// steps completed *before* this one (so the step's own slice is left free
     /// to fill in as it progresses).
-    fn begin(&mut self, ctrl: &Controller, msg: &str) {
+    pub(crate) fn begin(&mut self, ctrl: &Controller, msg: &str) {
         self.step += 1;
         ctrl.set_progress((self.step - 1) as f32 / self.total as f32);
         ctrl.log(msg.to_string());
@@ -95,12 +96,61 @@ impl Ticker {
 
     /// `(base, span)` of the current step's slice of the overall bar, so a step
     /// can report intra-step progress as `set_progress(base + span * frac)`.
-    fn step_span(&self) -> (f32, f32) {
+    pub(crate) fn step_span(&self) -> (f32, f32) {
         (
             (self.step - 1) as f32 / self.total as f32,
             1.0 / self.total as f32,
         )
     }
+}
+
+/// How a digest that does not match the manifest is treated while the install is
+/// already writing.
+///
+/// In [`FetchMode::VerifyFirst`] every artifact was verified before the target
+/// was touched, so a mismatch now means the bytes changed underneath us and the
+/// run is failed. In [`FetchMode::Stream`] the operator declined the up-front
+/// check, and the verdict only arrives once the data has landed, so it can only
+/// be reported.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OnMismatch {
+    Fail,
+    Warn,
+}
+
+impl OnMismatch {
+    fn for_mode(mode: FetchMode) -> Self {
+        match mode {
+            FetchMode::VerifyFirst => OnMismatch::Fail,
+            FetchMode::Stream => OnMismatch::Warn,
+        }
+    }
+}
+
+/// Apply a digest verdict according to `policy`, logging what happened.
+pub(crate) fn apply_verdict(
+    ctrl: &Controller,
+    what: &str,
+    verdict: fetch::Verdict,
+    policy: OnMismatch,
+) -> Result<()> {
+    if let Some(msg) = verdict.message(what) {
+        ctrl.log(msg.clone());
+        if matches!(verdict, fetch::Verdict::Mismatch(_, _)) {
+            if policy == OnMismatch::Fail {
+                return Err(msg);
+            }
+            // Streaming: the bytes are already on the target, so say so plainly
+            // rather than letting a warning imply the install is still sound.
+            ctrl.log(format!(
+                "warning: {what} was already written to the target; \
+                 do not boot this installation"
+            ));
+        }
+    } else {
+        ctrl.log(format!("{what}: sha256 verified"));
+    }
+    Ok(())
 }
 
 /// A `Read` adapter that reports the running total of bytes read to a callback
@@ -128,7 +178,7 @@ impl<R: Read> Read for ProgressReader<'_, R> {
 /// `<what>: N%` line every 10%. `total` is the expected (compressed) byte count;
 /// when it is 0 (unknown) the bar is left alone and throughput is logged every
 /// 32 MiB so the step is never silent.
-fn receive_progress(
+pub(crate) fn receive_progress(
     ctrl: &Controller,
     what: String,
     base: f32,
@@ -174,21 +224,23 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
         .target()
         .cloned()
         .ok_or("no target device selected")?;
-    let uboot = state
+    let mut uboot = state
         .selected_uboot()
         .cloned()
         .ok_or("no u-boot build selected")?;
-    let build = state
+    let mut build = state
         .selected_build()
         .cloned()
         .ok_or("no snapshot build selected")?;
     if !build.loaded {
         return Err("snapshot build profiles not loaded yet".to_string());
     }
-    let minimal = build
-        .minimal()
-        .cloned()
-        .ok_or("snapshot build has no Minimal profile")?;
+    if !uboot.loaded {
+        return Err("u-boot build manifest not loaded yet".to_string());
+    }
+    if build.minimal().is_none() {
+        return Err("snapshot build has no Minimal profile".to_string());
+    }
     // Extra profiles the user opted into, in build order.
     let extras: Vec<ProfilePack> = build
         .extra_profiles()
@@ -215,7 +267,12 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
     // behind. Clear them before the in-use guard, so a retry is not refused
     // because of our own leftovers (a foreign mount still makes it refuse).
     release_own_mounts(cfg, ctrl);
+    // Our own read-only media mounts would otherwise make the target look busy.
+    // Dropping them here also fails fast if the artifacts we are about to read
+    // live on the disk we are about to wipe.
+    crate::core::removable::unmount_ours(Some(&device.path));
     guard_target(cfg, ctrl, &device)?;
+    stage::guard_not_on_target(&uboot, &build, &extras, &device.path)?;
 
     // Resolve the Btrfs layout: prefer one shipped with the images, else the
     // built-in default.
@@ -227,11 +284,71 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
         fs_layout.subvolumes.len()
     ));
 
+    // How a digest mismatch is treated once we are writing, and whether the
+    // artifacts are checked before that point at all.
+    let fetch_mode = state.selection.fetch;
+    let policy = OnMismatch::for_mode(fetch_mode);
+    let plan = stage::plan(&uboot, &build, &extras);
+
+    // A locally supplied `*.tar.zst` is unpacked into the scratch dir first; the
+    // bundle already describes its files at the paths they will occupy.
+    let pending_archive = state
+        .bundle
+        .as_ref()
+        .map(|b| b.reference.clone())
+        .filter(|r| r.archive.is_some());
+
     // 4 fixed steps, then receive + snapshot + kernel per deployed profile, plus
-    // one receive step for the shared /home seed when the build ships one.
+    // one receive step for the shared /home seed when the build ships one, one
+    // staging step per artifact when verifying up front, and one for unpacking a
+    // local archive.
     let deployed = 1 + extras.len();
-    let total_steps = 4 + deployed as u32 * 3 + build.home_pack.is_some() as u32;
+    let verify_steps = match fetch_mode {
+        FetchMode::VerifyFirst => plan.len() as u32,
+        FetchMode::Stream => 0,
+    };
+    let total_steps = 4
+        + pending_archive.is_some() as u32
+        + verify_steps
+        + deployed as u32 * 3
+        + build.home_pack.is_some() as u32;
     let mut ticker = Ticker::new(total_steps);
+
+    if let Some(reference) = &pending_archive {
+        stage::unpack_bundle(cfg, ctrl, reference, &mut ticker)?;
+    }
+
+    // Verify (and, for remote artifacts, download) everything before the first
+    // destructive command, so a bad or truncated artifact cannot leave the
+    // operator with a wiped device. `_staged` owns the scratch files: keeping it
+    // alive until the end of the run is what keeps them on disk.
+    let _staged = match fetch_mode {
+        FetchMode::VerifyFirst => {
+            let staged = stage::run(cfg, ctrl, &plan, &mut ticker)?;
+            staged.localise_uboot(&mut uboot);
+            staged.localise_build(&mut build);
+            Some(staged)
+        }
+        FetchMode::Stream => {
+            ctrl.log(
+                "streaming without up-front verification; \
+                 digests are checked as data is written"
+                    .to_string(),
+            );
+            None
+        }
+    };
+    // The Minimal pack and the extras were cloned out of `build` before staging
+    // rewrote its locations, so take them again from the staged copy.
+    let minimal = build
+        .minimal()
+        .cloned()
+        .ok_or("snapshot build has no Minimal profile")?;
+    let extras: Vec<ProfilePack> = build
+        .extra_profiles()
+        .filter(|p| state.selection.profiles.iter().any(|n| n == &p.name))
+        .cloned()
+        .collect();
 
     let root_part = partition_path(&device.path, ROOT_PART_INDEX);
 
@@ -252,7 +369,7 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
 
     // 3. Bootloader.
     ticker.begin(ctrl, &format!("installing u-boot {}", uboot.label));
-    install_uboot(cfg, ctrl, &device, &uboot)?;
+    install_uboot(cfg, ctrl, &device, &uboot, policy)?;
 
     // 4. Filesystem + subvolumes.
     ticker.begin(ctrl, &format!("mkfs.btrfs {root_part}"));
@@ -296,7 +413,15 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
             // $TOP/@home`), so it lands at @stock-snapshots/@home.
             let stock_dir = format!("{mnt}/{STOCK_SNAPSHOTS_DIR}");
             let staged = format!("{stock_dir}/{HOME_SUBVOL}");
-            receive_pack(cfg, ctrl, &stock_dir, home_pack, &mut on_progress)?;
+            receive_pack(
+                cfg,
+                ctrl,
+                &stock_dir,
+                home_pack,
+                "/home seed",
+                policy,
+                &mut on_progress,
+            )?;
             // Drop the empty placeholder the skeleton created (if it did) so the
             // writable @home snapshot can take its place; a custom layout that
             // omits @home leaves nothing to remove.
@@ -337,6 +462,7 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
             &minimal,
             minimal_full,
             "full",
+            policy,
             &mut ticker,
         )?;
 
@@ -355,6 +481,7 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
                 p,
                 inc,
                 "incremental",
+                policy,
                 &mut ticker,
             )?;
         }
@@ -384,6 +511,7 @@ fn deploy_profile(
     profile: &ProfilePack,
     pack: &PackFile,
     kind: &str,
+    policy: OnMismatch,
     ticker: &mut Ticker,
 ) -> Result<()> {
     ticker.begin(ctrl, &format!("receiving {} ({kind})", profile.name));
@@ -393,15 +521,16 @@ fn deploy_profile(
     // periodic percentage so neither frontend sits on a frozen bar. Progress is
     // measured against the compressed pack size (what we read off the wire/disk).
     let (base, span) = ticker.step_span();
+    let what = format!("{} ({kind})", profile.name);
     let mut on_progress = receive_progress(
         ctrl,
-        format!("receiving {} ({kind})", profile.name),
+        format!("receiving {what}"),
         base,
         span,
         pack.size_bytes,
     );
     let stock_dir = format!("{mnt}/{STOCK_SNAPSHOTS_DIR}");
-    receive_pack(cfg, ctrl, &stock_dir, pack, &mut on_progress)?;
+    receive_pack(cfg, ctrl, &stock_dir, pack, &what, policy, &mut on_progress)?;
 
     ticker.begin(ctrl, &format!("snapshotting {}", profile.root_subvol()));
     make_writable_snapshot(cfg, ctrl, mnt, &profile.stock_subvol(), &profile.root_subvol())?;
@@ -590,6 +719,7 @@ fn install_uboot(
     ctrl: &Controller,
     device: &StorageDevice,
     build: &UbootBuild,
+    policy: OnMismatch,
 ) -> Result<()> {
     // Write the image directly onto the loader partition (p1) from its start.
     // The GPT places p1 at the RK3576 mask-ROM offset, so this lands the
@@ -597,7 +727,17 @@ fn install_uboot(
     // created node before opening it.
     let loader = partition_path(&device.path, LOADER_PART_INDEX);
     wait_for_device(cfg, ctrl, &loader)?;
-    write_source_to_offset(cfg, ctrl, &build.image_location, &build.source, &loader, 0, false)?;
+    write_source_to_offset(
+        cfg,
+        ctrl,
+        &build.image_location,
+        &build.source,
+        &loader,
+        0,
+        false,
+        build.sha256.as_deref(),
+        policy,
+    )?;
 
     // On UFS the RK3576 mask ROM fetches DRAM init + SPL from Boot LU A, and
     // ignores the copy on the main LU's loader partition. Duplicate the leading
@@ -617,6 +757,8 @@ fn install_uboot(
                     &boot_lu,
                     LOADER_START,
                     true,
+                    build.sha256.as_deref(),
+                    policy,
                 )?;
             }
             None => ctrl.log(format!(
@@ -629,11 +771,14 @@ fn install_uboot(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn receive_pack(
     cfg: &Config,
     ctrl: &Controller,
     target: &str,
     pack: &PackFile,
+    what: &str,
+    policy: OnMismatch,
     on_progress: &mut dyn FnMut(u64),
 ) -> Result<()> {
     // The packs are zstd-compressed `btrfs send` streams. Decompress in-process
@@ -648,10 +793,15 @@ fn receive_pack(
         ));
         return Ok(());
     }
-    // Count bytes on the compressed source (before the decoder) so the reported
-    // progress lines up with the known compressed pack size.
+    // Count bytes and hash on the compressed source, before the decoder: the
+    // reported progress then lines up with the known compressed pack size, and
+    // the digest covers the pack exactly as the manifest describes it.
+    let mut sha = fetch::Sha256::new();
     let reader = ProgressReader {
-        inner: open_source(&pack.location, &pack.source)?,
+        inner: fetch::Digesting {
+            inner: open_source(&pack.location, &pack.source)?,
+            sha: &mut sha,
+        },
         read: 0,
         on_progress,
     };
@@ -659,7 +809,8 @@ fn receive_pack(
         .map_err(|e| format!("zstd {}: {e}", pack.location))?;
     let mut recv = Command::new("btrfs");
     recv.arg("receive").arg(target);
-    pump_reader_into(ctrl, decoder, recv, &pack.location)
+    pump_reader_into(ctrl, decoder, recv, &pack.location)?;
+    apply_verdict(ctrl, what, fetch::verify(sha, pack.sha256.as_deref()), policy)
 }
 
 fn make_writable_snapshot(
@@ -1054,21 +1205,10 @@ fn drain_child(ctrl: &Controller, child: &mut std::process::Child) {
 }
 
 /// Open a byte stream for a source: an HTTP GET for [`Source::Server`], or the
-/// local file for removable media.
+/// local file for removable media and unpacked bundles. See
+/// [`crate::core::fetch`] for the timeout and resume behaviour.
 fn open_source(location: &str, source: &Source) -> Result<Box<dyn Read + Send>> {
-    match source {
-        Source::Server => {
-            let resp = ureq::get(location)
-                .call()
-                .map_err(|e| format!("GET {location}: {e}"))?;
-            Ok(Box::new(resp.into_reader()))
-        }
-        Source::Removable { .. } => {
-            let file = std::fs::File::open(location)
-                .map_err(|e| format!("open {location}: {e}"))?;
-            Ok(Box::new(file))
-        }
-    }
+    fetch::open(location, source)
 }
 
 /// Stream a source (HTTP URL for [`Source::Server`], local path otherwise)
@@ -1078,6 +1218,7 @@ fn open_source(location: &str, source: &Source) -> Result<Box<dyn Read + Send>> 
 /// write until the device runs out of space and treat that as success, so only
 /// the leading part that fits is kept (used to seed a small UFS boot LU with the
 /// front of the full U-Boot image). Otherwise a short write is an error.
+#[allow(clippy::too_many_arguments)]
 fn write_source_to_offset(
     cfg: &Config,
     ctrl: &Controller,
@@ -1086,6 +1227,8 @@ fn write_source_to_offset(
     device: &str,
     offset: u64,
     fill: bool,
+    expect: Option<&str>,
+    policy: OnMismatch,
 ) -> Result<()> {
     if cfg.dry_run {
         ctrl.log(format!(
@@ -1096,7 +1239,11 @@ fn write_source_to_offset(
     }
     ctrl.log(format!("writing {location} -> {device} @ offset {offset} B"));
 
-    let mut reader = open_source(location, source)?;
+    let mut sha = fetch::Sha256::new();
+    let mut reader = fetch::Digesting {
+        inner: open_source(location, source)?,
+        sha: &mut sha,
+    };
     let mut file = OpenOptions::new()
         .write(true)
         .open(device)
@@ -1112,7 +1259,16 @@ fn write_source_to_offset(
     file.sync_all()
         .map_err(|e| format!("sync {device}: {e}"))?;
     ctrl.log(format!("wrote {written} bytes to {device}"));
-    Ok(())
+    // A `fill` write stops at the end of a small boot LU, so only part of the
+    // image was read and its digest cannot be checked.
+    if fill {
+        ctrl.log(format!(
+            "{device}: partial copy of the image; not verified"
+        ));
+        return Ok(());
+    }
+    drop(reader);
+    apply_verdict(ctrl, "u-boot image", fetch::verify(sha, expect), policy)
 }
 
 /// Linux `errno` for "No space left on device" — what a `write(2)` past the end

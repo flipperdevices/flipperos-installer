@@ -17,7 +17,7 @@ use slint::platform::software_renderer::{
 use slint::platform::{Platform, PlatformError, WindowAdapter};
 use slint::{ComponentHandle, ModelRc, PhysicalSize, SharedString, VecModel};
 
-use flipperos_installer::gui::MainWindow;
+use flipperos_installer::gui::{MainWindow, MenuEntry};
 
 const W: usize = 256;
 const H: usize = 144;
@@ -36,17 +36,31 @@ impl Platform for ScreenshotPlatform {
     }
 }
 
-fn strs(items: &[&str]) -> ModelRc<SharedString> {
-    let v: Vec<SharedString> = items.iter().map(|s| SharedString::from(*s)).collect();
+/// One menu row. The tuple mirrors `core::menu::MenuItem`'s rendered fields:
+/// `(text, detail, icon, marker, drill, dim, action)` where `icon` is 0 none /
+/// 1 network / 2 sdcard and `marker` is 0 none / 1 unchecked / 2 checked /
+/// 3 committed choice.
+type Row<'a> = (&'a str, &'a str, i32, i32, bool, bool, bool);
+
+fn rows(items: &[Row]) -> ModelRc<MenuEntry> {
+    let v: Vec<MenuEntry> = items
+        .iter()
+        .map(|(text, detail, icon, marker, drill, dim, action)| MenuEntry {
+            text: SharedString::from(*text),
+            detail: SharedString::from(*detail),
+            icon: *icon,
+            marker: *marker,
+            drill: *drill,
+            dim: *dim,
+            action: *action,
+        })
+        .collect();
     ModelRc::new(VecModel::from(v))
 }
 
-fn bools(items: &[bool]) -> ModelRc<bool> {
-    ModelRc::new(VecModel::from(items.to_vec()))
-}
-
-fn ints(items: &[i32]) -> ModelRc<i32> {
-    ModelRc::new(VecModel::from(items.to_vec()))
+/// A plain drill-in row.
+fn drill(text: &str, marker: i32) -> Row<'_> {
+    (text, "", 0, marker, true, false, false)
 }
 
 fn main() {
@@ -62,69 +76,25 @@ fn main() {
 
     // --- representative data (long lists, so scrolling is exercised) ---
     ui.set_device_type_text("Device type: Flipper One [flipper-one]".into());
-    ui.set_info_text("3 target(s), 14 build(s) found".into());
+    ui.set_info_text("3 target(s), 8 bundle(s) found".into());
     ui.set_installing(false);
     ui.set_progress(0.0);
     ui.set_can_install(true);
-    ui.set_install_status_text("ready".into());
-    ui.set_status_text("unpacking Minimal_stock…".into());
+    ui.set_status_text("verifying Minimal (full): 40%…".into());
 
-    // Split into name (left) + detail (right, gray); builds also get a source
-    // icon (1 = network/server, 2 = sdcard/media), mirroring the real apply().
-    let devices = [
-        "/dev/mmcblk0 [eMMC] SDINDDH4-32G",
-        "/dev/mmcblk1 [SD] SC64G",
-        "! /dev/sda [USB] SanDisk Ultra",
-        "! /dev/sdb [USB] Kingston DT",
+    // The five summary rows, as core::menu::root_level builds them.
+    let summary: [Row; 5] = [
+        ("Source", "nightly #15", 0, 0, true, false, false),
+        ("Device", "/dev/mmcblk0 29.7 GiB", 0, 0, true, false, false),
+        ("Profiles", "Minimal +2", 0, 0, true, false, false),
+        ("Fetch", "verify first", 0, 0, true, false, false),
+        ("Install", "ready", 0, 0, false, false, true),
     ];
-    let devices_detail = ["29.7 GiB", "59.5 GiB", "14.9 GiB", "3.8 GiB"];
-    let devices_dim = [false, false, true, true];
-    ui.set_devices(strs(&devices));
-    ui.set_devices_detail(strs(&devices_detail));
-    ui.set_devices_dim(bools(&devices_dim));
-
-    // Identifiers are the manifest build number once fetched; the last row shows
-    // the label fallback (media build whose manifest hasn't been fetched).
-    let uboots = ["#512", "#489", "#455", "2023.10-rk3576"];
-    let uboots_detail = ["2024-10-02", "2024-07-15", "2024-04-11", "2023-10-30"];
-    let uboots_icon = [1, 1, 1, 2]; // last one from removable media
-    ui.set_uboots(strs(&uboots));
-    ui.set_uboots_detail(strs(&uboots_detail));
-    ui.set_uboots_icon(ints(&uboots_icon));
-
-    let snapshots = [
-        "#704", "#703", "#698", "#695", "#690",
-        "#684", "#679", "#672", "nightly-7850", "stable-7800",
-    ];
-    let snapshots_detail = [
-        "2024-10-05 08:43", "2024-10-05 06:11", "2024-10-01 22:07", "2024-09-20 14:30",
-        "2024-09-18 09:52", "2024-09-12 03:18", "2024-09-01 17:44", "2024-08-28 11:05",
-        "2024-08-22 20:39", "2024-08-10 08:00",
-    ];
-    let snapshots_icon = [1, 1, 1, 1, 1, 1, 1, 1, 2, 2]; // last two from media
-    ui.set_snapshots(strs(&snapshots));
-    ui.set_snapshots_detail(strs(&snapshots_detail));
-    ui.set_snapshots_icon(ints(&snapshots_icon));
-
-    let profiles = ["Minimal (always)", "Desktop", "Developer", "Gaming", "Media"];
-    let profiles_detail = ["128.4 MiB", "642.1 MiB", "311.0 MiB", "1.2 GiB", "498.7 MiB"];
-    let profile_checked = [true, true, false, true, false];
-    ui.set_profiles(strs(&profiles));
-    ui.set_profiles_detail(strs(&profiles_detail));
-    ui.set_profile_checked(bools(&profile_checked));
-
-    // Summary-row values.
-    ui.set_device_sel_text("/dev/mmcblk0 29.7 GiB".into());
-    ui.set_has_device(true);
-    ui.set_uboot_sel_text("2024.10-rk3576".into());
-    ui.set_has_uboot(true);
-    ui.set_snapshot_sel_text("nightly-8123".into());
-    ui.set_has_snapshot(true);
-    ui.set_profiles_sel_text("Minimal +2".into());
+    ui.set_summary_items(rows(&summary));
 
     std::fs::create_dir_all("target/screenshots").expect("mkdir");
 
-    // Summary screen, "Snapshot" row highlighted.
+    // Summary screen, "Profiles" row highlighted.
     ui.set_screen(0);
     ui.set_menu_index(2);
     shoot(&window, "01-summary");
@@ -135,37 +105,105 @@ fn main() {
 
     // Summary during installation: progress bar + latest log line replace the
     // idle info line, and the Install soft button disappears.
+    let installing_summary: [Row; 5] = [
+        ("Source", "nightly #15", 0, 0, true, false, false),
+        ("Device", "/dev/mmcblk0 29.7 GiB", 0, 0, true, false, false),
+        ("Profiles", "Minimal +2", 0, 0, true, false, false),
+        ("Fetch", "verify first", 0, 0, true, false, false),
+        ("Install", "in progress", 0, 0, false, false, true),
+    ];
+    ui.set_summary_items(rows(&installing_summary));
     ui.set_installing(true);
     ui.set_busy(true); // Phase::Installing is busy → Refresh soft button hidden.
     ui.set_progress(0.42);
     ui.set_can_install(false);
-    ui.set_install_status_text("in progress".into());
     shoot(&window, "02b-summary-installing");
+    ui.set_summary_items(rows(&summary));
     ui.set_installing(false);
     ui.set_busy(false);
-    ui.set_install_status_text("ready".into());
     ui.set_can_install(true);
     ui.set_progress(0.0);
 
-    // Device submenu (short list, one greyed non-boot-capable entry).
+    // The source picker: channels, local bundles, and the legacy custom flow.
+    // The bullet marks where the current selection came from.
     ui.set_screen(1);
-    ui.set_sub_section(0);
-    ui.set_cursor(0);
-    shoot(&window, "03-submenu-device");
+    ui.set_level_can_details(false);
+    ui.set_level_can_refresh(true);
+    ui.set_level_multi(false);
+    ui.set_level_title("Source".into());
+    let source: [Row; 6] = [
+        ("Release", "", 1, 0, true, false, false),
+        ("Testing", "", 1, 0, true, false, false),
+        ("Nightly", "", 1, 3, true, false, false),
+        ("Dev", "", 1, 0, true, false, false),
+        ("Local bundle", "1", 2, 0, true, false, false),
+        drill("Custom development build", 0),
+    ];
+    ui.set_level_items(rows(&source));
+    ui.set_cursor(2);
+    shoot(&window, "03-level-source");
 
-    // Snapshot submenu scrolled down, so the scrollbar/scroll is visible.
-    ui.set_sub_section(2);
+    // A channel's builds: more than fit, so the scrollbar shows. The selected
+    // build carries its number and a details popup.
+    ui.set_level_title("Nightly".into());
+    ui.set_level_can_details(true);
+    let builds: [Row; 10] = [
+        ("20260812-83ddb68-15", "#15", 1, 3, false, false, false),
+        ("20260811-83ddb68-14", "", 1, 0, false, false, false),
+        ("20260810-83ddb68-13", "", 1, 0, false, false, false),
+        ("20260809-83ddb68-12", "", 1, 0, false, false, false),
+        ("20260808-83ddb68-11", "", 1, 0, false, false, false),
+        ("20260807-83ddb68-8", "", 1, 0, false, false, false),
+        ("20260806-83ddb68-6", "", 1, 0, false, false, false),
+        ("20260805-83ddb68-5", "", 1, 0, false, false, false),
+        ("20260804-83ddb68-4", "", 1, 0, false, false, false),
+        ("20260803-83ddb68-3", "", 1, 0, false, false, false),
+    ];
+    ui.set_level_items(rows(&builds));
     ui.set_cursor(9);
-    shoot(&window, "04-submenu-snapshot-scrolled");
+    shoot(&window, "04-level-builds-scrolled");
 
-    // Profiles submenu (checkboxes; Minimal is always on).
-    ui.set_sub_section(3);
-    ui.set_cursor(1);
-    shoot(&window, "05-submenu-profiles");
+    // The profiles level: checkboxes, with Minimal pinned on and dimmed.
+    ui.set_level_title("Profiles".into());
+    ui.set_level_multi(true);
+    ui.set_level_can_details(false);
+    let profiles: [Row; 6] = [
+        ("Minimal (always)", "844.2 MiB", 0, 2, false, true, false),
+        ("(all extra profiles)", "", 0, 1, false, false, false),
+        ("Desktop", "360.8 MiB", 0, 2, false, false, false),
+        ("No-Graphics", "638 B", 0, 1, false, false, false),
+        ("Router", "5.0 KiB", 0, 1, false, false, false),
+        ("TV-Media-Box", "49.2 MiB", 0, 2, false, false, false),
+    ];
+    ui.set_level_items(rows(&profiles));
+    ui.set_cursor(2);
+    shoot(&window, "05-level-profiles");
 
-    // Details popup (screen 2): sourcestamps for a snapshot build.
-    ui.set_sub_section(2);
-    ui.set_details_title("Snapshot details".into());
+    // A dev drill-down level, whose heading is the deepest path segment.
+    ui.set_level_title("Alchark".into());
+    ui.set_level_multi(false);
+    let branches: [Row; 3] = [
+        drill("update-bundles", 0),
+        drill("ufs-boot-lu", 0),
+        drill("wip/kernel-6.12", 0),
+    ];
+    ui.set_level_items(rows(&branches));
+    ui.set_cursor(0);
+    shoot(&window, "07-level-dev-branches");
+
+    // The fetch-mode pick: two rows, so the popup frame is at its smallest.
+    ui.set_level_title("Fetch mode".into());
+    ui.set_level_can_refresh(false);
+    let fetch: [Row; 2] = [
+        ("Download & verify", "check before writing", 0, 3, false, false, false),
+        ("Stream", "check while writing", 0, 0, false, false, false),
+    ];
+    ui.set_level_items(rows(&fetch));
+    ui.set_cursor(0);
+    shoot(&window, "08-level-fetch");
+
+    // Details popup (screen 2): sourcestamps for a bundle.
+    ui.set_details_title("Bundle details".into());
     let raw = "Build #692 (rootfs)\n  2026-07-16 09:42\n  https://linux-images.flipp.dev/#/builders/11/builds/692\n\nlinux-mainline\n  branch: flipper-devel\n  rev: 895107b0c84dd4f9af8791f15d66447fbe48743e\n  https://github.com/flipperdevices/flipper-linux-kernel.git\n\nbuildscripts\n  branch: dev\n  rev: ae979d1abf2a8f833e303185e28eb177e7008a0b";
     let lines: Vec<SharedString> = raw
         .split('\n')

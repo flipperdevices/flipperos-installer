@@ -40,6 +40,20 @@ toml = "0.8"
 # vendored C library straight into the binary (no runtime .so; needs a C
 # compiler at build time), and is much faster than a pure-Rust decoder.
 zstd = "0.13"
+# Tar reader for locally supplied `*.tar.zst` update bundles. `default-features
+# = false` drops the `xattr` feature: we unpack plain files into a scratch dir
+# and never want extended attributes (nor the extra dependency) — do not
+# "restore" the default features here.
+tar = { version = "0.4", default-features = false }
+# SHA-256 for verifying bundle artifacts against their manifest. `ring` is
+# already compiled and linked into the binary by ureq's rustls, so depending on
+# it directly costs no extra code size, and it uses the ARMv8 SHA-2 extensions
+# on the RK3576. All hashing goes through `core::fetch::Sha256`, so swapping to
+# `sha2` (should a future rustls drop ring) is a change in one place.
+ring = "0.17"
+# statvfs(3) for the free-space precheck before staging ~1 GiB of artifacts.
+# Already in the dependency graph via zstd-sys.
+libc = "0.2"
 
 # TUI frontend (serial console / any terminal).
 [dependencies.cursive]

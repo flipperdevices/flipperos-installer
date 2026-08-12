@@ -9,11 +9,9 @@
 //!
 //! `<base>` is an HTTP(S) URL for the server or a filesystem path for media.
 
-use std::io::Read;
-use std::time::Duration;
-
 use serde::Deserialize;
 
+use crate::core::fetch;
 use crate::core::model::{BuildDetails, PackFile, ProfilePack, SnapshotBuild, Source, UbootBuild};
 
 /// A place to read the catalog from.
@@ -96,7 +94,8 @@ pub fn supported_device_types(origin: &Origin) -> Vec<String> {
     types
 }
 
-/// List the available U-Boot builds for `board_dir`, newest first (capped).
+/// List the available U-Boot builds for `board_dir`, newest first (capped). The
+/// image size and digest are loaded lazily via [`load_uboot_contents`].
 pub fn uboot_builds(origin: &Origin, board_dir: &str, limit: usize) -> Vec<UbootBuild> {
     let list: ListManifest = match fetch_json(&origin.join("u-boot/manifest.json")) {
         Ok(l) => l,
@@ -115,10 +114,41 @@ pub fn uboot_builds(origin: &Origin, board_dir: &str, limit: usize) -> Vec<Uboot
                 manifest_location: format!("{base_location}manifest.json"),
                 source: origin.source(),
                 size_bytes: 0,
+                sha256: None,
                 details: None,
+                loaded: false,
             }
         })
         .collect()
+}
+
+/// Parsed contents of a U-Boot build manifest: the flashable image's size and
+/// digest, plus the build metadata for the details popup.
+pub type UbootContents = (u64, Option<String>, String, BuildDetails);
+
+/// Fetch a U-Boot build's manifest and extract the metadata for its
+/// `<board_dir>/u-boot-rockchip.bin`.
+///
+/// The sibling of [`load_profiles`]: both kinds of build carry a manifest, and
+/// both are read exactly once through this pair, so the details popup, the
+/// verification pass and the install path all see the same fields.
+pub fn load_uboot_contents(build: &UbootBuild, board_dir: &str) -> Result<UbootContents, String> {
+    let bm: BuildManifest = fetch_json(&build.manifest_location)?;
+    let details = bm.details();
+    let wanted = format!("{board_dir}/u-boot-rockchip.bin");
+    let entry = bm
+        .files
+        .iter()
+        .find(|f| f.path == wanted || f.path.ends_with(&format!("/{wanted}")));
+    match entry {
+        Some(f) => Ok((f.size, f.digest(), f.mtime.clone(), details)),
+        // The build exists but ships nothing for this board. Report it rather
+        // than silently flashing whatever the URL happens to return.
+        None => Err(format!(
+            "{} lists no {wanted}",
+            build.manifest_location
+        )),
+    }
 }
 
 /// List the available snapshot (rootfs) builds, newest first (capped). Profile
@@ -169,6 +199,7 @@ pub fn load_profiles(build: &SnapshotBuild) -> Result<BuildContents, String> {
             location: format!("{}{}", build.base_location, fname),
             source: build.source.clone(),
             size_bytes: f.size,
+            sha256: f.digest(),
         };
         // The shared /home seed (`home_<build>_pack.zst`) is not a profile.
         if parse_home_pack(fname).is_some() {
@@ -221,18 +252,25 @@ struct DirEntry {
     mtime: Option<String>,
 }
 
+/// A build's `manifest.json`. `build` and `sourcestamps` are the same sections
+/// [`BuildDetails`] exposes to the details popup, so one fetch serves both.
 #[derive(Debug, Deserialize)]
 struct BuildManifest {
     #[serde(default)]
-    build: BuildMeta,
+    build: crate::core::model::BuildMeta,
+    #[serde(default)]
+    sourcestamps: Vec<crate::core::model::SourceStamp>,
     #[serde(default)]
     files: Vec<FileEntry>,
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct BuildMeta {
-    #[serde(default)]
-    number: Option<u64>,
+impl BuildManifest {
+    fn details(&self) -> BuildDetails {
+        BuildDetails {
+            build: self.build.clone(),
+            sourcestamps: self.sourcestamps.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -240,6 +278,22 @@ struct FileEntry {
     path: String,
     #[serde(default)]
     size: u64,
+    /// SHA-256 of the file as stored. Current builds publish one; older builds
+    /// predate the field, hence `Option`.
+    #[serde(default)]
+    sha256: Option<String>,
+    #[serde(default)]
+    mtime: String,
+}
+
+impl FileEntry {
+    /// The digest, treating an empty string the same as an absent field.
+    fn digest(&self) -> Option<String> {
+        self.sha256
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    }
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -272,7 +326,10 @@ fn short(hash: &str) -> String {
 
 /// Parse a pack filename into `(profile, build, is_incremental)`.
 /// Accepts `<Profile>_<build>_stock_pack.zst` and `..._stock_inc_pack.zst`.
-fn parse_pack(fname: &str) -> Option<(String, String, bool)> {
+///
+/// Shared with [`crate::core::bundle`], which walks a bundle manifest's file
+/// list rather than a rootfs build's.
+pub(crate) fn parse_pack(fname: &str) -> Option<(String, String, bool)> {
     let stem = fname.strip_suffix(".zst")?;
     let (rest, is_inc) = if let Some(r) = stem.strip_suffix("_stock_inc_pack") {
         (r, true)
@@ -294,7 +351,7 @@ fn parse_pack(fname: &str) -> Option<(String, String, bool)> {
 /// Parse a shared `/home` seed filename `home_<build>_pack.zst`, returning the
 /// build number. This is a full `btrfs send` of `@home` (version-independent,
 /// no incremental), distinct from the per-profile `_stock` packs.
-fn parse_home_pack(fname: &str) -> Option<String> {
+pub(crate) fn parse_home_pack(fname: &str) -> Option<String> {
     let num = fname
         .strip_suffix(".zst")?
         .strip_prefix("home_")?
@@ -306,28 +363,10 @@ fn parse_home_pack(fname: &str) -> Option<String> {
     }
 }
 
+/// Read a (small) manifest from an HTTP URL or a local path. Thin alias for
+/// [`fetch::json`], kept so the call sites here read as before.
 fn fetch_json<T: serde::de::DeserializeOwned>(location: &str) -> Result<T, String> {
-    let bytes = fetch_bytes(location)?;
-    serde_json::from_slice(&bytes).map_err(|e| format!("parse {location}: {e}"))
-}
-
-/// Read a (small) manifest into memory from an HTTP URL or a local path.
-fn fetch_bytes(location: &str) -> Result<Vec<u8>, String> {
-    if location.starts_with("http://") || location.starts_with("https://") {
-        let resp = ureq::get(location)
-            .timeout(Duration::from_secs(20))
-            .call()
-            .map_err(|e| format!("GET {location}: {e}"))?;
-        let mut buf = Vec::new();
-        // Manifests are small; cap to guard against surprises.
-        resp.into_reader()
-            .take(32 * 1024 * 1024)
-            .read_to_end(&mut buf)
-            .map_err(|e| format!("read {location}: {e}"))?;
-        Ok(buf)
-    } else {
-        std::fs::read(location).map_err(|e| format!("read {location}: {e}"))
-    }
+    fetch::json(location)
 }
 
 #[cfg(test)]

@@ -9,10 +9,13 @@ It can:
 - **Discover the running board** from the device tree (`/proc/device-tree`).
 - **Enumerate local storage** the RK3576 boot ROM can boot from (UFS, eMMC, SD)
   via sysfs.
+- **Browse update bundles** published per channel (`release`, `testing`,
+  `nightly`, and per-developer `dev/<user>/<branch>` builds), and verify each
+  artifact against the SHA-256 digests in the bundle's manifest.
 - **Query the image server** for available U-Boot images and exported profile
-  snapshots for the board.
-- **Search removable storage** (SD / USB) for offline U-Boot images and profile
-  snapshots.
+  snapshots for the board (the *custom development build* flow).
+- **Mount removable storage** (SD / USB) read-only and search it for update
+  bundles, offline U-Boot images and profile snapshots.
 - Present a **TUI** (Cursive + Crossterm) for serial-console operation.
 - Present a **GUI** (Slint + LinuxKMS) on the Flipper One 256×144 DRM screen,
   driven by the on-device buttons (a Linux input event device).
@@ -25,24 +28,45 @@ It can:
 Both frontends are thin views over a single shared installer state:
 
 ```
-                 ┌──────────────────────────────┐
-   serial  ─────▶│  TUI (cursive/crossterm)     │─┐
-   console       └──────────────────────────────┘ │  actions
-                                                   ▼
-                 ┌──────────────────────────────┐  Controller ── AppState
-   on-device ───▶│  GUI (slint/linuxkms)        │─┐  (single source of truth)
-   buttons       └──────────────────────────────┘ │  snapshots ▲
-                                                   └────────────┘
+                      ┌──────────────────────────────┐
+   serial console ───>│ TUI (cursive / crossterm)    │
+                      └───────┬──────────────┬───────┘
+                              │              ^
+                              │ actions      │ snapshots
+                              v              │
+                      ┌───────┴──────────────┴───────┐
+                      │ Controller                   │
+                      │ owns AppState — the single   │
+                      │ source of truth              │
+                      └───────┬──────────────┬───────┘
+                              ^              │
+                              │ actions      │ snapshots
+                              │              v
+   on-device          ┌───────┴──────────────┴───────┐
+   buttons ──────────>│ GUI (slint / linuxkms)       │
+                      └──────────────────────────────┘
 ```
 
+Both frontends render the *same* menu tree, built once in
+[`core::menu`](src/core/menu.rs); only the current position in that tree is
+per-frontend, so the two can sit on different screens while sharing every
+selection.
+
 - [`core::model`](src/core/model.rs) — plain data model (`AppState`, devices,
-  images, snapshots).
+  images, snapshots, bundles).
 - [`core::controller`](src/core/controller.rs) — owns `AppState`, applies all
   mutations, and broadcasts immutable snapshots to every subscribed frontend so
   the TUI and GUI mirror each other live.
+- [`core::menu`](src/core/menu.rs) — the menu tree: what each screen contains,
+  built once and rendered by both frontends. Only the *position* in the tree is
+  per-frontend.
 - [`core::board`](src/core/board.rs) / [`core::storage`](src/core/storage.rs) /
-  [`core::removable`](src/core/removable.rs) / [`core::server`](src/core/server.rs)
-  — discovery.
+  [`core::removable`](src/core/removable.rs) — discovery.
+- [`core::bundle`](src/core/bundle.rs) / [`core::archive`](src/core/archive.rs) /
+  [`core::catalog`](src/core/catalog.rs) — the two kinds of image source.
+- [`core::fetch`](src/core/fetch.rs) — every byte the installer reads, plus the
+  SHA-256 primitives; [`core::stage`](src/core/stage.rs) — verifying artifacts
+  before the target is touched.
 - [`core::install`](src/core/install.rs) — the destructive install pipeline
   (honours `--dry-run`).
 - [`tui`](src/tui/mod.rs) / [`gui`](src/gui/mod.rs) — the two frontends.
@@ -109,19 +133,86 @@ sudo ./flipperos-installer
 # Serial console only:
 sudo ./flipperos-installer --tui
 
-# On-device screen only, real install, custom server:
+# On-device screen only, real install:
 sudo ./flipperos-installer --gui --no-dry-run \
-    --server https://images.flipperos.example \
     --kms-device /dev/dri/by-path/platform-2acf0000.spi-cs-0-card
+
+# Install from a bundle sitting on a USB stick, streaming rather than staging:
+sudo ./flipperos-installer --no-dry-run --fetch stream \
+    --bundle /mnt/usb/flipperone-update-20260812-83ddb68-nightly-15.tar.zst
+
+# Hand-picked U-Boot + rootfs pair from the image server:
+sudo ./flipperos-installer --custom --server https://images.flipperos.example
 ```
 
 By default the installer runs in **dry-run** mode: every destructive command is
-logged but not executed. Pass `--no-dry-run` to actually flash.
+logged but not executed. Pass `--no-dry-run` to actually flash. `--help` lists
+every flag; the bundle-specific ones are described under
+[Update bundles](#update-bundles).
+
+Two examples double as development probes, and both run without a screen or a
+serial console:
+
+```sh
+# Browse the real bucket and resolve the newest bundle.
+cargo run --example bundle_probe --no-default-features
+
+# Drive a whole installation headlessly, in dry-run mode.
+cargo run --example dry_run --no-default-features
+```
+
+## Update bundles
+
+An **update bundle** is one artifact set that pins a U-Boot build and a rootfs
+build together, with a SHA-256 digest for every file. Installing from a bundle is
+the default. Bundles are published per channel:
+
+```
+bundles/<channel>/<build>/               channel = release | testing | nightly
+bundles/dev/<user>/<branch>/<build>/     per-developer topic branches
+```
+
+and each build directory holds a `manifest.json`, the flashable
+`u-boot/<board>/u-boot-rockchip.bin` for every supported board, the
+`profile-packs/` (the same `<Profile>_<build>_stock[_inc]_pack.zst` and
+`home_<build>_pack.zst` files the image server publishes), MCU firmware the
+installer ignores, and a `*.tar.zst` of the whole tree.
+
+Directory listing is not available on the public object host, so the installer
+**lists** through the bucket's object API (`--bundle-bucket`, or
+`--bundle-list-url` to override the endpoint outright) and **downloads** from the
+public base URL (`--bundle-url`). Builds are ordered by directory name,
+descending; the build number shown in the UI comes from the manifest once a
+bundle is selected, so nothing depends on the shape of the directory name.
+
+A bundle can equally come from a local directory holding a `manifest.json`, or
+from a `*.tar.zst` — passed with `--bundle` or found on removable media, which
+the installer mounts read-only during discovery (`--no-automount` opts out).
+A local archive is unpacked into the scratch directory before installing; a
+remote install never reads the archive, only the individual files its manifest
+lists and the operator's profile selection call for.
+
+### Verifying
+
+The **Fetch** row chooses when artifacts are checked:
+
+- `verify first` (the default) downloads exactly what the run needs — the U-Boot
+  image, the Minimal full pack, each selected incremental and the `/home` seed —
+  into `--cache-dir`, compares each against its manifest digest, and only then
+  starts partitioning. A bad or truncated artifact therefore cannot leave a wiped
+  device behind. The space needed (~0.8–1.3 GiB) is checked up front.
+- `stream` writes as it downloads, hashing on the way through. The verdict
+  necessarily arrives after the bytes have landed, so a mismatch is reported as a
+  warning that says the target must not be booted.
+
+Either way, an artifact whose manifest publishes no digest is installed with a
+warning that verification was skipped. Both modes also work for the *custom
+development build* flow, whose manifests now carry digests too.
 
 ## Image sources
 
-The installer reads the image server's two-level catalog (default base
-`https://dl-linux-images.flipp.dev`, override with `--server`):
+The *custom development build* flow reads the image server's two-level catalog
+(default base `https://dl-linux-images.flipp.dev`, override with `--server`):
 
 - **U-Boot:** `/u-boot/manifest.json` lists build directories; each build's
   `manifest.json` contains `<board>/u-boot-rockchip.bin`. The installer flashes
@@ -132,11 +223,14 @@ The installer reads the image server's two-level catalog (default base
   `<Profile>_<build>_stock_pack.zst` (full) and `<Profile>_<build>_stock_inc_pack.zst`
   (incremental delta vs. Minimal).
 
-Both lists are presented **newest first**. The operator picks one U-Boot build
-and one snapshot build. **Minimal is always deployed** (from its full pack); any
-extra profiles the operator selects are streamed from their **incremental** packs
-on top of Minimal. Packs are zstd-compressed `btrfs send` streams, decompressed
-in-process and piped into `btrfs receive`.
+Both lists are presented **newest first**, and the operator picks one U-Boot build
+and one snapshot build — any combination, which is what makes this the *custom*
+flow rather than the default one.
+
+Either way — bundle or custom pair — **Minimal is always deployed** (from its full
+pack); any extra profiles the operator selects are received from their
+**incremental** packs on top of Minimal. Packs are zstd-compressed `btrfs send`
+streams, decompressed in-process and piped into `btrfs receive`.
 
 A removable-media mirror of the same `u-boot/` and `rootfs/` tree is picked up
 automatically and merged into the lists.

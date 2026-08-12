@@ -18,8 +18,12 @@ export component ListRow inherits Rectangle {
     in property <int> icon-kind;
     in property <bool> selected;
     in property <bool> dim;
-    in property <bool> checkbox;
-    in property <bool> checked;
+    // Leading state marker, from core::menu::Marker: 0 none, 1 unchecked,
+    // 2 checked. Only multi-choice levels use it; a single choice is shown by
+    // where the cursor opens, not by decorating the row.
+    in property <int> marker;
+    // Whether the row opens another level, drawn as a trailing chevron.
+    in property <bool> drill;
     height: 13px;
     // 1px separator beneath the row, inset to the selection box width minus
     // its rounded corners (so it stops short of the frame's rounded parts,
@@ -36,8 +40,9 @@ export component ListRow inherits Rectangle {
         padding-left: 5px;
         padding-right: 5px;
         spacing: 3px;
-        if root.checkbox : Text {
-            text: root.checked ? "[x]" : "[ ]";
+        // Checkbox for a toggle row, a bullet for the committed single choice.
+        if root.marker == 1 || root.marker == 2 : Text {
+            text: root.marker == 2 ? "[x]" : "[ ]";
             font-family: "HaxrCorp 4090";
             color: root.dim ? #999999 : #000000;
             vertical-alignment: center;
@@ -68,6 +73,14 @@ export component ListRow inherits Rectangle {
             source: @image-url("../icons/sdcard.png");
             width: 14px;
             height: 10px;
+        }
+        // Drill-in affordance, matching the chevron MenuRow uses on the summary.
+        if root.drill : Text {
+            text: "\u{203a}";
+            font-family: "HaxrCorp 4090";
+            color: root.dim ? #999999 : #666666;
+            vertical-alignment: center;
+            width: 5px;
         }
     }
 }

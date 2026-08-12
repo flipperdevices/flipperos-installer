@@ -5,48 +5,48 @@
 //! screen from each broadcast [`AppState`] snapshot. Because the controller is
 //! the single source of truth, selections made here show up live in the GUI and
 //! vice-versa.
+//!
+//! What the menus *contain* comes from [`crate::core::menu`], so this file only
+//! decides how a level is drawn and where the cursor is. The navigation position
+//! ([`Nav`]) is deliberately local: it is the one piece of UI state the two
+//! frontends do not share, which is what lets this one show a level beside the
+//! overview while the GUI shows it as a popup.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use cursive::event::{Event, Key};
 use cursive::style::Effect;
-use cursive::view::ScrollStrategy;
 use cursive::traits::{Nameable, Resizable, Scrollable};
 use cursive::utils::markup::StyledString;
+use cursive::view::ScrollStrategy;
 use cursive::views::{
-    BoxedView, Button, Checkbox, Dialog, LinearLayout, OnEventView, Panel, SelectView, TextView,
+    Button, Dialog, LinearLayout, OnEventView, Panel, SelectView, TextView,
 };
 use cursive::Cursive;
 
+use crate::core::menu::{self, DetailsTarget, Level, Marker, Nav};
 use crate::core::model::{AppState, Phase};
 use crate::core::Controller;
 
-/// The Install row on the overview; the first four rows open a submenu.
-const SEC_INSTALL: usize = 4;
-
-/// Minimum terminal width at which the submenu is drawn in the right details
-/// pane alongside the overview. Below this we fall back to a single full-screen
-/// pane (the submenu replaces the overview), like the GUI.
+/// Minimum terminal width at which a level is drawn in the right details pane
+/// alongside the overview. Below this we fall back to a single full-screen pane
+/// (the level replaces the overview), like the GUI.
 const TWO_PANE_MIN_COLS: usize = 74;
 
 /// Per-session state stored in Cursive's user data.
 struct TuiData {
     ctrl: Arc<Controller>,
-    /// Signature of the last-rendered data lists, so we only rebuild the
-    /// interactive widgets when the underlying data actually changes.
+    /// Where this frontend is in the menu tree.
+    nav: RefCell<Nav>,
+    /// Fingerprint of the last-rendered level, so the list widget is only rebuilt
+    /// when what it displays actually changes.
     sig: RefCell<String>,
-    /// Active submenu section (0..=3), or None on the overview.
-    active: RefCell<Option<usize>>,
-    /// Whether the active submenu is a full-screen layer (true) or lives in the
+    /// Whether the open level is a full-screen layer (true) or lives in the
     /// details pane (false).
     layered: RefCell<bool>,
-    /// Open details popup target: (section, build id), or None when closed.
-    detail: RefCell<Option<(usize, String)>>,
-    /// (section, build id) whose manifest fetch has been kicked off, so scrolling
-    /// the list doesn't re-spawn duplicate fetches. Cleared on Refresh.
-    requested: RefCell<HashSet<(usize, String)>>,
+    /// What the open details popup is showing, or None when closed.
+    detail: RefCell<Option<DetailsTarget>>,
 }
 
 /// Build the UI, wire it to `ctrl`, and run the blocking event loop.
@@ -54,18 +54,17 @@ pub fn run(ctrl: Arc<Controller>) {
     let mut siv = cursive::default();
     siv.set_user_data(TuiData {
         ctrl: Arc::clone(&ctrl),
+        nav: RefCell::new(Nav::new()),
         sig: RefCell::new(String::new()),
-        active: RefCell::new(None),
         layered: RefCell::new(false),
         detail: RefCell::new(None),
-        requested: RefCell::new(HashSet::new()),
     });
 
-    // Left: overview of the current selections (Enter opens a submenu / installs).
-    // Right: the details pane, which shows live status and doubles as the submenu
+    // Left: overview of the current selections (Enter opens a level / installs).
+    // Right: the details pane, which shows live status and doubles as the level
     // host when the terminal is wide enough.
     let overview = SelectView::<usize>::new()
-        .on_submit(|s, section: &usize| open_section(s, *section))
+        .on_submit(|s, index: &usize| activate_overview(s, *index))
         .with_name("overview");
 
     let main = LinearLayout::horizontal()
@@ -84,8 +83,8 @@ pub fn run(ctrl: Arc<Controller>) {
     siv.call_on_name("detail", |ll: &mut LinearLayout| fill_status(ll));
 
     siv.add_global_callback('q', Cursive::quit);
-    siv.add_global_callback(Key::Backspace, close_submenu);
-    siv.add_global_callback(Key::Esc, close_submenu);
+    siv.add_global_callback(Key::Backspace, go_back);
+    siv.add_global_callback(Key::Esc, go_back);
 
     // Alt+letter mnemonics for the bottom action buttons (each guarded so it
     // only fires when its action is currently available).
@@ -94,19 +93,8 @@ pub fn run(ctrl: Arc<Controller>) {
             action(s, |c| c.start_install());
         }
     });
-    siv.add_global_callback(Event::AltChar('r'), |s| {
-        if !snapshot(s).phase.is_busy() {
-            action(s, |c| {
-                let c = Arc::clone(c);
-                std::thread::spawn(move || c.refresh_sources());
-            });
-        }
-    });
-    siv.add_global_callback(Event::AltChar('d'), |s| {
-        if let Some(section) = get_active(s).0.filter(|x| *x == 1 || *x == 2) {
-            open_details(s, section);
-        }
-    });
+    siv.add_global_callback(Event::AltChar('r'), refresh);
+    siv.add_global_callback(Event::AltChar('d'), open_details);
     siv.add_global_callback(Event::AltChar('q'), Cursive::quit);
 
     // Subscribe: marshal every snapshot into the Cursive event loop.
@@ -138,104 +126,161 @@ fn action<F: FnOnce(&Arc<Controller>)>(siv: &mut Cursive, f: F) {
     }
 }
 
-// --- navigation ------------------------------------------------------------
-
 fn snapshot(siv: &mut Cursive) -> AppState {
     siv.user_data::<TuiData>()
         .map(|d| d.ctrl.snapshot())
         .unwrap_or_default()
 }
 
-fn set_active(siv: &mut Cursive, active: Option<usize>, layered: bool) {
-    if let Some(d) = siv.user_data::<TuiData>() {
-        *d.active.borrow_mut() = active;
-        *d.layered.borrow_mut() = layered;
-    }
-}
-
-fn get_active(siv: &mut Cursive) -> (Option<usize>, bool) {
+/// A copy of the navigation position. Cloned out rather than borrowed, because a
+/// `RefCell` borrow may not be held across a `call_on_name`, which needs `siv`.
+fn nav(siv: &mut Cursive) -> Nav {
     siv.user_data::<TuiData>()
-        .map(|d| (*d.active.borrow(), *d.layered.borrow()))
-        .unwrap_or((None, false))
+        .map(|d| d.nav.borrow().clone())
+        .unwrap_or_default()
 }
 
-fn section_title(section: usize) -> &'static str {
-    match section {
-        0 => "Target device",
-        1 => "U-Boot build",
-        2 => "Snapshot build",
-        _ => "Profiles",
+fn set_nav(siv: &mut Cursive, value: Nav) {
+    if let Some(d) = siv.user_data::<TuiData>() {
+        *d.nav.borrow_mut() = value;
     }
 }
 
-/// Open the submenu for `section`, or trigger install for the Install row.
-///
-/// When the terminal is wide enough the submenu is drawn in the right details
-/// pane (overview stays visible on the left); otherwise it takes over the whole
-/// screen as a full-screen layer.
-fn open_section(siv: &mut Cursive, section: usize) {
-    if section == SEC_INSTALL {
-        action(siv, |c| c.start_install());
-        return;
-    }
+fn layered(siv: &mut Cursive) -> bool {
+    siv.user_data::<TuiData>()
+        .map(|d| *d.layered.borrow())
+        .unwrap_or(false)
+}
+
+/// The level this frontend is currently showing.
+fn current_level(siv: &mut Cursive) -> Level {
+    let nav = nav(siv);
     let state = snapshot(siv);
-    // Don't open selection submenus while an install is running.
+    menu::level(&nav, &state)
+}
+
+// --- navigation ------------------------------------------------------------
+
+/// Enter on an overview row: open its level, or run its action.
+fn activate_overview(siv: &mut Cursive, index: usize) {
+    let state = snapshot(siv);
+    // Don't open selection levels while an install is running.
     if matches!(state.phase, Phase::Installing) {
         return;
     }
+    let root = menu::root_level(&state);
+    let mut nav = nav(siv);
+    nav.set_cursor(index);
+    set_nav(siv, nav);
+    apply_activation(siv, &root, index);
+}
+
+/// Enter on a row of an open level.
+fn activate_row(siv: &mut Cursive, index: usize) {
+    let level = current_level(siv);
+    apply_activation(siv, &level, index);
+}
+
+/// Perform a row's action and move the stack the way the core says to.
+fn apply_activation(siv: &mut Cursive, level: &Level, index: usize) {
+    let mv = {
+        let mut moved = menu::Move::Stay;
+        if let Some(d) = siv.user_data::<TuiData>() {
+            let ctrl = Arc::clone(&d.ctrl);
+            moved = menu::activate(&ctrl, level, index);
+        }
+        moved
+    };
+    let mut nav = nav(siv);
+    nav.apply(mv.clone());
+    set_nav(siv, nav);
+
+    match mv {
+        menu::Move::Push(_) => show_level(siv),
+        menu::Move::Pop | menu::Move::ToRoot => leave_level(siv),
+        menu::Move::Stay => {
+            // A toggle: the level stays up and is repainted by the snapshot that
+            // the controller call has already broadcast.
+        }
+    }
+}
+
+/// Draw the current level, in the details pane or as a full-screen layer.
+fn show_level(siv: &mut Cursive) {
+    let level = current_level(siv);
     let two_pane = siv.screen_size().x >= TWO_PANE_MIN_COLS;
 
-    let submenu = if section == 3 {
-        BoxedView::boxed(profiles_submenu(&state))
-    } else {
-        BoxedView::boxed(list_submenu(section, &state))
-    };
-    let focus = if section == 3 { "profiles" } else { "submenu" };
+    // Only ever one level layer exists: a second view named "submenu" would be
+    // found before this one, since cursive resolves a name from the bottom layer
+    // upwards.
+    if layered(siv) {
+        siv.pop_layer();
+    }
+    if let Some(d) = siv.user_data::<TuiData>() {
+        *d.layered.borrow_mut() = !two_pane;
+        *d.sig.borrow_mut() = menu::signature(&level);
+    }
 
-    set_active(siv, Some(section), !two_pane);
-
+    let list = level_view(&level, nav(siv).cursor());
+    let title = level.crumb.clone();
     if two_pane {
         siv.call_on_name("detail", move |ll: &mut LinearLayout| {
             clear_layout(ll);
-            ll.add_child(TextView::new(section_title(section)));
-            ll.add_child(submenu);
+            ll.add_child(TextView::new(title));
+            ll.add_child(list);
         });
     } else {
-        siv.add_fullscreen_layer(Panel::new(submenu).title(section_title(section)));
+        siv.add_fullscreen_layer(Panel::new(list).title(title));
     }
-    let _ = siv.focus_name(focus);
-    // Fetch the initially-highlighted build's number (on_select only fires on
-    // subsequent moves, not for the selection set at construction).
-    if section == 1 || section == 2 {
-        if let Some(id) = siv
-            .call_on_name("submenu", |v: &mut SelectView<String>| {
-                v.selection().map(|r| (*r).clone())
-            })
-            .flatten()
-        {
-            request_build_details(siv, section, &id);
-        }
+    let _ = siv.focus_name("submenu");
+
+    // Start whatever this level (and its focused row) needs fetched.
+    if let Some(d) = siv.user_data::<TuiData>() {
+        let ctrl = Arc::clone(&d.ctrl);
+        menu::on_open(&ctrl, &level);
+        menu::on_focus(&ctrl, &level, nav(siv).cursor());
     }
-    // Refresh the button bar so the context-sensitive Details button appears.
+    let state = snapshot(siv);
     rebuild_buttons(siv, &state);
 }
 
-/// Return from a submenu: pop the layer or restore the status pane, then refocus
-/// the overview. A no-op when already on the overview.
-fn close_submenu(siv: &mut Cursive) {
-    if get_active(siv).0.is_none() {
+/// Leave the current level: show its parent, or the overview at the bottom.
+fn leave_level(siv: &mut Cursive) {
+    if nav(siv).depth() > 0 {
+        show_level(siv);
         return;
     }
-    let layered = get_active(siv).1;
-    set_active(siv, None, false);
-    if layered {
+    if layered(siv) {
         siv.pop_layer();
+        if let Some(d) = siv.user_data::<TuiData>() {
+            *d.layered.borrow_mut() = false;
+        }
     } else {
         siv.call_on_name("detail", |ll: &mut LinearLayout| fill_status(ll));
     }
     let _ = siv.focus_name("overview");
     let state = snapshot(siv);
     render(siv, &state);
+}
+
+/// Back out one level. A no-op on the overview.
+fn go_back(siv: &mut Cursive) {
+    let mut nav = nav(siv);
+    if !nav.pop() {
+        return;
+    }
+    set_nav(siv, nav);
+    leave_level(siv);
+}
+
+fn refresh(siv: &mut Cursive) {
+    if snapshot(siv).phase.is_busy() {
+        return;
+    }
+    action(siv, |c| {
+        let c = Arc::clone(c);
+        std::thread::spawn(move || c.refresh_sources());
+    });
 }
 
 fn clear_layout(ll: &mut LinearLayout) {
@@ -252,183 +297,76 @@ fn fill_status(ll: &mut LinearLayout) {
     ll.add_child(TextView::new("").with_name("log").scrollable().full_height());
 }
 
-// --- submenu construction --------------------------------------------------
+// --- level rendering -------------------------------------------------------
 
-/// (label, value) pairs for a list submenu section (0 device, 1 u-boot, 2 snap).
-fn submenu_items(section: usize, state: &AppState) -> Vec<(String, String)> {
-    match section {
-        0 => state
-            .devices
-            .iter()
-            .map(|d| {
-                let mark = if d.boot_rom_capable() { " " } else { "!" };
-                (format!("{mark}{}", d.summary()), d.path.clone())
-            })
-            .collect(),
-        1 => state
-            .uboot_builds
-            .iter()
-            .map(|b| (b.summary(), b.id.clone()))
-            .collect(),
-        2 => state
-            .snapshot_builds
-            .iter()
-            .map(|b| (b.summary(), b.id.clone()))
-            .collect(),
-        _ => Vec::new(),
+/// One row's text: a checkbox on a multi-choice level, the label, and any
+/// secondary detail. A single choice is not decorated — the cursor opens on it.
+fn row_label(item: &menu::MenuItem) -> String {
+    let marker = match item.marker {
+        Marker::None => "",
+        Marker::Unchecked => "[ ] ",
+        Marker::Checked => "[x] ",
+    };
+    let mut out = format!("{marker}{}", item.text);
+    if !item.detail.is_empty() {
+        out.push_str(&format!("  ({})", item.detail));
     }
+    if item.drill {
+        out.push_str(" \u{203a}");
+    }
+    out
 }
 
-/// The currently-selected value for `section`, used to keep the cursor put.
-fn submenu_selected(section: usize, state: &AppState) -> Option<String> {
-    match section {
-        0 => state.selection.target_device.clone(),
-        1 => state.selection.uboot.clone(),
-        2 => state.selection.snapshot_build.clone(),
-        _ => None,
+/// A scrollable list for any level; the payload is the row index, which is what
+/// [`menu::activate`] takes.
+fn level_view(level: &Level, cursor: usize) -> impl cursive::View {
+    let mut v = SelectView::<usize>::new();
+    for (i, item) in level.items.iter().enumerate() {
+        v.add_item(row_label(item), i);
     }
-}
-
-/// A scrollable single-select list for the device/u-boot/snapshot sections.
-fn list_submenu(section: usize, state: &AppState) -> impl cursive::View {
-    let items = submenu_items(section, state);
-    let mut v = SelectView::<String>::new();
-    for (label, value) in &items {
-        v.add_item(label.clone(), value.clone());
+    // The core's preferred row wins when the level has just materialised (the
+    // cursor is still at 0), otherwise keep where the operator was.
+    let start = if cursor == 0 {
+        level.preferred_cursor.unwrap_or(0)
+    } else {
+        cursor
+    };
+    if start < level.items.len() {
+        v.set_selection(start);
     }
-    if let Some(sel) = submenu_selected(section, state) {
-        if let Some(i) = items.iter().position(|(_, val)| val == &sel) {
-            v.set_selection(i);
+    let v = v.on_select(|s, index: &usize| {
+        let index = *index;
+        let mut nav = nav(s);
+        nav.set_cursor(index);
+        set_nav(s, nav);
+        let level = current_level(s);
+        if let Some(d) = s.user_data::<TuiData>() {
+            let ctrl = Arc::clone(&d.ctrl);
+            menu::on_focus(&ctrl, &level, index);
         }
-    }
-    // Lazily fetch the highlighted build's manifest (for its #<n> identifier) as
-    // the list scrolls; a no-op for the device list.
-    let v = v.on_select(move |s, value: &String| request_build_details(s, section, value));
-    let v = v.on_submit(move |s, value: &String| {
-        let value = value.clone();
-        action(s, move |c| match section {
-            0 => c.select_device(&value),
-            1 => c.select_uboot(&value),
-            2 => c.select_snapshot_build(&value),
-            _ => {}
-        });
-        close_submenu(s);
+        // The Details button is per-row, so its availability can change.
+        let state = snapshot(s);
+        rebuild_buttons(s, &state);
     });
+    let v = v.on_submit(|s, index: &usize| activate_row(s, *index));
     v.with_name("submenu").scrollable().full_height()
-}
-
-/// Kick off a background manifest fetch for a build row so its build number can
-/// replace the placeholder label. Only fires for the U-Boot (1) / snapshot (2)
-/// lists, and at most once per build per session (deduped via `requested`).
-fn request_build_details(siv: &mut Cursive, section: usize, id: &str) {
-    if section != 1 && section != 2 {
-        return;
-    }
-    if let Some(d) = siv.user_data::<TuiData>() {
-        if !d.requested.borrow_mut().insert((section, id.to_string())) {
-            return;
-        }
-        let ctrl = Arc::clone(&d.ctrl);
-        let id = id.to_string();
-        std::thread::spawn(move || match section {
-            1 => ctrl.load_uboot_details(&id),
-            2 => ctrl.load_snapshot_details(&id),
-            _ => {}
-        });
-    }
-}
-
-/// A scrollable multi-select (checkbox) list for the profiles section.
-fn profiles_submenu(state: &AppState) -> impl cursive::View {
-    let mut list = LinearLayout::vertical();
-    populate_profiles(&mut list, state);
-    list.with_name("profiles").scrollable().full_height()
-}
-
-fn populate_profiles(list: &mut LinearLayout, state: &AppState) {
-    clear_layout(list);
-    let build = state.selected_build();
-    let loaded = build.map(|b| b.loaded).unwrap_or(false);
-    if !loaded {
-        list.add_child(TextView::new("  (loading…)"));
-        return;
-    }
-    // Minimal is always deployed.
-    let minimal_label = build
-        .and_then(|b| b.minimal())
-        .map(|p| p.summary())
-        .unwrap_or_else(|| "Minimal".to_string());
-    list.add_child(TextView::new(format!("  [x] {minimal_label} (always)")));
-
-    let extras: Vec<(String, String, bool)> = build
-        .map(|b| {
-            b.extra_profiles()
-                .map(|p| {
-                    let checked = state.selection.profiles.iter().any(|n| n == &p.name);
-                    (p.name.clone(), p.summary(), checked)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    if !extras.is_empty() {
-        let all = extras.iter().all(|(_, _, c)| *c);
-        list.add_child(
-            LinearLayout::horizontal()
-                .child(
-                    Checkbox::new()
-                        .with_checked(all)
-                        .on_change(|s, on| action(s, move |c| c.select_all_profiles(on))),
-                )
-                .child(TextView::new(" (all extra profiles)")),
-        );
-    }
-    for (name, label, checked) in &extras {
-        let n = name.clone();
-        list.add_child(
-            LinearLayout::horizontal()
-                .child(Checkbox::new().with_checked(*checked).on_change(move |s, on| {
-                    let n = n.clone();
-                    action(s, move |c| c.toggle_profile(&n, on));
-                }))
-                .child(TextView::new(format!(" {label}"))),
-        );
-    }
 }
 
 // --- details popup ---------------------------------------------------------
 
-/// Open a scrollable details popup for the highlighted U-Boot / snapshot entry,
-/// kicking off a background fetch of its sourcestamps.
-fn open_details(siv: &mut Cursive, section: usize) {
-    if section != 1 && section != 2 {
-        return;
-    }
-    let id = siv
-        .call_on_name("submenu", |v: &mut SelectView<String>| {
-            v.selection().map(|r| (*r).clone())
-        })
-        .flatten();
-    let Some(id) = id else {
+/// Open a scrollable details popup for the highlighted row, if it has one.
+fn open_details(siv: &mut Cursive) {
+    let level = current_level(siv);
+    let cursor = nav(siv).cursor();
+    let Some(target) = level.details_at(cursor) else {
         return;
     };
-
     if let Some(d) = siv.user_data::<TuiData>() {
-        let ctrl = Arc::clone(&d.ctrl);
-        let idc = id.clone();
-        std::thread::spawn(move || match section {
-            1 => ctrl.load_uboot_details(&idc),
-            2 => ctrl.load_snapshot_details(&idc),
-            _ => {}
-        });
-        *d.detail.borrow_mut() = Some((section, id.clone()));
+        *d.detail.borrow_mut() = Some(target.clone());
     }
 
-    let title = if section == 1 {
-        "U-Boot details"
-    } else {
-        "Snapshot details"
-    };
-    let text = detail_text(siv, section, &id);
+    let state = snapshot(siv);
+    let (title, text) = menu::details_text(&state, &target);
     let dialog = Dialog::around(
         TextView::new(text)
             .with_name("details")
@@ -450,17 +388,6 @@ fn close_details(siv: &mut Cursive) {
     if let Some(d) = siv.user_data::<TuiData>() {
         *d.detail.borrow_mut() = None;
     }
-}
-
-/// The details text for a build, or a loading placeholder.
-fn detail_text(siv: &mut Cursive, section: usize, id: &str) -> String {
-    let st = snapshot(siv);
-    let found = match section {
-        1 => st.uboot_builds.iter().find(|b| b.id == id).map(|b| b.details_text()),
-        2 => st.snapshot_builds.iter().find(|b| b.id == id).map(|b| b.details_text()),
-        _ => None,
-    };
-    found.unwrap_or_else(|| "Loading…".to_string())
 }
 
 // --- rendering -------------------------------------------------------------
@@ -485,17 +412,21 @@ fn fill_install(ll: &mut LinearLayout) {
     );
 }
 
-/// Switch the details pane to the install view (closing any open submenu), once,
+/// Switch the details pane to the install view (closing any open level), once,
 /// when installation starts.
 fn ensure_install_pane(siv: &mut Cursive) {
     if siv.call_on_name("inst_bar", |_: &mut TextView| ()).is_some() {
         return; // already showing it
     }
-    let (active, layered) = get_active(siv);
-    if active.is_some() {
-        set_active(siv, None, false);
-        if layered {
-            siv.pop_layer();
+    if nav(siv).depth() > 0 {
+        let mut n = nav(siv);
+        n.reset();
+        set_nav(siv, n);
+    }
+    if layered(siv) {
+        siv.pop_layer();
+        if let Some(d) = siv.user_data::<TuiData>() {
+            *d.layered.borrow_mut() = false;
         }
     }
     siv.call_on_name("detail", |ll: &mut LinearLayout| fill_install(ll));
@@ -505,7 +436,12 @@ fn ensure_install_pane(siv: &mut Cursive) {
 /// Re-render the whole screen from a state snapshot.
 fn render(siv: &mut Cursive, state: &AppState) {
     // Overview rows (preserve the highlighted row across the rebuild).
-    let labels = overview_labels(state);
+    let root = menu::root_level(state);
+    let labels: Vec<String> = root
+        .items
+        .iter()
+        .map(|i| format!("{:<9}{}", i.text, i.detail))
+        .collect();
     siv.call_on_name("overview", |v: &mut SelectView<usize>| {
         let sel = v.selected_id().unwrap_or(0);
         v.clear();
@@ -539,86 +475,51 @@ fn render(siv: &mut Cursive, state: &AppState) {
     siv.call_on_name("status", |v: &mut TextView| v.set_content(render_status(state)));
     siv.call_on_name("log", |v: &mut TextView| v.set_content(tail.join("\n")));
 
-    // Refresh the active submenu's list only when the underlying data changed.
-    let sig = data_signature(state);
-    let changed = siv
-        .user_data::<TuiData>()
-        .map(|d| {
-            let mut last = d.sig.borrow_mut();
-            if *last != sig {
-                *last = sig.clone();
-                true
-            } else {
-                false
-            }
-        })
-        .unwrap_or(true);
-    if changed {
-        match get_active(siv).0 {
-            Some(3) => {
-                siv.call_on_name("profiles", |ll: &mut LinearLayout| populate_profiles(ll, state));
-            }
-            Some(section) => {
-                let items = submenu_items(section, state);
-                let sel = submenu_selected(section, state);
-                siv.call_on_name("submenu", |v: &mut SelectView<String>| {
-                    // Preserve the current highlight across the rebuild (a lazily
-                    // fetched build number rebuilds the list while the user may be
-                    // mid-scroll); fall back to the committed selection.
-                    let cur = v.selection().map(|r| (*r).clone());
-                    v.clear();
-                    for (label, value) in &items {
-                        v.add_item(label.clone(), value.clone());
-                    }
-                    let restore = cur
-                        .as_ref()
-                        .or(sel.as_ref())
-                        .and_then(|id| items.iter().position(|(_, val)| val == id));
-                    if let Some(i) = restore {
-                        v.set_selection(i);
-                    }
-                });
-            }
-            None => {}
+    // Rebuild the open level's list only when what it renders changed. The
+    // fingerprint comes from the built level, so a newly listed channel or a
+    // lazily fetched build number cannot be forgotten here.
+    if nav(siv).depth() > 0 {
+        let nav_now = nav(siv);
+        let level = menu::level(&nav_now, state);
+        let sig = menu::signature(&level);
+        let changed = siv
+            .user_data::<TuiData>()
+            .map(|d| {
+                let mut last = d.sig.borrow_mut();
+                if *last != sig {
+                    *last = sig.clone();
+                    true
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(true);
+        if changed {
+            let cursor = nav_now.cursor().min(level.items.len().saturating_sub(1));
+            let labels: Vec<String> = level.items.iter().map(row_label).collect();
+            siv.call_on_name("submenu", |v: &mut SelectView<usize>| {
+                v.clear();
+                for (i, l) in labels.into_iter().enumerate() {
+                    v.add_item(l, i);
+                }
+                if cursor < v.len() {
+                    v.set_selection(cursor);
+                }
+            });
+            // A level that just finished loading may have fewer rows than the
+            // placeholder cursor allowed for.
+            let mut n = nav_now;
+            n.clamp(level.items.len());
+            set_nav(siv, n);
         }
     }
 
     // Keep an open details popup in sync as its sourcestamps arrive.
     let target = siv.user_data::<TuiData>().and_then(|d| d.detail.borrow().clone());
-    if let Some((section, id)) = target {
-        let text = detail_text(siv, section, &id);
+    if let Some(target) = target {
+        let (_, text) = menu::details_text(state, &target);
         siv.call_on_name("details", |v: &mut TextView| v.set_content(text));
     }
-}
-
-/// The five overview rows: label + current selection.
-fn overview_labels(state: &AppState) -> Vec<String> {
-    let dev = state
-        .target()
-        .map(|d| format!("{} {}", d.path, d.human_size()))
-        .unwrap_or_else(|| "(not selected)".to_string());
-    let ub = state
-        .selected_uboot()
-        .map(|b| b.display_name())
-        .unwrap_or_else(|| "(not selected)".to_string());
-    let sn = state
-        .selected_build()
-        .map(|b| b.display_name())
-        .unwrap_or_else(|| "(not selected)".to_string());
-    let extra = state.selection.profiles.len();
-    let pr = if extra > 0 {
-        format!("Minimal +{extra}")
-    } else {
-        "Minimal".to_string()
-    };
-    let inst = state.install_status_label();
-    vec![
-        format!("{:<9}{}", "Device", dev),
-        format!("{:<9}{}", "U-Boot", ub),
-        format!("{:<9}{}", "Snapshot", sn),
-        format!("{:<9}{}", "Profiles", pr),
-        format!("{:<9}{}", "Install", inst),
-    ]
 }
 
 /// Rebuild the bottom button bar, showing each action only when it is allowed.
@@ -626,9 +527,17 @@ fn overview_labels(state: &AppState) -> Vec<String> {
 fn rebuild_buttons(siv: &mut Cursive, state: &AppState) {
     let can_install = state.can_install();
     let busy = state.phase.is_busy();
-    // Details is available while a U-Boot / snapshot submenu is open.
-    let details_section = get_active(siv).0.filter(|s| *s == 1 || *s == 2);
-    siv.call_on_name("buttons", |ll: &mut LinearLayout| {
+    // Details and Refresh are per-level, and Details is per-row.
+    let (has_details, can_refresh) = if nav(siv).depth() > 0 {
+        let level = current_level(siv);
+        (
+            level.details_at(nav(siv).cursor()).is_some(),
+            level.can_refresh,
+        )
+    } else {
+        (false, true)
+    };
+    siv.call_on_name("buttons", move |ll: &mut LinearLayout| {
         clear_layout(ll);
         if can_install {
             ll.add_child(Button::new_raw(mnemonic("Install", 'I'), |s| {
@@ -636,23 +545,12 @@ fn rebuild_buttons(siv: &mut Cursive, state: &AppState) {
             }));
             ll.add_child(TextView::new("  "));
         }
-        if !busy {
-            ll.add_child(Button::new_raw(mnemonic("Refresh", 'R'), |s| {
-                // Rebuilt lists want their manifests re-fetched.
-                if let Some(d) = s.user_data::<TuiData>() {
-                    d.requested.borrow_mut().clear();
-                }
-                action(s, |c| {
-                    let c = Arc::clone(c);
-                    std::thread::spawn(move || c.refresh_sources());
-                })
-            }));
+        if !busy && can_refresh {
+            ll.add_child(Button::new_raw(mnemonic("Refresh", 'R'), refresh));
             ll.add_child(TextView::new("  "));
         }
-        if let Some(section) = details_section {
-            ll.add_child(Button::new_raw(mnemonic("Details", 'D'), move |s| {
-                open_details(s, section)
-            }));
+        if has_details {
+            ll.add_child(Button::new_raw(mnemonic("Details", 'D'), open_details));
             ll.add_child(TextView::new("  "));
         }
         ll.add_child(Button::new_raw(mnemonic("Quit", 'Q'), Cursive::quit));
@@ -693,13 +591,21 @@ fn render_status(state: &AppState) -> String {
     let mut profiles = vec!["Minimal".to_string()];
     profiles.extend(state.selection.profiles.iter().cloned());
     let bar = progress_bar(state.progress);
+    let source = match &state.bundle {
+        Some(b) => format!("{} {} ({})", b.channel, b.version, b.reference.source.label()),
+        None => match &state.bundle_error {
+            Some(e) => format!("unavailable — {e}"),
+            None => state.source_label(),
+        },
+    };
     format!(
-        "Board   : {} ({})\nBoard id: {}\nPhase   : {}\n{bar}\n\nTarget  : {target}\nU-Boot  : {uboot}\nSnapshot: {build}\nProfiles: {}\nReady   : {}",
+        "Board   : {} ({})\nBoard id: {}\nPhase   : {}\n{bar}\n\nSource  : {source}\nTarget  : {target}\nU-Boot  : {uboot}\nSnapshot: {build}\nProfiles: {}\nFetch   : {}\nReady   : {}",
         state.board.model,
         state.board.soc,
         state.board.board_id,
         state.phase.label(),
         profiles.join(", "),
+        state.selection.fetch.label(),
         if state.can_install() { "yes" } else { "no" },
     )
 }
@@ -714,43 +620,45 @@ fn progress_bar(progress: f32) -> String {
     format!("[{bar}] {:.0}%", progress * 100.0)
 }
 
-/// A stable fingerprint of the selectable data, used to decide when to rebuild.
-fn data_signature(state: &AppState) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    parts.push(state.board.board_id.clone());
-    for d in &state.devices {
-        parts.push(d.path.clone());
-    }
-    // Include the build number so the list rebuilds (switching label -> #<n>)
-    // when a lazily-fetched manifest arrives.
-    for b in &state.uboot_builds {
-        parts.push(format!("u:{}:{:?}", b.id, b.build_number()));
-    }
-    for b in &state.snapshot_builds {
-        parts.push(format!("s:{}:{}:{:?}", b.id, b.loaded, b.resolved_build_number()));
-    }
-    if let Some(b) = state.selected_build() {
-        for p in &b.profiles {
-            parts.push(format!("pp:{}", p.name));
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::menu::{Action, Icon, MenuItem};
+
+    fn item(text: &str, detail: &str, marker: Marker, drill: bool) -> MenuItem {
+        MenuItem {
+            text: text.to_string(),
+            detail: detail.to_string(),
+            icon: Icon::None,
+            marker,
+            selected: false,
+            drill,
+            dim: false,
+            action: Action::Inert,
+            on_focus: None,
+            details: None,
         }
     }
-    // Selection affects checkbox/highlight state, so include it.
-    if let Some(t) = &state.selection.target_device {
-        parts.push(format!("t:{t}"));
+
+    #[test]
+    fn row_labels_show_state_and_affordances() {
+        assert_eq!(
+            row_label(&item("Desktop", "378.0 MiB", Marker::Checked, false)),
+            "[x] Desktop  (378.0 MiB)"
+        );
+        assert_eq!(
+            row_label(&item("Router", "", Marker::Unchecked, false)),
+            "[ ] Router"
+        );
+        // A drill-in row carries the chevron and nothing else; the committed
+        // choice is conveyed by the cursor, not by a marker.
+        assert_eq!(
+            row_label(&item("Release", "", Marker::None, true)),
+            "Release \u{203a}"
+        );
+        assert_eq!(
+            row_label(&item("#15", "2026-08-12 02:25", Marker::None, false)),
+            "#15  (2026-08-12 02:25)"
+        );
     }
-    if let Some(u) = &state.selection.uboot {
-        parts.push(format!("v:{u}"));
-    }
-    if let Some(b) = &state.selection.snapshot_build {
-        parts.push(format!("b:{b}"));
-    }
-    for p in &state.selection.profiles {
-        parts.push(format!("p:{p}"));
-    }
-    parts.push(if matches!(state.phase, Phase::Installing) {
-        "busy".to_string()
-    } else {
-        "idle".to_string()
-    });
-    parts.join("|")
 }
