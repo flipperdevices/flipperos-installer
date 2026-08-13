@@ -80,6 +80,9 @@ export component MainWindow inherits Window {
     // Whether the Install soft button is live. The Install *row*'s own value
     // ("ready" / "in progress" / "incomplete") arrives with `summary-items`.
     in property <bool> can-install;
+    // True once an install has succeeded for real (never in a dry run), which is
+    // when the RUN slot stops offering Install and offers Reboot instead.
+    in property <bool> can-reboot;
     // True once installation has started; gates the progress bar + log line
     // (which replace the idle info line).
     in property <bool> installing;
@@ -115,6 +118,10 @@ export component MainWindow inherits Window {
     // and sets `screen` back to 0 once the stack is empty.
     callback back();
     callback start-install();
+    // Close the installer and reboot the board (the RUN soft button once an
+    // install has finished). Rust tears both frontends down first, so the serial
+    // console is left in a usable state.
+    callback reboot();
     // Re-query the bundle bucket / image server / removable media (the Edit
     // soft button). Mirrors the TUI's Refresh action.
     callback refresh();
@@ -209,9 +216,14 @@ export component MainWindow inherits Window {
             }
 
             // RUN (B): the dedicated execute button. Starts the install from
-            // the summary; confirms the current row inside a level.
+            // the summary — or reboots, once one has finished; confirms the
+            // current row inside a level. The dispatch tests the same property
+            // as the soft button's caption, so key and label cannot disagree.
             if (event.text == "b" || event.text == "B") {
-                if (root.screen == 0) { root.start-install(); }
+                if (root.screen == 0) {
+                    if (root.can-reboot) { root.reboot(); }
+                    else { root.start-install(); }
+                }
                 else { root.activate(root.cursor); }
                 return accept;
             }
@@ -327,7 +339,13 @@ export component MainWindow inherits Window {
                 color: #8c8c8c;
                 overflow: elide;
             }
-            if root.installing : ProgressBar { progress: root.progress; }
+            // The bar is only shown while the run is in flight. Once it has
+            // ended, the status line ("installation complete", or the failure)
+            // stands in for the info line on its own — a 6px bar plus its
+            // spacing needs 7px the panel does not have once the soft buttons
+            // are back on screen, and the layout would take those pixels out of
+            // the 14px button bar, clipping the tabs.
+            if root.installing && root.busy : ProgressBar { progress: root.progress; }
             if root.installing : Text {
                 text: root.status-text;
                 color: #8c8c8c;
@@ -339,6 +357,10 @@ export component MainWindow inherits Window {
             // Refresh = Edit (slot 3), Install = Run (slot 4). Refresh drops
             // out while busy (discovery/install), leaving its slot empty.
             // Hidden while a submenu popup is open (screen 1).
+            //
+            // The RUN slot is Install until a run starts (which blanks it), then
+            // Reboot once one has succeeded — the operator's next step, and the
+            // only way to end the session from the device.
             if root.screen == 0 : Rectangle {
                 height: 14px;
                 if !root.busy : SoftButton {
@@ -346,9 +368,9 @@ export component MainWindow inherits Window {
                 }
                 SoftButton {
                     x: root.sb-x(4); width: root.sb-w;
-                    caption: root.installing ? "" : "Install";
+                    caption: root.can-reboot ? "Reboot" : (root.installing ? "" : "Install");
                     primary: true;
-                    enabled: root.can-install;
+                    enabled: root.can-reboot || root.can-install;
                 }
             }
         }

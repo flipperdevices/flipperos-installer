@@ -144,6 +144,12 @@ pub fn build(ctrl: Arc<Controller>) -> Result<MainWindow, slint::PlatformError> 
         win.on_start_install(move || ctrl.start_install());
     }
     {
+        // The reboot itself happens in `main`, after this event loop (and the
+        // TUI's) has returned; all this does is record it and start the teardown.
+        let ctrl = Arc::clone(&ctrl);
+        win.on_reboot(move || ctrl.request_reboot());
+    }
+    {
         // Re-scan sources off the event-loop thread, like the TUI's Refresh.
         let ctrl = Arc::clone(&ctrl);
         win.on_refresh(move || {
@@ -186,6 +192,17 @@ pub fn build(ctrl: Arc<Controller>) -> Result<MainWindow, slint::PlatformError> 
             }
         });
     }
+
+    // Close this frontend when either frontend's Reboot action asks the
+    // installer to shut down. `invoke_from_event_loop` is callable from any
+    // thread, which is what lets the TUI (on its own thread) end the GUI loop
+    // that owns the main thread — without it, quitting the TUI would leave the
+    // process running and nothing would ever reboot.
+    ctrl.on_exit(|| {
+        let _ = slint::invoke_from_event_loop(|| {
+            let _ = slint::quit_event_loop();
+        });
+    });
 
     // Subscribe: marshal every snapshot into the Slint event loop.
     let weak = win.as_weak();
@@ -343,6 +360,7 @@ fn apply(win: &MainWindow, state: &AppState) {
     );
     win.set_progress(state.progress);
     win.set_can_install(state.can_install());
+    win.set_can_reboot(state.can_reboot());
 
     // The progress bar + log line only appear once installation has started;
     // until then the freed line shows a discovery/summary count instead.

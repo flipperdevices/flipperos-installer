@@ -96,11 +96,26 @@ pub fn run(ctrl: Arc<Controller>) {
     siv.add_global_callback(Event::AltChar('r'), refresh);
     siv.add_global_callback(Event::AltChar('d'), open_details);
     siv.add_global_callback(Event::AltChar('q'), Cursive::quit);
+    // Alt+R is Refresh, so Reboot takes B — which is also the GUI's RUN key.
+    siv.add_global_callback(Event::AltChar('b'), |s| {
+        if snapshot(s).can_reboot() {
+            action(s, |c| c.request_reboot());
+        }
+    });
 
     // Subscribe: marshal every snapshot into the Cursive event loop.
     let cb_sink = siv.cb_sink().clone();
     ctrl.subscribe(move |snapshot| {
         let _ = cb_sink.send(Box::new(move |siv: &mut Cursive| render(siv, &snapshot)));
+    });
+
+    // Close this frontend when anything (either frontend's Reboot action) asks
+    // the installer to shut down. Quitting through the event loop is what lets
+    // cursive's backend restore the terminal on the way out; a failed send just
+    // means the loop is already gone, which is the state we wanted anyway.
+    let quit_sink = siv.cb_sink().clone();
+    ctrl.on_exit(move || {
+        let _ = quit_sink.send(Box::new(|s: &mut Cursive| s.quit()));
     });
 
     siv.run();
@@ -526,6 +541,7 @@ fn render(siv: &mut Cursive, state: &AppState) {
 /// Buttons carry an underlined mnemonic letter, also bound as Alt+letter.
 fn rebuild_buttons(siv: &mut Cursive, state: &AppState) {
     let can_install = state.can_install();
+    let can_reboot = state.can_reboot();
     let busy = state.phase.is_busy();
     // Details and Refresh are per-level, and Details is per-row.
     let (has_details, can_refresh) = if nav(siv).depth() > 0 {
@@ -551,6 +567,14 @@ fn rebuild_buttons(siv: &mut Cursive, state: &AppState) {
         }
         if has_details {
             ll.add_child(Button::new_raw(mnemonic("Details", 'D'), open_details));
+            ll.add_child(TextView::new("  "));
+        }
+        // Last of the actions, next to Quit: after a successful install this is
+        // the expected next step, and it is the only one that ends the session.
+        if can_reboot {
+            ll.add_child(Button::new_raw(mnemonic("Reboot", 'B'), |s| {
+                action(s, |c| c.request_reboot())
+            }));
             ll.add_child(TextView::new("  "));
         }
         ll.add_child(Button::new_raw(mnemonic("Quit", 'Q'), Cursive::quit));
@@ -624,6 +648,7 @@ fn progress_bar(progress: f32) -> String {
 mod tests {
     use super::*;
     use crate::core::menu::{Action, Icon, MenuItem};
+    use cursive::style::Effects;
 
     fn item(text: &str, detail: &str, marker: Marker, drill: bool) -> MenuItem {
         MenuItem {
@@ -637,6 +662,22 @@ mod tests {
             action: Action::Inert,
             on_focus: None,
             details: None,
+        }
+    }
+
+    /// The underlined letter has to be the one bound as Alt+letter, and Reboot's
+    /// cannot be the obvious `R` — Refresh already owns that.
+    #[test]
+    fn button_mnemonics_underline_the_bound_letter() {
+        for (label, key, expected) in [("Reboot", 'B', "b"), ("Refresh", 'R', "R")] {
+            let styled = mnemonic(label, key);
+            assert_eq!(styled.source(), format!("<{label}>"));
+            let underlined: Vec<&str> = styled
+                .spans()
+                .filter(|s| s.attr.effects == Effects::only(Effect::Underline))
+                .map(|s| s.content)
+                .collect();
+            assert_eq!(underlined, vec![expected], "{label}");
         }
     }
 

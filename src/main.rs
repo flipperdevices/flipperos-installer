@@ -10,6 +10,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use flipperos_installer::core::model::{FetchMode, InstallMode};
+use flipperos_installer::core::power;
 use flipperos_installer::core::{Config, Controller};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -49,8 +50,25 @@ fn main() -> ExitCode {
         });
     }
 
-    match run_frontends(controller, args.frontend) {
-        Ok(()) => ExitCode::SUCCESS,
+    let result = run_frontends(Arc::clone(&controller), args.frontend);
+
+    // Every frontend's event loop has returned by now, so the TUI has left the
+    // alternate screen and taken the terminal out of raw mode. Only here is it
+    // safe to bring the machine down: rebooting from the UI callback that asked
+    // for it would skip that teardown and leave the serial console unusable.
+    //
+    // A frontend that failed never reboots — we don't know what the operator is
+    // looking at, or whether the install even ran.
+    match result {
+        Ok(()) => {
+            if controller.reboot_requested() {
+                if let Err(e) = power::reboot(controller.config()) {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            ExitCode::SUCCESS
+        }
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::FAILURE

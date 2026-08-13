@@ -8,6 +8,7 @@
 //! lock the state, apply the change and then [`Controller::notify`] subscribers.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::core::menu::LoadRequest;
@@ -91,6 +92,10 @@ impl Config {
 /// A callback invoked with a fresh snapshot every time the state changes.
 type Subscriber = Box<dyn Fn(AppState) + Send + 'static>;
 
+/// A callback that quits one frontend's event loop. Registered by each frontend
+/// so the core can shut the whole app down without knowing what a frontend is.
+type ExitHook = Box<dyn Fn() + Send + 'static>;
+
 pub struct Controller {
     state: Mutex<AppState>,
     subscribers: Mutex<Vec<Subscriber>>,
@@ -99,6 +104,11 @@ pub struct Controller {
     /// twice does not spawn the same request again. Shared by both frontends,
     /// which is why it lives here rather than in each of them.
     inflight: Mutex<HashSet<LoadRequest>>,
+    /// One teardown hook per frontend, see [`Controller::on_exit`].
+    exit_hooks: Mutex<Vec<ExitHook>>,
+    /// Whether the operator asked to reboot. Read once the frontends are gone,
+    /// so it is not part of [`AppState`]: no view renders it.
+    reboot_requested: AtomicBool,
 }
 
 impl Controller {
@@ -109,6 +119,7 @@ impl Controller {
                 fetch: config.fetch,
                 ..Selection::default()
             },
+            dry_run: config.dry_run,
             ..AppState::default()
         };
         Arc::new(Self {
@@ -116,6 +127,8 @@ impl Controller {
             subscribers: Mutex::new(Vec::new()),
             config,
             inflight: Mutex::new(HashSet::new()),
+            exit_hooks: Mutex::new(Vec::new()),
+            reboot_requested: AtomicBool::new(false),
         })
     }
 
@@ -132,6 +145,43 @@ impl Controller {
         let snapshot = self.snapshot();
         f(snapshot);
         self.subscribers.lock().unwrap().push(Box::new(f));
+    }
+
+    // --- Shutdown --------------------------------------------------------
+
+    /// Register a frontend teardown hook: a callback that makes that frontend's
+    /// event loop return. Callable from any thread, because whoever asks for a
+    /// shutdown is rarely the frontend that has to act on it.
+    pub fn on_exit<F>(&self, f: F)
+    where
+        F: Fn() + Send + 'static,
+    {
+        self.exit_hooks.lock().unwrap().push(Box::new(f));
+    }
+
+    /// Ask the installer to close and reboot the machine.
+    ///
+    /// This only *records* the request and closes every frontend; the reboot
+    /// itself happens in `main`, once the event loops have returned. That
+    /// ordering is the whole point: the TUI restores the terminal (leaves the
+    /// alternate screen, disables raw mode) while its event loop unwinds, and
+    /// rebooting from inside a UI callback would skip that and leave the
+    /// operator's serial console unusable.
+    ///
+    /// Idempotent, so a second press — or one press per frontend — is harmless.
+    pub fn request_reboot(&self) {
+        if self.reboot_requested.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.log("reboot requested — closing the installer");
+        for hook in self.exit_hooks.lock().unwrap().iter() {
+            hook();
+        }
+    }
+
+    /// Whether a reboot was requested. Checked after the frontends have exited.
+    pub fn reboot_requested(&self) -> bool {
+        self.reboot_requested.load(Ordering::SeqCst)
     }
 
     /// Cheap immutable copy of the current state.
@@ -784,4 +834,46 @@ impl Controller {
 /// [`Controller`] share one implementation.
 fn storage_list() -> Vec<StorageDevice> {
     crate::core::storage::enumerate(crate::core::storage::MIN_TARGET_SIZE_BYTES)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn dry_run_reaches_the_frontends_through_the_snapshot() {
+        let ctrl = Controller::new(Config {
+            dry_run: true,
+            ..Config::default()
+        });
+        assert!(ctrl.snapshot().dry_run);
+
+        let ctrl = Controller::new(Config {
+            dry_run: false,
+            ..Config::default()
+        });
+        assert!(!ctrl.snapshot().dry_run);
+    }
+
+    #[test]
+    fn requesting_a_reboot_closes_every_frontend_once() {
+        let ctrl = Controller::new(Config::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        for _ in 0..2 {
+            let calls = Arc::clone(&calls);
+            ctrl.on_exit(move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        assert!(!ctrl.reboot_requested());
+
+        ctrl.request_reboot();
+        assert!(ctrl.reboot_requested());
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "one call per frontend");
+
+        // A second press (or one press per frontend) must not re-run teardown.
+        ctrl.request_reboot();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
 }

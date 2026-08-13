@@ -118,11 +118,33 @@ fn main() {
     ui.set_progress(0.42);
     ui.set_can_install(false);
     shoot(&window, "02b-summary-installing");
+
+    // Summary after a successful install (Phase::Done): the progress bar stays
+    // at 100%, Refresh is back, and the RUN slot now offers Reboot instead of
+    // Install. `can_reboot` is what swaps that caption. Done is not busy and the
+    // selection is still complete, so the Install row reads "ready" again.
+    let done_summary: [Row; 5] = [
+        ("Source", "nightly #15", 0, 0, true, false, false),
+        ("Device", "/dev/mmcblk0 29.7 GiB", 0, 0, true, false, false),
+        ("Profiles", "Minimal +2", 0, 0, true, false, false),
+        ("Fetch", "verify first", 0, 0, true, false, false),
+        ("Install", "ready", 0, 0, false, false, true),
+    ];
+    ui.set_summary_items(rows(&done_summary));
+    ui.set_busy(false);
+    ui.set_progress(1.0);
+    ui.set_can_install(true);
+    ui.set_can_reboot(true);
+    ui.set_status_text("installation complete".into());
+    shoot(&window, "02c-summary-done");
+    ui.set_can_reboot(false);
+
     ui.set_summary_items(rows(&summary));
     ui.set_installing(false);
     ui.set_busy(false);
     ui.set_can_install(true);
     ui.set_progress(0.0);
+    ui.set_status_text("verifying Minimal (full): 40%…".into());
 
     // The source picker: channels, local bundles, and the legacy custom flow.
     // The bullet marks where the current selection came from.

@@ -150,6 +150,13 @@ logged but not executed. Pass `--no-dry-run` to actually flash. `--help` lists
 every flag; the bundle-specific ones are described under
 [Update bundles](#update-bundles).
 
+Once a real install has finished, both frontends offer to reboot: `<ReBoot>`
+(Alt+B) in the serial console's button bar, and the RUN soft button on the
+device, where it replaces Install. Use it instead of power-cycling — it closes
+both frontends first, which is what leaves the serial console usable afterwards
+(a terminal still in raw mode / the alternate screen survives a power cut). The
+action is absent in a dry run, since nothing was written to boot into.
+
 Two examples double as development probes, and both run without a screen or a
 serial console:
 

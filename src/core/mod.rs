@@ -10,6 +10,7 @@ pub mod install;
 pub mod layout;
 pub mod menu;
 pub mod model;
+pub mod power;
 pub mod removable;
 pub mod stage;
 pub mod storage;

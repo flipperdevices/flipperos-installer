@@ -602,6 +602,12 @@ pub struct AppState {
     pub bundle: Option<SelectedBundle>,
     /// Why the selected bundle could not be resolved, if it could not be.
     pub bundle_error: Option<String>,
+    /// Whether this run only logs destructive steps (`--dry-run`). Copied from
+    /// the config at construction and never changed; it lives here rather than
+    /// being read from the config because the frontends render from a snapshot
+    /// alone, and they use it to hide affordances that would be a lie in a dry
+    /// run.
+    pub dry_run: bool,
 }
 
 impl AppState {
@@ -612,6 +618,16 @@ impl AppState {
             && self.selection.target_device.is_some()
             && self.selected_uboot().is_some()
             && self.selected_build().and_then(|b| b.minimal()).is_some()
+    }
+
+    /// Whether the machine can be rebooted from the UI.
+    ///
+    /// Only after a completed install: by then the target has been flushed and
+    /// unmounted ([`crate::core::install`] does that on every exit path), so
+    /// going down is safe. Never in a dry run — nothing was written, so offering
+    /// it would imply the machine is ready to boot the new system.
+    pub fn can_reboot(&self) -> bool {
+        matches!(self.phase, Phase::Done) && !self.dry_run
     }
 
     /// Short label for the "Install" summary row shared by both frontends:
@@ -742,5 +758,39 @@ pub fn human_bytes(bytes: u64) -> String {
         format!("{bytes} B")
     } else {
         format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reboot_is_offered_only_after_a_real_install_completed() {
+        let done = AppState {
+            phase: Phase::Done,
+            ..AppState::default()
+        };
+        assert!(done.can_reboot());
+
+        // A dry run wrote nothing, so there is nothing to boot into.
+        assert!(!AppState {
+            dry_run: true,
+            ..done.clone()
+        }
+        .can_reboot());
+
+        for phase in [
+            Phase::Discovering,
+            Phase::Ready,
+            Phase::Installing,
+            Phase::Failed("boom".to_string()),
+        ] {
+            let state = AppState {
+                phase,
+                ..AppState::default()
+            };
+            assert!(!state.can_reboot(), "{}", state.phase.label());
+        }
     }
 }
