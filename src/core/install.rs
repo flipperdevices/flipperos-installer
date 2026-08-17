@@ -305,6 +305,12 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
         fs_layout.subvolumes.len()
     ));
 
+    // Reject a profile whose name collides with a shared subvolume before the
+    // wipe, not after `btrfs receive` has already run.
+    for p in build.minimal().into_iter().chain(extras.iter()) {
+        reject_reserved_profile_name(&p.name, &fs_layout)?;
+    }
+
     // How a digest mismatch is treated once we are writing, and whether the
     // artifacts are checked before that point at all.
     let fetch_mode = state.selection.fetch;
@@ -665,6 +671,43 @@ fn guard_ufs_boot_lu(
             human_bytes(size),
             human_bytes(uboot.size_bytes)
         )),
+    }
+    Ok(())
+}
+
+/// Refuse a profile name that collides with a shared or reserved top-level
+/// subvolume. `name` is the bare profile name (e.g. `Minimal`); the collision
+/// is checked against `@<name>`, which is what `ProfilePack::root_subvol()`
+/// deploys to. Mirrors `is_reserved_subvol()` in
+/// flipperone-linux-build-scripts (`overlays/usr/lib/flipper-btrfs.sh`), and
+/// additionally covers whatever the active layout defines.
+fn reject_reserved_profile_name(name: &str, layout: &Layout) -> Result<()> {
+    const RESERVED: &[&str] = &[
+        "@",
+        "@home",
+        "@root",
+        "@snapshots",
+        STOCK_SNAPSHOTS_DIR,
+        "@var-log",
+        "@var-cache",
+        "boot",
+    ];
+
+    if name.is_empty() {
+        return Err("profile name is empty".to_string());
+    }
+
+    let root = format!("@{name}");
+    if RESERVED.contains(&root.as_str()) || RESERVED.contains(&name) {
+        return Err(format!(
+            "profile name '{name}' is reserved and cannot be deployed as a profile"
+        ));
+    }
+    if let Some(sv) = layout.subvolumes.iter().find(|sv| sv.name == root) {
+        return Err(format!(
+            "profile name '{name}' collides with the shared '{}' subvolume ({})",
+            sv.name, layout.label
+        ));
     }
     Ok(())
 }
@@ -1638,5 +1681,46 @@ devpts /run/flipperos-install-root/dev/pts devpts rw 0 0
     #[test]
     fn mountpoint_escapes_are_decoded() {
         assert_eq!(mountpoints_in(MOUNTS, "/media"), vec!["/media/usb 1"]);
+    }
+
+    /// A pack named `stock-snapshots` parses like any other profile, and its
+    /// `root_subvol()` is byte-for-byte the directory every install already
+    /// mkdir -p's before the first receive. `btrfs subvolume snapshot` with an
+    /// existing directory as dest nests the snapshot inside it instead of
+    /// failing, stranding a subvolume that `btrfs subvolume delete` will not
+    /// remove.
+    #[test]
+    fn profile_named_stock_snapshots_collides_with_the_stock_snapshots_dir() {
+        let (name, build, is_inc) =
+            crate::core::catalog::parse_pack("stock-snapshots_694_stock_pack.zst")
+                .expect("parses like any other profile pack");
+        assert_eq!(name, "stock-snapshots");
+        assert!(!is_inc);
+
+        let profile = ProfilePack {
+            name,
+            build,
+            full: None,
+            incremental: None,
+        };
+        assert_eq!(profile.root_subvol(), STOCK_SNAPSHOTS_DIR);
+        assert!(
+            reject_reserved_profile_name(&profile.name, &Layout::embedded_default()).is_err(),
+            "a profile named '{}' must be rejected up front",
+            profile.name
+        );
+    }
+
+    #[test]
+    fn reject_reserved_profile_name_catches_every_shared_subvolume() {
+        let layout = Layout::embedded_default();
+        for reserved in ["home", "var-log", "var-cache", "snapshots", "stock-snapshots"] {
+            assert!(
+                reject_reserved_profile_name(reserved, &layout).is_err(),
+                "'{reserved}' should collide with a shared/reserved subvolume"
+            );
+        }
+        assert!(reject_reserved_profile_name("Minimal", &layout).is_ok());
+        assert!(reject_reserved_profile_name("Desktop", &layout).is_ok());
     }
 }
