@@ -11,8 +11,10 @@ pub mod layout;
 pub mod menu;
 pub mod model;
 pub mod power;
+pub mod provision;
 pub mod removable;
 pub mod stage;
 pub mod storage;
+pub mod ufs;
 
 pub use controller::{Config, Controller};

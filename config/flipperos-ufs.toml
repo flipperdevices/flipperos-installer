@@ -1,0 +1,109 @@
+# FlipperOS UFS provisioning scheme.
+#
+# Describes the logical units a UFS install target must be divided into. The
+# installer reads a target's Configuration Descriptor (over the kernel's UFS BSG
+# endpoint), compares it against this file, and offers to reprovision the device
+# when the layout differs. Reprovisioning is DESTRUCTIVE: the device is
+# reconfigured from scratch and everything on it is lost.
+#
+# This file is compiled into the installer. Unlike the Btrfs layout there is no
+# image-shipped override: provisioning describes the board's hardware rather than
+# the image, and the check runs when the target is selected, before an image
+# source is necessarily known. Use `--ufs-scheme <path>` to try a different
+# scheme without rebuilding.
+#
+# The scheme deliberately matches the one Rockchip's downstream USB-plug loader
+# writes (see drivers/ufs/ufs-rockchip-usbplug.c in rockchip-linux/u-boot), only
+# with larger LUs: 16 MiB boot LUs instead of 4 MiB, and a 128 MiB recovery LU
+# instead of an 8 MiB spare. Every other descriptor field is what that loader
+# writes, so a device provisioned by either agrees with the other and they never
+# fight over it.
+
+# `bBootEnable`: the boot feature must be on, or the RK3576 mask ROM cannot read
+# the bootloader from the boot LU at all and the board comes back dead. Some
+# parts (the Foresee 64 GB) ship with it off.
+boot_enable = true
+
+# `bBootLunEn`: which of the two boot LUs the mask ROM reads. Set to this when a
+# device is provisioned, but not fixed afterwards: every install writes the boot
+# LU that is *not* currently active and switches over only once the image is
+# written and its digest verified, so an interrupted update leaves the board
+# booting the bootloader it booted before. The provisioning check therefore
+# accepts either LU of the pair as the active one — what it rejects is a device
+# booting an LU the scheme does not flag, or none at all.
+#
+# This is a device attribute rather than part of the Configuration Descriptor, so
+# the installer can correct it without erasing anything.
+active_boot_lu = "A"
+
+# WriteBooster: part of the TLC NAND run in SLC mode as a write buffer.
+#
+# Both vendor datasheets state their parts support "preserve user space" only
+# (JESD220C-2.2 §13.4.14.2: with bWriteBoosterBufferPreserveUserSpaceEn = 01h the
+# buffer "avoids the reduction of the total user space that can be configured at
+# provisioning"). So the buffer costs no configurable capacity and is NOT
+# subtracted from LU 0 — asking for the device maximum is free. It shrinks by
+# itself as the device fills.
+[writebooster]
+# "max" uses dWriteBoosterBufferMaxNAllocUnits; a number is a size in MiB;
+# 0 disables the feature.
+size = "max"
+# "shared" is one buffer for every LU, "lu" dedicates it to LU 0. Every part we
+# have supports "shared" (the Biwin 256 GB supports *only* shared), and it is
+# what the Rockchip loader configures, so it is the default. The installer falls
+# back to the other mode if a device does not support this one.
+type = "shared"
+
+# LU 0 — the main system LU: GPT, U-Boot's loader partition and the Btrfs
+# filesystem. It takes whatever capacity the other LUs leave, so it carries no
+# `size_mib`. There must be exactly one such LU.
+[[lu]]
+id = 0
+name = "system"
+memory_type = "normal"
+
+# LU 1 and LU 2 — the A/B pair holding U-Boot. The RK3576 mask ROM fetches DRAM
+# init and the SPL from whichever one `bBootLunEn` selects, so each must hold a
+# whole u-boot-rockchip.bin; 16 MiB is comfortably more than the ~10 MiB image
+# needs at its 32 KiB offset. The installer alternates between them, which is
+# what makes a bootloader update survive being interrupted.
+[[lu]]
+id = 1
+name = "u-boot-a"
+memory_type = "enhanced1"
+size_mib = 16
+boot_lun = "A"
+
+[[lu]]
+id = 2
+name = "u-boot-b"
+memory_type = "enhanced1"
+size_mib = 16
+boot_lun = "B"
+
+# LU 3 — recovery: a kernel plus initrd for on-device rescue, kept out of the
+# Btrfs volume so it survives anything done to LU 0.
+[[lu]]
+id = 3
+name = "recovery"
+memory_type = "enhanced1"
+size_mib = 128
+
+# Every LU also gets, by default: bLUEnable = 1, bDataReliability = 1 (protected
+# against a power failure mid-write), bLogicalBlockSize = 4096 (both datasheets
+# say 4 KiB is not reconfigurable), bProvisioningType = thin, and
+# bLUWriteProtect = 0. Write protection stays off for now: LU 1-3 are to become
+# RPMB write-protected, which is a separate piece of work — setting
+# bLUWriteProtect here would only make them read-only after a power-on reset,
+# which would break the installer's own U-Boot write. Per-LU overrides are
+# `data_reliability`, `provisioning` ("thick" | "thin" | "thin-read-zeros") and
+# `logical_block_size`.
+#
+# `memory_type` may name any of the types the UFS spec defines — "normal",
+# "system code", "non-persistent" and "enhanced1" through "enhanced4" — but a
+# device only offers the subset its Geometry Descriptor advertises, and the
+# installer refuses a scheme asking for one it does not, or for more of a type
+# than that descriptor's ceiling allows.
+#
+# Logical units not listed here are disabled, including LU 8-31 on a device that
+# reports 32 of them.

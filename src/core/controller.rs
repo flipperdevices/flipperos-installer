@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::core::menu::LoadRequest;
 use crate::core::model::*;
-use crate::core::{board, bundle, catalog, install, removable};
+use crate::core::{board, bundle, catalog, install, provision, removable};
 
 /// Runtime configuration for the installer.
 #[derive(Clone, Debug)]
@@ -45,6 +45,15 @@ pub struct Config {
     pub fetch: FetchMode,
     /// When true, destructive operations are logged but not executed.
     pub dry_run: bool,
+    /// Check a UFS target's logical units against the Flipper provisioning
+    /// scheme when it is selected, and offer to reprovision on a mismatch.
+    pub ufs_check: bool,
+    /// Read the provisioning scheme from this file instead of the compiled-in
+    /// one. Only useful for trying a scheme out without a rebuild.
+    pub ufs_scheme: Option<String>,
+    /// Reprovision a mismatched UFS target without asking. For unattended and
+    /// factory runs, where there is nobody to answer the prompt.
+    pub ufs_reprovision: bool,
     /// DRM/KMS device node for the on-device screen.
     pub kms_device: String,
     /// When true, the GUI logs each keypress to stderr (input debugging). Off by
@@ -67,6 +76,9 @@ impl Default for Config {
             mode: InstallMode::default(),
             fetch: FetchMode::default(),
             dry_run: true,
+            ufs_check: true,
+            ufs_scheme: None,
+            ufs_reprovision: false,
             kms_device: "/dev/dri/by-path/platform-2acf0000.spi-cs-0-card".to_string(),
             debug_keys: false,
         }
@@ -87,6 +99,17 @@ impl Config {
             prefix: self.bundle_prefix.trim_matches('/').to_string(),
         }
     }
+}
+
+/// Whether a UFS provisioning check may raise the destructive reprovisioning
+/// prompt, or should only report what it found.
+///
+/// The distinction is who chose the device. A target the installer picked for the
+/// operator at startup gets reported; one the operator picked gets the offer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Offer {
+    Prompt,
+    ReportOnly,
 }
 
 /// A callback invoked with a fresh snapshot every time the state changes.
@@ -231,8 +254,9 @@ impl Controller {
     // --- Discovery -------------------------------------------------------
 
     /// Probe the board and enumerate local storage. Safe to run on a worker
-    /// thread; it only reads sysfs / device-tree.
-    pub fn discover(&self) {
+    /// thread; it only reads sysfs / device-tree, and the UFS provisioning check
+    /// it kicks off for the auto-selected target runs on a thread of its own.
+    pub fn discover(self: &Arc<Self>) {
         self.set_phase(Phase::Discovering);
         self.log("discovering board identity…");
         let board = board::detect();
@@ -264,6 +288,13 @@ impl Controller {
                 }
             }
         });
+
+        // Report the auto-selected target's provisioning, but do not offer to wipe
+        // it: nobody has chosen this device yet, and an operator who is about to
+        // insert an SD card should not have to answer for the one soldered on.
+        if let Some(path) = self.snapshot().selection.target_device {
+            self.check_ufs_provisioning(&path, Offer::ReportOnly);
+        }
     }
 
     /// Re-scan every source: mount removable media read-only, list the bundle
@@ -729,8 +760,199 @@ impl Controller {
 
     // --- Selection actions (shared by both frontends) --------------------
 
-    pub fn select_device(&self, path: &str) {
-        self.update(|s| s.selection.target_device = Some(path.to_string()));
+    pub fn select_device(self: &Arc<Self>, path: &str) {
+        self.update(|s| {
+            s.selection.target_device = Some(path.to_string());
+            // The old probe describes a different device.
+            s.ufs = None;
+        });
+        // Picking a device by hand is a decision about that device, so this is
+        // where an offer to reprovision it belongs.
+        self.check_ufs_provisioning(path, Offer::Prompt);
+    }
+
+    // --- UFS provisioning -------------------------------------------------
+
+    /// Probe a UFS target against the Flipper provisioning scheme, on a worker
+    /// thread since it talks to the device. Non-UFS targets are left alone.
+    ///
+    /// `offer` decides whether a layout that does not match raises the
+    /// reprovisioning prompt or is only reported. `--reprovision-ufs` skips the
+    /// asking either way.
+    pub fn check_ufs_provisioning(self: &Arc<Self>, path: &str, offer: Offer) {
+        if !self.config.ufs_check {
+            return;
+        }
+        let is_ufs = self
+            .snapshot()
+            .devices
+            .iter()
+            .any(|d| d.path == path && d.kind == StorageKind::Ufs);
+        if !is_ufs {
+            return;
+        }
+        let this = Arc::clone(self);
+        let path = path.to_string();
+        std::thread::spawn(move || this.probe_ufs(&path, offer));
+    }
+
+    /// Read the target's provisioning and publish it. Runs on a worker thread.
+    fn probe_ufs(self: &Arc<Self>, path: &str, offer: Offer) {
+        let (scheme, origin) = provision::Scheme::resolve(&self.config);
+        let status = match provision::probe(path, &scheme, &origin) {
+            Ok(status) => status,
+            Err(e) => {
+                self.log(probe_failure(path, &e));
+                return;
+            }
+        };
+        for line in status.report() {
+            self.log(line);
+        }
+        let provisioned = status.is_provisioned();
+        let device = status.device.clone();
+        let prompt = match (provisioned, offer) {
+            (false, Offer::Prompt) => Some(reprovision_prompt(&status)),
+            _ => None,
+        };
+        self.update(|s| {
+            // Only publish it if the operator has not moved on to another target.
+            if s.selection.target_device.as_deref() != Some(path) {
+                return;
+            }
+            s.ufs = Some(status);
+            if prompt.is_some() {
+                s.prompt = prompt.clone();
+            }
+        });
+        if provisioned {
+            return;
+        }
+        if self.config.ufs_reprovision {
+            self.log(format!(
+                "{device}: --reprovision-ufs given, reprovisioning without asking"
+            ));
+            self.dismiss_prompt();
+            self.start_reprovision(&device);
+        } else if offer == Offer::ReportOnly {
+            // Say where the offer lives, since it is not being made here.
+            self.log(format!(
+                "{device} is not provisioned for FlipperOS; reprovision it from the \
+                 target-device menu, or pick another target"
+            ));
+        }
+    }
+
+    /// Raise the reprovisioning prompt again for `path`, e.g. after it was
+    /// dismissed. Re-probes first, so it never offers to fix something already
+    /// fixed.
+    pub fn request_reprovision(self: &Arc<Self>, path: &str) {
+        let this = Arc::clone(self);
+        let path = path.to_string();
+        std::thread::spawn(move || {
+            let (scheme, origin) = provision::Scheme::resolve(&this.config);
+            match provision::probe(&path, &scheme, &origin) {
+                Err(e) => this.log(probe_failure(&path, &e)),
+                Ok(status) if status.is_provisioned() => {
+                    for line in status.report() {
+                        this.log(line);
+                    }
+                    this.log(format!("{path}: already matches the Flipper scheme"));
+                    this.update(|s| s.ufs = Some(status));
+                }
+                Ok(status) => {
+                    let prompt = reprovision_prompt(&status);
+                    this.update(|s| {
+                        s.ufs = Some(status);
+                        s.prompt = Some(prompt);
+                    });
+                }
+            }
+        });
+    }
+
+    /// Answer the pending prompt affirmatively.
+    ///
+    /// Taking the prompt is what makes this safe to call from both frontends at
+    /// once: whichever gets there first clears it under the lock, and the other
+    /// finds nothing to act on. Two simultaneous confirmations must not start two
+    /// destructive operations.
+    pub fn confirm_prompt(self: &Arc<Self>) {
+        let Some(prompt) = self.take_prompt() else {
+            return;
+        };
+        match prompt.kind {
+            PromptKind::ReprovisionUfs { device } => self.start_reprovision(&device),
+        }
+    }
+
+    /// Dismiss the pending prompt without acting on it.
+    pub fn dismiss_prompt(&self) {
+        self.take_prompt();
+    }
+
+    /// Remove the pending prompt and hand it back, if there was one.
+    fn take_prompt(&self) -> Option<Prompt> {
+        let taken = self.state.lock().unwrap().prompt.take();
+        if taken.is_some() {
+            // Both frontends take the popup down off this snapshot.
+            self.notify();
+        }
+        taken
+    }
+
+    /// Rewrite a UFS target's logical units on a worker thread. Destructive, so
+    /// it only ever runs from a confirmed prompt or `--reprovision-ufs`.
+    fn start_reprovision(self: &Arc<Self>, device: &str) {
+        if self.snapshot().phase.is_busy() {
+            self.log("cannot reprovision while another operation is running");
+            return;
+        }
+        let this = Arc::clone(self);
+        let device = device.to_string();
+        std::thread::spawn(move || {
+            this.set_phase(Phase::Provisioning);
+            let (scheme, origin) = provision::Scheme::resolve(&this.config);
+            let result = provision::apply(&this.config, &this, &device, &scheme, &origin);
+            match result {
+                Ok(()) => {
+                    // The logical units may have changed size, or been renamed by
+                    // the rescan, so the device list has to be rebuilt.
+                    this.rediscover_storage(&device);
+                    this.set_phase(Phase::Ready);
+                }
+                Err(e) => {
+                    this.log(format!("reprovisioning failed: {e}"));
+                    this.set_phase(Phase::Failed(e));
+                }
+            }
+        });
+    }
+
+    /// Re-enumerate storage after a device was reprovisioned, keeping `preferred`
+    /// selected when it is still there and falling back to the same rule
+    /// [`Self::discover`] uses when it is not.
+    fn rediscover_storage(self: &Arc<Self>, preferred: &str) {
+        let devices = storage_list();
+        for d in &devices {
+            self.log(format!("  found {}", d.summary()));
+        }
+        let still_there = devices.iter().any(|d| d.path == preferred);
+        self.update(|s| {
+            s.devices = devices;
+            if !still_there {
+                s.selection.target_device = s
+                    .devices
+                    .iter()
+                    .find(|d| d.boot_rom_capable() && !d.removable)
+                    .map(|d| d.path.clone());
+            }
+        });
+        if let Some(path) = self.snapshot().selection.target_device {
+            // Straight after a reprovision, so report the outcome rather than
+            // offering to do it again.
+            self.probe_ufs(&path, Offer::ReportOnly);
+        }
     }
 
     /// Pick a U-Boot build by hand, which is only meaningful for the custom flow,
@@ -830,6 +1052,30 @@ impl Controller {
     }
 }
 
+/// The prompt offering to bring a UFS target to the Flipper scheme. Built in one
+/// place so the wording cannot drift between the paths that raise it.
+fn reprovision_prompt(status: &provision::Status) -> Prompt {
+    Prompt {
+        kind: PromptKind::ReprovisionUfs {
+            device: status.device.clone(),
+        },
+        title: "Reprovision UFS?".to_string(),
+        lines: status.prompt_lines(),
+        // Both captions have to fit a 48 px soft-button slot on the device's
+        // screen, which "Reprovision" overflows. The title and the body say what
+        // confirming does; the button only has to say that it does it.
+        confirm: "Confirm".to_string(),
+        cancel: "Cancel".to_string(),
+    }
+}
+
+/// Why a UFS provisioning probe came back empty. Never fatal: the check is
+/// advisory, and [`crate::core::install`]'s own boot-LU guard is what refuses a
+/// device the bootloader cannot be written to.
+fn probe_failure(path: &str, e: &str) -> String {
+    format!("warning: cannot read {path}'s UFS provisioning: {e}")
+}
+
 /// Enumerate local storage; kept as a free function so tests and the
 /// [`Controller`] share one implementation.
 fn storage_list() -> Vec<StorageDevice> {
@@ -854,6 +1100,42 @@ mod tests {
             ..Config::default()
         });
         assert!(!ctrl.snapshot().dry_run);
+    }
+
+    #[test]
+    fn only_one_frontend_can_answer_a_prompt() {
+        // Both frontends show the same prompt, so both can be pressed at once. A
+        // destructive action must run for the first answer only.
+        let ctrl = Controller::new(Config::default());
+        let seen = Arc::new(AtomicUsize::new(0));
+        {
+            let seen = Arc::clone(&seen);
+            ctrl.subscribe(move |s| {
+                if s.prompt.is_none() {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+        }
+        ctrl.update(|s| {
+            s.prompt = Some(Prompt {
+                kind: PromptKind::ReprovisionUfs {
+                    device: "/dev/sda".to_string(),
+                },
+                title: "Reprovision UFS?".to_string(),
+                lines: vec!["ALL DATA WILL BE LOST.".to_string()],
+                confirm: "Confirm".to_string(),
+                cancel: "Cancel".to_string(),
+            });
+        });
+        assert!(ctrl.snapshot().prompt.is_some());
+        let before = seen.load(Ordering::SeqCst);
+
+        assert!(ctrl.take_prompt().is_some(), "the first answer wins");
+        assert!(ctrl.take_prompt().is_none(), "the second finds it gone");
+        assert!(ctrl.snapshot().prompt.is_none());
+        // Clearing it is broadcast, so the other frontend's popup comes down;
+        // taking nothing broadcasts nothing.
+        assert_eq!(seen.load(Ordering::SeqCst), before + 1);
     }
 
     #[test]

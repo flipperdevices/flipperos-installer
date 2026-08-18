@@ -47,6 +47,9 @@ struct TuiData {
     layered: RefCell<bool>,
     /// What the open details popup is showing, or None when closed.
     detail: RefCell<Option<DetailsTarget>>,
+    /// Whether the core's modal prompt is currently on screen, so a repeated
+    /// snapshot does not stack another copy of it.
+    prompt_open: RefCell<bool>,
 }
 
 /// Build the UI, wire it to `ctrl`, and run the blocking event loop.
@@ -58,6 +61,7 @@ pub fn run(ctrl: Arc<Controller>) {
         sig: RefCell::new(String::new()),
         layered: RefCell::new(false),
         detail: RefCell::new(None),
+        prompt_open: RefCell::new(false),
     });
 
     // Left: overview of the current selections (Enter opens a level / installs).
@@ -405,6 +409,69 @@ fn close_details(siv: &mut Cursive) {
     }
 }
 
+// --- the core's modal prompt -----------------------------------------------
+
+/// Answer the prompt affirmatively. The controller clears it, and the snapshot
+/// that follows is what takes the dialog down.
+fn accept_prompt(siv: &mut Cursive) {
+    action(siv, |c| c.confirm_prompt());
+}
+
+/// Turn the prompt down, from its own button or from Backspace/Escape.
+fn cancel_prompt(siv: &mut Cursive) {
+    action(siv, |c| c.dismiss_prompt());
+}
+
+/// Show or hide the question the core raised, driven purely by the snapshot: the
+/// buttons only answer the controller, and the layer appears and disappears with
+/// [`AppState::prompt`]. That is what keeps the two frontends in step — answering
+/// in the serial console closes the same prompt on the device's screen.
+fn sync_prompt(siv: &mut Cursive, state: &AppState) {
+    let open = siv
+        .user_data::<TuiData>()
+        .map(|d| *d.prompt_open.borrow())
+        .unwrap_or(false);
+    match &state.prompt {
+        Some(prompt) if !open => {
+            // Only the topmost layer can be removed again, so an open details
+            // popup goes first.
+            if siv
+                .user_data::<TuiData>()
+                .map(|d| d.detail.borrow().is_some())
+                .unwrap_or(false)
+            {
+                close_details(siv);
+            }
+            if let Some(d) = siv.user_data::<TuiData>() {
+                *d.prompt_open.borrow_mut() = true;
+            }
+            let dialog = Dialog::around(
+                TextView::new(prompt.lines.join("\n"))
+                    .scrollable()
+                    .max_height(14)
+                    .min_width(48),
+            )
+            .title(prompt.title.clone())
+            // Cancel first, so cursive opens with the harmless button focused —
+            // these prompts destroy data.
+            .button(prompt.cancel.clone(), cancel_prompt)
+            .button(prompt.confirm.clone(), accept_prompt);
+            siv.add_layer(
+                OnEventView::new(dialog)
+                    .on_event(Key::Backspace, cancel_prompt)
+                    .on_event(Key::Esc, cancel_prompt),
+            );
+        }
+        None if open => {
+            siv.pop_layer();
+            if let Some(d) = siv.user_data::<TuiData>() {
+                *d.prompt_open.borrow_mut() = false;
+            }
+        }
+        _ => {}
+    }
+}
+
 // --- rendering -------------------------------------------------------------
 
 /// Progress-bar + phase header line shown at the top of the install pane.
@@ -470,6 +537,10 @@ fn render(siv: &mut Cursive, state: &AppState) {
 
     // Bottom action buttons: shown only while their action is available.
     rebuild_buttons(siv, state);
+
+    // Before the install-view branch below returns early: a prompt can be raised
+    // at any phase, and it has to be answerable in all of them.
+    sync_prompt(siv, state);
 
     let tail: Vec<String> = state.log.iter().rev().take(400).rev().cloned().collect();
 

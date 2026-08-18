@@ -546,6 +546,8 @@ pub enum Phase {
     Discovering,
     /// Idle, waiting for the operator to make selections.
     Ready,
+    /// Rewriting a UFS target's logical units before an install can start.
+    Provisioning,
     /// Installation in progress.
     Installing,
     /// Installation finished successfully.
@@ -565,6 +567,7 @@ impl Phase {
         match self {
             Phase::Discovering => "discovering…".to_string(),
             Phase::Ready => "ready".to_string(),
+            Phase::Provisioning => "provisioning…".to_string(),
             Phase::Installing => "installing…".to_string(),
             Phase::Done => "done".to_string(),
             Phase::Failed(e) => format!("failed: {e}"),
@@ -572,8 +575,35 @@ impl Phase {
     }
 
     pub fn is_busy(&self) -> bool {
-        matches!(self, Phase::Discovering | Phase::Installing)
+        matches!(
+            self,
+            Phase::Discovering | Phase::Provisioning | Phase::Installing
+        )
     }
+}
+
+/// A modal question the core needs answered before it can go on.
+///
+/// It lives in [`AppState`] rather than in a frontend because the core is what
+/// raises it: the navigation stack is per-frontend and the core cannot push a
+/// level onto it. Both frontends therefore show the same prompt at the same time,
+/// and whichever one answers it clears it for the other.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Prompt {
+    pub kind: PromptKind,
+    pub title: String,
+    /// The body, one paragraph per entry; the frontends wrap it themselves.
+    pub lines: Vec<String>,
+    /// Caption for the confirming action, e.g. `Reprovision`.
+    pub confirm: String,
+    pub cancel: String,
+}
+
+/// What confirming a [`Prompt`] sets in motion.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PromptKind {
+    /// Rewrite a UFS target's logical units to the Flipper scheme.
+    ReprovisionUfs { device: String },
 }
 
 /// The full application state. A clone of this is the "snapshot" broadcast to
@@ -608,6 +638,12 @@ pub struct AppState {
     /// alone, and they use it to hide affordances that would be a lie in a dry
     /// run.
     pub dry_run: bool,
+    /// How the selected UFS target's logical units compare to the Flipper
+    /// provisioning scheme. `None` for a non-UFS target, or before the probe has
+    /// finished.
+    pub ufs: Option<crate::core::provision::Status>,
+    /// The modal question waiting for an answer, if any.
+    pub prompt: Option<Prompt>,
 }
 
 impl AppState {

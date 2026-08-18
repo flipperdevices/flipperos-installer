@@ -108,7 +108,9 @@ fn main() {
     // The install runs on a worker thread; wait for it to settle.
     loop {
         let s = ctrl.snapshot();
-        if !matches!(s.phase, Phase::Installing | Phase::Ready | Phase::Discovering) {
+        // Anything but a finished or failed run means work is still in flight —
+        // including a UFS reprovision, which can precede the install.
+        if matches!(s.phase, Phase::Done | Phase::Failed(_)) {
             for line in s.log.iter().skip(from) {
                 println!("  {line}");
             }

@@ -56,6 +56,8 @@ pub enum Action {
     ToggleProfile { name: String, on: bool },
     ToggleAllProfiles(bool),
     StartInstall,
+    /// Offer to rewrite a UFS target's logical units to the Flipper scheme.
+    ReprovisionUfs(String),
     /// Placeholder rows: `(loading…)`, `(none found)`, `(failed: …)`.
     Inert,
 }
@@ -82,6 +84,8 @@ pub enum DetailsTarget {
     Snapshot(String),
     /// The selected bundle, whose manifest is already loaded.
     Bundle(String),
+    /// A UFS target's logical units and how they compare to the scheme.
+    Ufs(String),
 }
 
 /// Left-hand state marker for a row.
@@ -671,7 +675,14 @@ fn snapshot(state: &AppState) -> Level {
 }
 
 fn device(state: &AppState) -> Level {
-    let items: Vec<MenuItem> = state
+    let selected = state.selection.target_device.as_deref();
+    // The provisioning probe result, but only while it still describes the
+    // selected target: it is replaced asynchronously when the target changes.
+    let ufs = match (&state.ufs, selected) {
+        (Some(status), Some(path)) if status.device == path => Some(status),
+        _ => None,
+    };
+    let mut items: Vec<MenuItem> = state
         .devices
         .iter()
         .map(|d| {
@@ -685,11 +696,31 @@ fn device(state: &AppState) -> Level {
             };
             let mut item = MenuItem::plain(name, Action::PickDevice(d.path.clone()))
                 .with_detail(d.human_size())
-                .selected_if(Some(d.path.as_str()) == state.selection.target_device.as_deref());
+                .selected_if(Some(d.path.as_str()) == selected);
             item.dim = !d.boot_rom_capable();
+            // A probe result exists for the selected target only, and offering a
+            // details popup with nothing behind it would be a lie.
+            if ufs.is_some() && Some(d.path.as_str()) == selected {
+                item.details = Some(DetailsTarget::Ufs(d.path.clone()));
+            }
             item
         })
         .collect();
+
+    // A UFS target that does not match the scheme can be reprovisioned from
+    // here, which is also how the operator gets the offer back after dismissing
+    // it. The row stays visible when the layout is fine, showing that it is.
+    if let Some(status) = ufs {
+        let mut item = MenuItem::plain(
+            "Reprovision UFS\u{2026}",
+            Action::ReprovisionUfs(status.device.clone()),
+        )
+        .with_detail(status.short_label());
+        item.dim = status.is_provisioned();
+        item.details = Some(DetailsTarget::Ufs(status.device.clone()));
+        items.push(item);
+    }
+
     let mut level = level_of(MenuKey::Device, "Target device", LevelKind::SinglePick, items);
     if level.items.is_empty() {
         level.items = vec![MenuItem::inert("(no targets found)")];
@@ -863,6 +894,12 @@ pub fn activate(ctrl: &Arc<Controller>, level: &Level, index: usize) -> Move {
             ctrl.start_install();
             Move::ToRoot
         }
+        Action::ReprovisionUfs(path) => {
+            // Raises the confirmation prompt rather than doing anything: the
+            // operator has to agree to losing everything on the device.
+            ctrl.request_reprovision(path);
+            Move::Stay
+        }
     }
 }
 
@@ -950,6 +987,14 @@ pub fn details_text(state: &AppState, target: &DetailsTarget) -> (String, String
                 None => "(not loaded)".to_string(),
             };
             ("Bundle details".to_string(), text)
+        }
+        DetailsTarget::Ufs(path) => {
+            let text = match &state.ufs {
+                Some(status) if status.device == *path => status.report().join("\n"),
+                // Either the probe has not finished or the target moved on.
+                _ => "(not probed)".to_string(),
+            };
+            ("UFS provisioning".to_string(), text)
         }
     }
 }
@@ -1284,5 +1329,97 @@ mod tests {
         assert!(level.items[1].dim);
         assert!(level.items[1].text.starts_with("! "));
         assert_eq!(level.items[1].action, Action::PickDevice("/dev/sda".into()));
+    }
+
+    #[test]
+    fn a_ufs_target_offers_its_provisioning() {
+        let mut s = state();
+        s.devices = vec![StorageDevice {
+            path: "/dev/sda".into(),
+            kind: StorageKind::Ufs,
+            model: "BWUFS256".into(),
+            size_bytes: 256 * 1000 * 1000 * 1000,
+            removable: false,
+            logical_block_size: 4096,
+        }];
+        s.selection.target_device = Some("/dev/sda".into());
+
+        // No probe yet: just the device row, and no provisioning affordance to
+        // offer since there is nothing to say about it.
+        let level = build(&MenuKey::Device, &s);
+        assert_eq!(level.items.len(), 1);
+        assert!(level.items[0].details.is_none());
+
+        // Once the probe lands, the selected UFS row gets a details popup and the
+        // level gains the reprovisioning row, labelled with the verdict.
+        s.ufs = Some(unprovisioned_status("/dev/sda"));
+        let level = build(&MenuKey::Device, &s);
+        assert_eq!(level.items.len(), 2);
+        assert_eq!(
+            level.items[0].details,
+            Some(DetailsTarget::Ufs("/dev/sda".into()))
+        );
+        let row = &level.items[1];
+        assert_eq!(row.action, Action::ReprovisionUfs("/dev/sda".into()));
+        assert_eq!(row.detail, "unprovisioned");
+        assert!(!row.dim, "a device needing work must not look inert");
+        assert!(level.can_details());
+        // The report reaches the popup rather than being hidden in the log.
+        let (title, text) = details_text(&s, &DetailsTarget::Ufs("/dev/sda".into()));
+        assert_eq!(title, "UFS provisioning");
+        assert!(text.contains("/dev/sda"), "{text}");
+
+        // A device that is already right keeps the row, dimmed, so the operator
+        // can still see the verdict and open the report.
+        let mut ok = unprovisioned_status("/dev/sda");
+        ok.mismatches.clear();
+        s.ufs = Some(ok);
+        let level = build(&MenuKey::Device, &s);
+        assert_eq!(level.items[1].detail, "ok");
+        assert!(level.items[1].dim);
+    }
+
+    /// A UFS probe result standing in for a device that needs reprovisioning,
+    /// built without touching hardware.
+    fn unprovisioned_status(device: &str) -> crate::core::provision::Status {
+        use crate::core::provision::{Mismatch, Plan};
+        use crate::core::ufs::{ConfigDescriptor, DeviceDescriptor, GeometryDescriptor};
+
+        // Minimal but real descriptors, so `Status` behaves as it would after a
+        // probe: a 22/26-byte configuration layout and 4 MiB allocation units.
+        let mut device_desc = vec![0u8; 0x59];
+        device_desc[0x00] = 0x59;
+        device_desc[0x1A] = 0x16;
+        device_desc[0x1B] = 0x1A;
+        let dev = DeviceDescriptor::parse(&device_desc).expect("device descriptor");
+        let mut geometry_desc = vec![0u8; 0x57];
+        geometry_desc[0x00] = 0x57;
+        geometry_desc[0x01] = 0x07;
+        geometry_desc[0x0F] = 0x20; // dSegmentSize = 8192 sectors
+        geometry_desc[0x11] = 0x01; // one segment per allocation unit
+        let geometry = GeometryDescriptor::parse(&geometry_desc).expect("geometry descriptor");
+
+        crate::core::provision::Status {
+            device: device.to_string(),
+            scheme_origin: "built-in default".to_string(),
+            current: ConfigDescriptor::empty(&dev).lus(),
+            plan: Plan {
+                descriptor: ConfigDescriptor::empty(&dev),
+                clear: Vec::new(),
+                boot_lun_en: 1,
+                summary: Vec::new(),
+            },
+            boot_enable: 0,
+            boot_lun_en: 0,
+            config_locked: false,
+            power_on_wp: false,
+            permanent_wp: false,
+            geometry,
+            mismatches: vec![Mismatch {
+                what: "LU 1 is absent, want it enabled".to_string(),
+                critical: true,
+                descriptor_write: true,
+            }],
+        }
     }
 }

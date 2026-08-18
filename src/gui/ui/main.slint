@@ -109,6 +109,14 @@ export component MainWindow inherits Window {
     in property <string> details-title;
     in property <[string]> details-model;
 
+    // Confirmation prompt (screen 3), raised by the core rather than by a key:
+    // the same question is on the serial console at the same time, and either
+    // answer closes both. Pre-wrapped like the details popup.
+    in property <string> prompt-title;
+    in property <[string]> prompt-model;
+    in property <string> prompt-confirm;
+    in property <string> prompt-cancel;
+
     // --- actions back to Rust ---
     // Activate a row of the summary (screen 0) or the open level (screen 1) by
     // index. Rust performs the action AND moves its navigation stack, then
@@ -127,6 +135,10 @@ export component MainWindow inherits Window {
     callback refresh();
     // Open the details popup for the highlighted row of the open level.
     callback show-details(int);
+    // Answer the core's confirmation prompt. Rust clears it in the shared state,
+    // which is what takes this popup back down — here and in the TUI at once.
+    callback confirm-prompt();
+    callback dismiss-prompt();
     // Per-keypress trace (text, screen, menu-index, cursor) for input
     // debugging. Only wired by Rust when `--debug-keys` is set — otherwise it
     // is a no-op, so nothing hits stderr / the shared console.
@@ -136,9 +148,10 @@ export component MainWindow inherits Window {
     callback ensure-visible(int, int);
 
     // --- navigation state ---
-    // screen: 0 = summary, 1 = level popup, 2 = details popup. Exposed as
-    // in-out so an off-device screenshot harness can drive the view; on-device
-    // it is set by the keys and by Rust when the level stack empties.
+    // screen: 0 = summary, 1 = level popup, 2 = details popup, 3 = the core's
+    // confirmation prompt. Exposed as in-out so an off-device screenshot harness
+    // can drive the view; on-device it is set by the keys and by Rust — when the
+    // level stack empties, and whenever a prompt is raised or answered.
     in-out property <int> screen: 0;
     // Highlighted summary row.
     in-out property <int> menu-index: 0;
@@ -148,6 +161,8 @@ export component MainWindow inherits Window {
     in-out property <int> cursor: 0;
     // Scroll offset (in rows) for the details popup on screen 2.
     in-out property <int> details-scroll: 0;
+    // Scroll offset (in rows) for the prompt on screen 3.
+    in-out property <int> prompt-scroll: 0;
 
     function level-count() -> int { return root.level-items.length; }
     // First visible row, chosen so the cursor stays on screen.
@@ -167,6 +182,9 @@ export component MainWindow inherits Window {
     }
     // Rows visible at once in the details popup (screen 2), at the 14px pitch.
     function details-visible() -> int { return 7; }
+    // The prompt (screen 3) spends a row on its title tab and keeps a soft-button
+    // bar with two captions, so it fits one line fewer than the details popup.
+    function prompt-visible() -> int { return 6; }
 
     forward-focus: fs;
     fs := FocusScope {
@@ -189,6 +207,33 @@ export component MainWindow inherits Window {
             // (Z = cancel/stop). Confirm and back live on ENTER/BACKSPACE, so
             // they never depend on a soft button. Escape/Left are kept as
             // conveniences for desktop testing against a vkms device.
+
+            // The confirmation prompt (screen 3) is modal and comes first: it is
+            // the core asking, so nothing else may be reached while it is up.
+            // RUN/ENTER confirms, EXIT/BACKSPACE cancels, and Rust takes the
+            // popup down by clearing the prompt in the shared state.
+            if (root.screen == 3) {
+                if (event.text == Key.UpArrow) {
+                    if (root.prompt-scroll > 0) { root.prompt-scroll -= 1; }
+                    return accept;
+                }
+                if (event.text == Key.DownArrow) {
+                    if (root.prompt-scroll < max(0, root.prompt-model.length - root.prompt-visible())) {
+                        root.prompt-scroll += 1;
+                    }
+                    return accept;
+                }
+                if (event.text == "b" || event.text == "B" || event.text == Key.Return) {
+                    root.confirm-prompt();
+                    return accept;
+                }
+                if (event.text == Key.Backspace || event.text == Key.Escape
+                    || event.text == "z" || event.text == "Z") {
+                    root.dismiss-prompt();
+                    return accept;
+                }
+                return reject;
+            }
 
             // Back / exit. From a level this asks Rust to pop one frame: the
             // stack lives there (Slint has no growable state), and Rust sets
@@ -510,6 +555,64 @@ export component MainWindow inherits Window {
             Rectangle {
                 height: 14px;
                 SoftButton { x: root.sb-x(0); width: root.sb-w; caption: "Back"; }
+            }
+        }
+
+        // ===== CONFIRMATION PROMPT (screen 3) =====
+        // Same shape as the details popup, plus a confirming soft button on the
+        // RUN slot. Raised by the core, not by a key.
+        if root.screen == 3 : VerticalLayout {
+            width: 100%;
+            height: 100%;
+
+            VerticalLayout {
+                vertical-stretch: 1;
+                padding: 3px;
+                padding-bottom: 0px;
+                spacing: 2px;
+
+                OutlineFrame {
+                    height: 16px;
+                    Text {
+                        x: 6px;
+                        y: 0px;
+                        height: parent.height;
+                        text: root.prompt-title;
+                        font-family: "HaxrCorp 4090";
+                        color: #000000;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+
+                OutlineFrame {
+                    clip: true;
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        width: 100%;
+                        padding: 3px;
+                        y: -root.prompt-scroll * 14px;
+                        for line[i] in root.prompt-model : Text {
+                            height: 14px;
+                            text: line;
+                            font-family: "HaxrCorp 4090";
+                            color: #000000;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 14px;
+                SoftButton {
+                    x: root.sb-x(0); width: root.sb-w; caption: root.prompt-cancel;
+                }
+                SoftButton {
+                    x: root.sb-x(4); width: root.sb-w; caption: root.prompt-confirm;
+                    primary: true;
+                }
             }
         }
     }

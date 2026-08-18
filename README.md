@@ -9,6 +9,9 @@ It can:
 - **Discover the running board** from the device tree (`/proc/device-tree`).
 - **Enumerate local storage** the RK3576 boot ROM can boot from (UFS, eMMC, SD)
   via sysfs.
+- **Check a UFS target's logical units** against the Flipper provisioning scheme
+  and offer to **reprovision** it — writing the Configuration Descriptor over the
+  kernel's UFS BSG endpoint.
 - **Browse update bundles** published per channel (`release`, `testing`,
   `nightly`, and per-developer `dev/<user>/<branch>` builds), and verify each
   artifact against the SHA-256 digests in the bundle's manifest.
@@ -62,6 +65,10 @@ selection.
   per-frontend.
 - [`core::board`](src/core/board.rs) / [`core::storage`](src/core/storage.rs) /
   [`core::removable`](src/core/removable.rs) — discovery.
+- [`core::ufs`](src/core/ufs.rs) — UFS descriptors and attributes over the SCSI
+  BSG endpoint (transport and wire format only);
+  [`core::provision`](src/core/provision.rs) — the logical-unit scheme, the
+  comparison against it, and the destructive rewrite.
 - [`core::bundle`](src/core/bundle.rs) / [`core::archive`](src/core/archive.rs) /
   [`core::catalog`](src/core/catalog.rs) — the two kinds of image source.
 - [`core::fetch`](src/core/fetch.rs) — every byte the installer reads, plus the
@@ -242,6 +249,81 @@ streams, decompressed in-process and piped into `btrfs receive`.
 A removable-media mirror of the same `u-boot/` and `rootfs/` tree is picked up
 automatically and merged into the lists.
 
+## UFS provisioning
+
+A UFS device is divided into **logical units** by its manufacturer, and the layout
+we need differs from the one they ship. When a UFS device is selected as the
+install target, the installer reads its Configuration Descriptor and compares it
+against the scheme in [config/flipperos-ufs.toml](config/flipperos-ufs.toml):
+
+| LU | Role | Memory type | Size |
+|----|------|-------------|------|
+| 0  | main system — GPT, loader partition, Btrfs | Normal | all remaining |
+| 1  | U-Boot, flagged **Boot LU A** | Enhanced1 | 16 MiB |
+| 2  | U-Boot, flagged **Boot LU B** | Enhanced1 | 16 MiB |
+| 3  | recovery — kernel + initrd for on-device rescue | Enhanced1 | 128 MiB |
+
+If the layout differs in a way that matters — which units exist, their size,
+memory type or boot flag, whether the boot feature is on, or whether the mask ROM
+is pointed at a boot LU at all — both frontends raise a confirmation prompt.
+Reprovisioning is
+**destructive**: the device rebuilds its whole mapping and everything on it is
+lost. Differences that do not change what the device *is* (the WriteBooster size,
+data reliability, provisioning type) are logged and tolerated. The full report is
+on the target-device level's details popup.
+
+Provisioning goes through `/dev/bsg/ufs-bsg<host>` (needs `CONFIG_SCSI_UFS_BSG`) and
+takes four steps: write the Configuration Descriptor, set `bBootLunEn`, set
+**`fDeviceInit`** so the device rebuilds its logical units, and rescan the SCSI host
+so the kernel picks up their new capacities. `fDeviceInit` is the same step
+Rockchip's downstream USB-plug loader performs after provisioning
+(`ufshcd_complete_dev_init` inside `_ufs_start`, see
+`drivers/ufs/ufs-rockchip-usbplug.c` in `rockchip-linux/u-boot`), which is why no
+power cycle is needed even though a device applies a new configuration only when it
+initialises. The installer then re-reads the descriptor and refuses to call the job
+done unless it reads back as the scheme.
+
+Every descriptor field we do not vary is set to the value that loader writes, so a
+device provisioned by either agrees with the other.
+
+Two details are worth knowing before touching this code. The UPIU header's
+`data_segment_length` **must** be set by us for a WRITE DESCRIPTOR: the kernel fills
+it in on its own query path but not on the raw BSG one, and a device that receives a
+zero-length data segment answers a perfectly good descriptor with `INVALID VALUE`,
+having never seen it (`ufs-utils` sets it in `prepare_upiu` for the same reason). And
+the rescan must delete only *data* logical units: the well-known LUNs live under the
+same SCSI target, the driver holds pointers to them, and deleting
+`hba->ufs_device_wlun` earned a NULL dereference in `rpm_drop_usage_count` from
+`ufshcd_err_handler`.
+
+### The A/B bootloader pair
+
+Because each boot LU then holds 16 MiB, a whole `u-boot-rockchip.bin` fits in one,
+so a UFS bootloader update is fail-safe:
+
+1. read `bBootLunEn` to see which boot LU the mask ROM currently reads;
+2. write the image to the **other** one, in full;
+3. verify it against the manifest digest;
+4. only then point `bBootLunEn` at it, and read the attribute back.
+
+An interrupted or corrupted update therefore leaves the board booting exactly what
+it booted before. A digest mismatch leaves the old boot LU active — the install
+fails outright under `verify first`, and warns under `stream`, where the bytes have
+already landed. A device with only one boot LU is written in place, with a warning
+that says so. An install onto a device whose boot LU is too small for the image is
+refused **before** anything is erased.
+
+Which side is live is consequently not fixed, so the provisioning check accepts
+either — otherwise every second install would offer to wipe the device.
+
+LU 1–3 are meant to end up RPMB write-protected; that is separate work, so
+`bLUWriteProtect` is left clear for now (setting it would make them read-only
+after a power-on reset, which would break the installer's own U-Boot write).
+
+`--no-ufs-check` skips the check entirely, `--reprovision-ufs` reprovisions a
+mismatched target without asking (for unattended and factory runs), and
+`--ufs-scheme <PATH>` tries a different scheme without a rebuild.
+
 ## Btrfs layout
 
 The shared, top-level Btrfs subvolume skeleton (`boot`, `@home`, `@var-log`,
@@ -257,8 +339,9 @@ selected snapshot packs.
 ## Status
 
 This is an early scaffold: the architecture, discovery, both frontends and the
-dry-run install pipeline are in place. GPT partitioning and the U-Boot write are
-done in-process (`gpt` crate); the remaining destructive steps shell out to
+dry-run install pipeline are in place. GPT partitioning, the U-Boot write and UFS
+provisioning are done in-process (the `gpt` crate, and `SG_IO` ioctls for UFS);
+the remaining destructive steps shell out to
 `blkdiscard`, `mkfs.btrfs`, `btrfs` and `chattr`. Kernel installation is driven
 by an embedded POSIX shell script
 ([scripts/flipperos-install-kernel.sh](scripts/flipperos-install-kernel.sh))

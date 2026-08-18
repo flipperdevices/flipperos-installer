@@ -244,7 +244,50 @@ fn main() {
     ui.set_screen(2);
     shoot(&window, "06-details");
 
+    // The target-device level of a UFS board whose logical units do not match the
+    // Flipper provisioning scheme: the last row offers to rewrite them.
+    ui.set_level_title("Target device".into());
+    ui.set_level_can_refresh(false);
+    ui.set_level_can_details(true);
+    let targets: [Row; 3] = [
+        ("/dev/sda [ufs] BWUFS256", "237.9 GiB", 0, 3, false, false, false),
+        ("! /dev/sdb [usb] SanDisk", "29.7 GiB", 2, 0, false, true, false),
+        ("Reprovision UFS\u{2026}", "unprovisioned", 0, 0, false, false, false),
+    ];
+    ui.set_level_items(rows(&targets));
+    ui.set_cursor(2);
+    ui.set_screen(1);
+    shoot(&window, "09-level-device-ufs");
+
+    // The reprovisioning prompt (screen 3), with the wording
+    // `provision::Status::prompt_lines` produces for a factory-provisioned part.
+    // The caution has to be readable without scrolling on a 256x144 panel.
+    ui.set_prompt_title("Reprovision UFS?".into());
+    ui.set_prompt_confirm("Confirm".into());
+    ui.set_prompt_cancel("Cancel".into());
+    let prompt = "ALL DATA ON /dev/sda WILL BE PERMANENTLY LOST.\n\
+                  \n\
+                  Logical units, now and wanted:\n\
+                  LU 0: 238.3 GiB \u{2192} 237.9 GiB\n\
+                  LU 1: 4.0 MiB boot A \u{2192} 16.0 MiB boot A\n\
+                  LU 2: 4.0 MiB boot B \u{2192} 16.0 MiB boot B\n\
+                  LU 3: 8.0 MiB \u{2192} 128.0 MiB";
+    ui.set_prompt_model(wrapped(prompt));
+    ui.set_prompt_scroll(0);
+    ui.set_screen(3);
+    shoot(&window, "10-prompt-reprovision");
+
     println!("wrote PNGs to target/screenshots/");
+}
+
+/// Wrap to the 40 columns the popups hold, through the very function the device
+/// uses, so a screenshot cannot flatter the real layout.
+fn wrapped(text: &str) -> ModelRc<SharedString> {
+    let lines: Vec<SharedString> = flipperos_installer::gui::wrap_lines(text, 40)
+        .into_iter()
+        .map(SharedString::from)
+        .collect();
+    ModelRc::new(VecModel::from(lines))
 }
 
 fn shoot(window: &Rc<MinimalSoftwareWindow>, name: &str) {

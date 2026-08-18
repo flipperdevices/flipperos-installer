@@ -7,7 +7,9 @@
 //! The high-level flow mirrors what the user selected in either frontend:
 //!   1. `blkdiscard` the whole target device.
 //!   2. Write a fresh GPT reserving the RK3576 bootloader area.
-//!   3. Write the selected U-Boot image directly to the reserved boot area.
+//!   3. Write the selected U-Boot image directly to the reserved boot area — and,
+//!      on UFS, to the spare boot LU, switching the mask ROM over to it only once
+//!      the image verifies.
 //!   4. `mkfs.btrfs` on the root partition and create the subvolume skeleton.
 //!   5. If the build ships a `/home` seed, `btrfs receive` it to a transient
 //!      base and snapshot a writable `@home` from it so /home starts populated.
@@ -24,7 +26,7 @@ use crate::core::layout::{self, Layout};
 use crate::core::model::{
     human_bytes, FetchMode, PackFile, ProfilePack, Source, StorageDevice, StorageKind, UbootBuild,
 };
-use crate::core::{fetch, stage};
+use crate::core::{fetch, stage, storage, ufs};
 
 // GPT layout used by FlipperOS images, as byte offsets from the start of disk.
 // These are absolute byte offsets, independent of the device's sector size;
@@ -263,6 +265,21 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
         if cfg.dry_run { "  [DRY RUN]" } else { "" },
     ));
 
+    // What the provisioning check found when the target was selected. Logged
+    // before the guards, so it is on screen to explain a refusal; nothing here
+    // aborts the run by itself — the boot-LU guard below is what refuses a device
+    // the bootloader cannot be written to.
+    if let Some(status) = &state.ufs {
+        ctrl.log(format!(
+            "ufs provisioning: {} (scheme: {})",
+            status.short_label(),
+            status.scheme_origin
+        ));
+        for m in status.critical().chain(status.warnings()) {
+            ctrl.log(format!("warning: ufs {}", m.what));
+        }
+    }
+
     // An earlier attempt that failed midway can leave our own mountpoints
     // behind. Clear them before the in-use guard, so a retry is not refused
     // because of our own leftovers (a foreign mount still makes it refuse).
@@ -272,6 +289,10 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
     // live on the disk we are about to wipe.
     crate::core::removable::unmount_ours(Some(&device.path));
     guard_target(cfg, ctrl, &device)?;
+    // Decided once, before anything is written: the guard below checks the boot LU
+    // this run will write, and `install_uboot` writes that same one.
+    let boot_lu = ufs_boot_lu_plan(ctrl, &device);
+    guard_ufs_boot_lu(cfg, ctrl, &device, &uboot, boot_lu.as_ref())?;
     stage::guard_not_on_target(&uboot, &build, &extras, &device.path)?;
 
     // Resolve the Btrfs layout: prefer one shipped with the images, else the
@@ -369,7 +390,7 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
 
     // 3. Bootloader.
     ticker.begin(ctrl, &format!("installing u-boot {}", uboot.label));
-    install_uboot(cfg, ctrl, &device, &uboot, policy)?;
+    install_uboot(cfg, ctrl, &device, &uboot, boot_lu.as_ref(), policy)?;
 
     // 4. Filesystem + subvolumes.
     ticker.begin(ctrl, &format!("mkfs.btrfs {root_part}"));
@@ -560,7 +581,7 @@ fn guard_target(cfg: &Config, ctrl: &Controller, device: &StorageDevice) -> Resu
         ));
     }
 
-    let in_use = crate::core::storage::device_in_use(&device.path);
+    let in_use = storage::device_in_use(&device.path);
     if !in_use.is_empty() {
         let detail = in_use.join("; ");
         // In dry-run we never touch the disk, so warn but let the flow proceed;
@@ -573,6 +594,77 @@ fn guard_target(cfg: &Config, ctrl: &Controller, device: &StorageDevice) -> Resu
         } else {
             return Err(format!("{} is in use: {detail}", device.path));
         }
+    }
+    Ok(())
+}
+
+/// Refuse a UFS target whose boot LU cannot hold the whole U-Boot image.
+///
+/// The mask ROM reads DRAM init and the SPL from a boot LU, so [`install_uboot`]
+/// writes the image there in full and verifies its digest. A device still
+/// carrying the factory 4 MiB boot LU cannot hold one, and finding that out at
+/// the U-Boot step would mean failing with the target already wiped — so it is
+/// checked here, before the first destructive command. Reprovisioning the device
+/// to the Flipper scheme is what fixes it.
+fn guard_ufs_boot_lu(
+    cfg: &Config,
+    ctrl: &Controller,
+    device: &StorageDevice,
+    uboot: &UbootBuild,
+    boot_lu: Option<&BootLuPlan>,
+) -> Result<()> {
+    if device.kind != StorageKind::Ufs {
+        return Ok(());
+    }
+    // In dry-run nothing is written, so an unusable boot LU is a warning; a real
+    // run refuses, the same split `guard_target` makes.
+    let refuse = |reason: String| -> Result<()> {
+        if cfg.dry_run {
+            ctrl.log(format!(
+                "[dry-run] warning: {reason} — a real run would refuse it"
+            ));
+            Ok(())
+        } else {
+            Err(reason)
+        }
+    };
+
+    let Some(plan) = boot_lu else {
+        return refuse(format!(
+            "{} is UFS but has no boot LU, so the mask ROM would have nothing to \
+             boot; reprovision the device first",
+            device.path
+        ));
+    };
+    let letter = ufs::boot_lu_name(plan.id);
+    let needed = LOADER_START + uboot.size_bytes;
+    match ufs::block_size_bytes(&plan.node) {
+        // A manifest that publishes no size leaves nothing to compare against.
+        _ if uboot.size_bytes == 0 => ctrl.log(format!(
+            "warning: the u-boot manifest gives no image size, so {} cannot be \
+             checked for room up front",
+            plan.node
+        )),
+        None => ctrl.log(format!(
+            "warning: cannot read the size of {}; it will not be checked for room",
+            plan.node
+        )),
+        Some(size) if size < needed => {
+            return refuse(format!(
+                "UFS boot LU {letter} ({}) is only {}, too small for a {} u-boot image at \
+                 offset {}; reprovision the device to the Flipper scheme first",
+                plan.node,
+                human_bytes(size),
+                human_bytes(uboot.size_bytes),
+                human_bytes(LOADER_START)
+            ))
+        }
+        Some(size) => ctrl.log(format!(
+            "UFS boot LU {letter} ({}): {} for a {} u-boot image",
+            plan.node,
+            human_bytes(size),
+            human_bytes(uboot.size_bytes)
+        )),
     }
     Ok(())
 }
@@ -719,6 +811,7 @@ fn install_uboot(
     ctrl: &Controller,
     device: &StorageDevice,
     build: &UbootBuild,
+    boot_lu: Option<&BootLuPlan>,
     policy: OnMismatch,
 ) -> Result<()> {
     // Write the image directly onto the loader partition (p1) from its start.
@@ -734,40 +827,167 @@ fn install_uboot(
         &build.source,
         &loader,
         0,
-        false,
         build.sha256.as_deref(),
         policy,
     )?;
 
-    // On UFS the RK3576 mask ROM fetches DRAM init + SPL from Boot LU A, and
-    // ignores the copy on the main LU's loader partition. Duplicate the leading
-    // part of the image onto Boot LU A at the same 32 KiB offset. The boot LU is
-    // small (typically 4 MiB) while the image is ~10 MiB, so we fill it and
-    // discard the tail: only the DRAM init + SPL at the front is needed there.
-    if device.kind == StorageKind::Ufs {
-        match crate::core::storage::find_ufs_boot_lu_a(&device.path) {
-            Some(boot_lu) => {
-                ctrl.log(format!("UFS target: mirroring u-boot to Boot LU A ({boot_lu})"));
-                wait_for_device(cfg, ctrl, &boot_lu)?;
-                write_source_to_offset(
-                    cfg,
-                    ctrl,
-                    &build.image_location,
-                    &build.source,
-                    &boot_lu,
-                    LOADER_START,
-                    true,
-                    build.sha256.as_deref(),
-                    policy,
-                )?;
+    // On UFS the RK3576 mask ROM fetches DRAM init + SPL from whichever boot LU
+    // `bBootLunEn` selects, and ignores the copy on the main LU's loader
+    // partition. So the image goes to the *other* boot LU of the pair, at the same
+    // 32 KiB offset, and only a verified write flips the flag over to it — an
+    // interrupted or corrupted update therefore leaves the board booting the
+    // bootloader it booted before.
+    if device.kind != StorageKind::Ufs {
+        return Ok(());
+    }
+    let Some(plan) = boot_lu else {
+        ctrl.log(format!(
+            "warning: {} is UFS but no boot LU was found — the mask ROM may fail to \
+             load the bootloader; check the device's UFS provisioning",
+            device.path
+        ));
+        return Ok(());
+    };
+
+    ctrl.log(format!(
+        "UFS target: writing u-boot to boot LU {} ({}), currently booting {}",
+        ufs::boot_lu_name(plan.id),
+        plan.node,
+        ufs::boot_lu_name(plan.active)
+    ));
+    wait_for_device(cfg, ctrl, &plan.node)?;
+    let verified = write_source_to_offset(
+        cfg,
+        ctrl,
+        &build.image_location,
+        &build.source,
+        &plan.node,
+        LOADER_START,
+        build.sha256.as_deref(),
+        policy,
+    )?;
+
+    if plan.id == plan.active {
+        // Nothing to switch: this device has only the one boot LU, so the new
+        // bootloader is live the moment it lands (see `ufs_boot_lu_plan`).
+        return Ok(());
+    }
+    if !verified {
+        // Only reachable in `stream` mode, where the fetch policy has decided a
+        // digest mismatch is a warning rather than a failure (`verify first` has
+        // already returned an error by this point). The run may go on, but the
+        // switch must not: pointing the mask ROM at an image we know is wrong is
+        // how a board stops booting at all.
+        ctrl.log(format!(
+            "warning: the u-boot image on boot LU {} does not match its digest, so \
+             boot LU {} stays active — this installation must not be booted",
+            ufs::boot_lu_name(plan.id),
+            ufs::boot_lu_name(plan.active)
+        ));
+        return Ok(());
+    }
+    activate_boot_lu(cfg, ctrl, &device.path, plan.id)
+}
+
+/// Which boot LU of a UFS device the next bootloader goes to.
+struct BootLuPlan {
+    /// Block node of the logical unit to write.
+    node: String,
+    /// Its `bBootLunID` — which one of the pair it is.
+    id: u8,
+    /// The boot LU the mask ROM reads right now; `0` when booting is disabled.
+    active: u8,
+}
+
+/// Pick the boot LU to write on a UFS target: the one the mask ROM is *not*
+/// reading, so a failed or corrupted write cannot take the board down with it.
+/// Only after the image is written and its digest checked does `bBootLunEn` move
+/// over ([`activate_boot_lu`]).
+///
+/// Falls back to the LU that is active when the device has no second one — the
+/// update is then not fail-safe, which is worth saying out loud. Returns `None`
+/// when the device has no boot LU at all, which [`guard_ufs_boot_lu`] refuses.
+fn ufs_boot_lu_plan(ctrl: &Controller, device: &StorageDevice) -> Option<BootLuPlan> {
+    if device.kind != StorageKind::Ufs {
+        return None;
+    }
+    let active = match read_boot_lun_en(&device.path) {
+        Ok(active) => active,
+        Err(e) => {
+            // Without the BSG endpoint the flag can be neither read nor moved, so
+            // fall back to the historical behaviour: write boot LU A in place and
+            // switch nothing. Reporting it as the active one is what makes
+            // `install_uboot` skip the switch.
+            ctrl.log(format!(
+                "warning: cannot read which UFS boot LU is active ({e}); writing boot \
+                 LU A in place, without the fail-safe switch"
+            ));
+            let node = storage::find_ufs_boot_lu(&device.path, ufs::BOOT_LUN_A)?;
+            return Some(BootLuPlan {
+                node,
+                id: ufs::BOOT_LUN_A,
+                active: ufs::BOOT_LUN_A,
+            });
+        }
+    };
+
+    // The spare side first, then the active one.
+    for id in [spare_boot_lu(active), active] {
+        if id == ufs::BOOT_LUN_NONE {
+            continue;
+        }
+        if let Some(node) = storage::find_ufs_boot_lu(&device.path, id) {
+            if id == active {
+                ctrl.log(format!(
+                    "warning: {} has no spare boot LU, so u-boot is replaced in place \
+                     and an interrupted write would leave the board unbootable",
+                    device.path
+                ));
             }
-            None => ctrl.log(format!(
-                "warning: {} is UFS but no Boot LU A was found — the mask ROM may \
-                 fail to load the bootloader; check the device's UFS provisioning",
-                device.path
-            )),
+            return Some(BootLuPlan { node, id, active });
         }
     }
+    None
+}
+
+/// The side of the boot pair to write, given which one the mask ROM reads. With
+/// booting disabled there is nothing to preserve, so A is as good as B.
+fn spare_boot_lu(active: u8) -> u8 {
+    if active == ufs::BOOT_LUN_A {
+        ufs::BOOT_LUN_B
+    } else {
+        ufs::BOOT_LUN_A
+    }
+}
+
+/// Read `bBootLunEn`: which boot LU the mask ROM reads.
+fn read_boot_lun_en(disk: &str) -> std::result::Result<u8, String> {
+    let bsg = ufs::Bsg::open_for_disk(disk)?;
+    Ok(bsg.read_attr(ufs::ATTR_BOOT_LUN_EN)? as u8)
+}
+
+/// Point `bBootLunEn` at the boot LU just written. The last step of a UFS
+/// bootloader update, and the only one that changes what the board boots.
+fn activate_boot_lu(cfg: &Config, ctrl: &Controller, disk: &str, id: u8) -> Result<()> {
+    if cfg.dry_run {
+        ctrl.log(format!(
+            "[dry-run] would switch the active UFS boot LU to {}",
+            ufs::boot_lu_name(id)
+        ));
+        return Ok(());
+    }
+    let bsg = ufs::Bsg::open_for_disk(disk)?;
+    bsg.write_attr(ufs::ATTR_BOOT_LUN_EN, u32::from(id))?;
+    // Read it back: this is the switch the board's next boot depends on.
+    let now = bsg.read_attr(ufs::ATTR_BOOT_LUN_EN)? as u8;
+    if now != id {
+        return Err(format!(
+            "the active UFS boot LU is still {} after asking for {}",
+            ufs::boot_lu_name(now),
+            ufs::boot_lu_name(id)
+        ));
+    }
+    ctrl.log(format!("active UFS boot LU switched to {}", ufs::boot_lu_name(id)));
     Ok(())
 }
 
@@ -1212,12 +1432,14 @@ fn open_source(location: &str, source: &Source) -> Result<Box<dyn Read + Send>> 
 }
 
 /// Stream a source (HTTP URL for [`Source::Server`], local path otherwise)
-/// directly onto `device`, starting at `offset` bytes, then flush to disk.
+/// directly onto `device`, starting at `offset` bytes, then flush to disk. A
+/// short write is an error, so the digest always covers the whole image.
 ///
-/// When `fill` is set, the source is expected to be larger than the target: we
-/// write until the device runs out of space and treat that as success, so only
-/// the leading part that fits is kept (used to seed a small UFS boot LU with the
-/// front of the full U-Boot image). Otherwise a short write is an error.
+/// Returns whether the bytes now on the device are trustworthy: true when the
+/// digest matched, or when the manifest published none to compare against, and
+/// false only for an outright mismatch (which is an error unless the fetch policy
+/// downgrades it to a warning). Callers that make a written image *live* — the
+/// UFS boot-LU switch — must not do so when this is false.
 #[allow(clippy::too_many_arguments)]
 fn write_source_to_offset(
     cfg: &Config,
@@ -1226,16 +1448,14 @@ fn write_source_to_offset(
     source: &Source,
     device: &str,
     offset: u64,
-    fill: bool,
     expect: Option<&str>,
     policy: OnMismatch,
-) -> Result<()> {
+) -> Result<bool> {
     if cfg.dry_run {
         ctrl.log(format!(
-            "[dry-run] write {location} -> {device} @ offset {offset} B{}",
-            if fill { " (fill, discarding overflow)" } else { "" }
+            "[dry-run] write {location} -> {device} @ offset {offset} B"
         ));
-        return Ok(());
+        return Ok(true);
     }
     ctrl.log(format!("writing {location} -> {device} @ offset {offset} B"));
 
@@ -1250,60 +1470,16 @@ fn write_source_to_offset(
         .map_err(|e| format!("open {device}: {e}"))?;
     file.seek(SeekFrom::Start(offset))
         .map_err(|e| format!("seek {device} to {offset}: {e}"))?;
-    let written = if fill {
-        copy_until_full(&mut reader, &mut file)
-    } else {
-        io::copy(&mut reader, &mut file)
-    }
-    .map_err(|e| format!("write {location} to {device}: {e}"))?;
+    let written = io::copy(&mut reader, &mut file)
+        .map_err(|e| format!("write {location} to {device}: {e}"))?;
     file.sync_all()
         .map_err(|e| format!("sync {device}: {e}"))?;
     ctrl.log(format!("wrote {written} bytes to {device}"));
-    // A `fill` write stops at the end of a small boot LU, so only part of the
-    // image was read and its digest cannot be checked.
-    if fill {
-        ctrl.log(format!(
-            "{device}: partial copy of the image; not verified"
-        ));
-        return Ok(());
-    }
     drop(reader);
-    apply_verdict(ctrl, "u-boot image", fetch::verify(sha, expect), policy)
-}
-
-/// Linux `errno` for "No space left on device" — what a `write(2)` past the end
-/// of a block device returns.
-const ENOSPC: i32 = 28;
-
-/// Copy `reader` into `writer` until the reader is exhausted *or* the writer
-/// runs out of space, returning the bytes written. Hitting the end of a
-/// fixed-size block device (a short write or `ENOSPC`) ends the copy cleanly
-/// rather than erroring — the caller intends to keep only the leading part.
-fn copy_until_full(reader: &mut dyn Read, writer: &mut impl io::Write) -> io::Result<u64> {
-    let mut buf = [0u8; 64 * 1024];
-    let mut total = 0u64;
-    loop {
-        let n = match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        };
-        let mut off = 0;
-        while off < n {
-            match writer.write(&buf[off..n]) {
-                Ok(0) => return Ok(total), // device full: nothing more accepted
-                Ok(w) => {
-                    off += w;
-                    total += w as u64;
-                }
-                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(ref e) if e.raw_os_error() == Some(ENOSPC) => return Ok(total),
-                Err(e) => return Err(e),
-            }
-        }
-    }
-    Ok(total)
+    let verdict = fetch::verify(sha, expect);
+    let trustworthy = !matches!(verdict, fetch::Verdict::Mismatch(_, _));
+    apply_verdict(ctrl, "u-boot image", verdict, policy)?;
+    Ok(trustworthy)
 }
 
 /// Spawn `cmd` and pump an arbitrary reader into its stdin, then wait.
@@ -1374,6 +1550,17 @@ fn render(cmd: &Command) -> String {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn the_bootloader_goes_to_the_other_boot_lu() {
+        // The whole point of the pair: never write the LU the board is booting
+        // from, so an interrupted update cannot take it down.
+        assert_eq!(spare_boot_lu(ufs::BOOT_LUN_A), ufs::BOOT_LUN_B);
+        assert_eq!(spare_boot_lu(ufs::BOOT_LUN_B), ufs::BOOT_LUN_A);
+        // Nothing is live yet on a device with booting disabled, so either side
+        // will do; A keeps a freshly provisioned device predictable.
+        assert_eq!(spare_boot_lu(ufs::BOOT_LUN_NONE), ufs::BOOT_LUN_A);
+    }
 
     #[test]
     fn progress_reader_reports_cumulative_bytes() {

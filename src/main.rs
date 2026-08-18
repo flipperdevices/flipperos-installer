@@ -266,6 +266,12 @@ fn parse_args() -> Result<Option<Args>, String> {
                     .ok_or("--kms-device requires a path argument")?;
             }
             "--debug-keys" => config.debug_keys = true,
+            "--no-ufs-check" => config.ufs_check = false,
+            "--reprovision-ufs" => config.ufs_reprovision = true,
+            "--ufs-scheme" => {
+                config.ufs_scheme =
+                    Some(iter.next().ok_or("--ufs-scheme requires a path argument")?);
+            }
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -299,6 +305,14 @@ UPDATE BUNDLES (the default source):\n\
     --keep-cache          Keep the scratch files after the run\n\
     --no-automount        Do not mount removable media read-only during discovery\n\
     --custom              Start on the custom development build flow instead\n\
+\n\
+UFS PROVISIONING (only for UFS targets):\n\
+    --no-ufs-check        Do not check the target's logical units against the\n\
+                          Flipper provisioning scheme\n\
+    --reprovision-ufs     Reprovision a mismatched target without asking first.\n\
+                          DESTRUCTIVE: everything on the device is lost\n\
+    --ufs-scheme <PATH>   Read the scheme from this TOML file instead of the\n\
+                          one compiled into the installer\n\
 \n\
 OPTIONS:\n\
     --server <URL>     Image server base URL (custom development builds)\n\
