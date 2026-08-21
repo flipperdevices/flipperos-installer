@@ -16,6 +16,7 @@
 
 use serde::Deserialize;
 use std::fs;
+use std::path::PathBuf;
 
 use crate::core::controller::Config;
 use crate::core::model::human_bytes;
@@ -622,7 +623,8 @@ pub struct Mismatch {
 /// Everything a probe learned about one device.
 #[derive(Clone, Debug)]
 pub struct Status {
-    pub device: String,
+    /// The device this describes, and how to reach it.
+    pub target: Target,
     /// Where the scheme came from.
     pub scheme_origin: String,
     /// The device's current logical units.
@@ -665,6 +667,14 @@ impl Status {
         self.critical().any(|m| m.descriptor_write)
     }
 
+    /// Whether the device has no logical units at all — factory-blank.
+    ///
+    /// Such a device presents no block device, so it cannot be an install target
+    /// until it is provisioned, and provisioning it destroys nothing.
+    pub fn is_blank(&self) -> bool {
+        !self.current.iter().any(|lu| lu.enabled())
+    }
+
     /// A logical unit's usable size in bytes.
     fn lu_size(&self, lu: &LuConfig) -> u64 {
         lu.size_bytes(&self.geometry)
@@ -699,13 +709,17 @@ impl Status {
     pub fn report(&self) -> Vec<String> {
         let mut out = vec![format!(
             "UFS {} — scheme: {}",
-            self.device, self.scheme_origin
+            self.target.label(),
+            self.scheme_origin
         )];
         out.push(format!(
             "allocation unit {}, {} units total",
             human_bytes(self.geometry.alloc_unit_bytes()),
             self.geometry.total_alloc_units()
         ));
+        if self.is_blank() {
+            out.push("no logical units configured".to_string());
+        }
         for (i, lu) in self.current.iter().enumerate() {
             if !lu.enabled() {
                 continue;
@@ -756,19 +770,26 @@ impl Status {
     ///
     /// The consequence comes first and the detail after: only the first handful
     /// of lines fit the 256x144 panel without scrolling, and what the operator
-    /// must not miss is that the device gets erased. The full technical report
+    /// must not miss is what happens to the device. The full technical report
     /// stays one keypress away in the details popup.
     pub fn prompt_lines(&self) -> Vec<String> {
         let mut out = Vec::new();
-        if self.needs_descriptor_write() {
+        if self.is_blank() {
+            // Nothing to lose: a device with no logical units holds no data, and
+            // claiming otherwise would be crying wolf.
+            out.push(format!(
+                "{} has no logical units yet. Provisioning creates them:",
+                self.target.display_name()
+            ));
+        } else if self.needs_descriptor_write() {
             out.push(format!(
                 "ALL DATA ON {} WILL BE PERMANENTLY LOST.",
-                self.device
+                self.target.display_name()
             ));
         } else {
             out.push(format!(
                 "{} only needs its active boot LU switched. No data is erased.",
-                self.device
+                self.target.display_name()
             ));
         }
         out.push(String::new());
@@ -779,6 +800,12 @@ impl Status {
             .iter()
             .zip(self.current.iter())
             .enumerate()
+            // A logical unit that is absent and stays absent is not a change. The
+            // two can still differ byte for byte — a factory descriptor leaves
+            // `bLogicalBlockSize` set in blocks it disables — and listing
+            // "absent → absent" would be noise in the one prompt that must read
+            // clearly.
+            .filter(|(_, (want, have))| want.enabled() || have.enabled())
             .filter(|(_, (want, have))| want != have)
             .map(|(i, (want, have))| {
                 format!(
@@ -1039,9 +1066,127 @@ fn diff<T: PartialEq + std::fmt::Display>(
 
 // --- probing and applying ---------------------------------------------------
 
+/// What provisioning acts on: a UFS host controller, plus the whole-disk node of
+/// its main logical unit when it has one.
+///
+/// Keyed on the controller rather than on a disk because a factory-blank device
+/// has no disk at all — no logical units means nothing in `/sys/block` — and that
+/// is precisely the device that needs provisioning most. Everything provisioning
+/// does goes through the BSG endpoint, which exists either way.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Target {
+    pub bsg: PathBuf,
+    pub host: u32,
+    /// Whole-disk node of the main logical unit, when the device has one.
+    pub disk: Option<String>,
+    /// How the device names itself (SCSI vendor and model), for the UI and log.
+    pub name: String,
+}
+
+impl Target {
+    /// The target behind a whole-disk UFS node.
+    pub fn for_disk(disk: &str) -> Result<Target> {
+        let host = ufs::scsi_host_number(disk)
+            .ok_or_else(|| format!("cannot find the SCSI host of {disk}"))?;
+        Ok(Target {
+            bsg: ufs::bsg_node(disk)?,
+            host,
+            disk: Some(disk.to_string()),
+            name: ufs::identity(host).unwrap_or_default(),
+        })
+    }
+
+    /// The target behind a UFS host controller, whether or not it has any logical
+    /// units yet.
+    pub fn for_endpoint(endpoint: &ufs::Endpoint) -> Target {
+        Target {
+            bsg: endpoint.bsg.clone(),
+            host: endpoint.host,
+            disk: main_lu_node(endpoint.host),
+            name: ufs::identity(endpoint.host).unwrap_or_default(),
+        }
+    }
+
+    /// The same controller, with its logical units looked up again — the block node
+    /// of a device that has just been provisioned did not exist before.
+    pub fn rediscovered(&self) -> Target {
+        Target::for_endpoint(&ufs::Endpoint {
+            bsg: self.bsg.clone(),
+            host: self.host,
+        })
+    }
+
+    /// The shortest thing that identifies this device, for prose the operator reads
+    /// on a 256x144 panel. Same as [`Self::label`] but without the endpoint, which
+    /// is noise once the model is there — the log and the details popup still carry
+    /// the full form.
+    pub fn display_name(&self) -> String {
+        match (&self.disk, self.name.is_empty()) {
+            (Some(disk), _) => disk.clone(),
+            (None, false) => self.name.clone(),
+            (None, true) => self.label(),
+        }
+    }
+
+    /// What to call this device in messages: its disk when it has one, else its own
+    /// name and endpoint — a blank device has no `/dev/sd*` to be known by.
+    pub fn label(&self) -> String {
+        if let Some(disk) = &self.disk {
+            return disk.clone();
+        }
+        let endpoint = self
+            .bsg
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| format!("host{}", self.host));
+        if self.name.is_empty() {
+            endpoint
+        } else {
+            format!("{} ({endpoint})", self.name)
+        }
+    }
+}
+
+#[cfg(test)]
+impl Target {
+    /// A target naming `disk`, built without touching sysfs.
+    pub(crate) fn for_test(disk: &str) -> Target {
+        Target {
+            bsg: PathBuf::from("/dev/bsg/ufs-bsg0"),
+            host: 0,
+            disk: Some(disk.to_string()),
+            name: "TESTDEV 0".to_string(),
+        }
+    }
+
+    /// A target for a device with no logical units, as a blank one has.
+    pub(crate) fn blank_for_test() -> Target {
+        Target {
+            bsg: PathBuf::from("/dev/bsg/ufs-bsg0"),
+            host: 0,
+            disk: None,
+            name: "BIWIN BWU2A0526B128G".to_string(),
+        }
+    }
+}
+
+/// The block node of the logical unit holding the main filesystem — LU 0 by both
+/// our scheme and Rockchip's — falling back to whichever data LU has one.
+fn main_lu_node(host: u32) -> Option<String> {
+    let dirs = ufs::data_lu_dirs(host);
+    let lu_zero = dirs.iter().find(|dir| {
+        dir.file_name()
+            .map(|n| n.to_string_lossy().ends_with(":0"))
+            .unwrap_or(false)
+    });
+    lu_zero
+        .and_then(|dir| ufs::lu_block_node(dir))
+        .or_else(|| dirs.iter().find_map(|dir| ufs::lu_block_node(dir)))
+}
+
 /// Read a UFS device's configuration and compare it against the scheme.
-pub fn probe(disk: &str, scheme: &Scheme, scheme_origin: &str) -> Result<Status> {
-    let bsg = ufs::Bsg::open_for_disk(disk)?;
+pub fn probe(target: &Target, scheme: &Scheme, scheme_origin: &str) -> Result<Status> {
+    let bsg = ufs::Bsg::open(&target.bsg)?;
     let dev = DeviceDescriptor::parse(&bsg.read_descriptor(ufs::IDN_DEVICE, 0)?)?;
     let geo = GeometryDescriptor::parse(&bsg.read_descriptor(ufs::IDN_GEOMETRY, 0)?)?;
     let current = ConfigDescriptor::new(bsg.read_descriptor(ufs::IDN_CONFIGURATION, 0)?, &dev)?;
@@ -1076,7 +1221,7 @@ pub fn probe(disk: &str, scheme: &Scheme, scheme_origin: &str) -> Result<Status>
     let mismatches = compare(&plan, &current, boot_lun_en, &extra_enabled);
 
     Ok(Status {
-        device: disk.to_string(),
+        target: target.clone(),
         scheme_origin: scheme_origin.to_string(),
         current: current.lus(),
         plan,
@@ -1090,17 +1235,17 @@ pub fn probe(disk: &str, scheme: &Scheme, scheme_origin: &str) -> Result<Status>
     })
 }
 
-/// Bring `disk` to the scheme. Destructive: rewriting the Configuration
-/// Descriptor makes the device rebuild its logical units, losing everything
-/// stored on them.
+/// Bring `target` to the scheme. Destructive on a device that already holds data:
+/// rewriting the Configuration Descriptor makes it rebuild its logical units.
 pub fn apply(
     cfg: &Config,
     ctrl: &Controller,
-    disk: &str,
+    target: &Target,
     scheme: &Scheme,
     origin: &str,
 ) -> Result<()> {
-    let status = probe(disk, scheme, origin)?;
+    let disk = target.label();
+    let status = probe(target, scheme, origin)?;
     for line in status.report() {
         ctrl.log(line);
     }
@@ -1115,12 +1260,16 @@ pub fn apply(
              device cannot be reprovisioned"
         ));
     }
-    let in_use = storage::device_in_use(disk);
-    if !in_use.is_empty() {
-        return Err(format!(
-            "{disk} is in use, refusing to reprovision: {}",
-            in_use.join("; ")
-        ));
+    // Only a device that has logical units can be in use; a blank one has nothing
+    // to hold open.
+    if let Some(node) = &target.disk {
+        let in_use = storage::device_in_use(node);
+        if !in_use.is_empty() {
+            return Err(format!(
+                "{node} is in use, refusing to reprovision: {}",
+                in_use.join("; ")
+            ));
+        }
     }
 
     ctrl.log(format!("{disk}: reprovisioning to the Flipper UFS scheme"));
@@ -1148,7 +1297,7 @@ pub fn apply(
     }
 
     {
-        let bsg = ufs::Bsg::open_for_disk(disk)?;
+        let bsg = ufs::Bsg::open(&target.bsg)?;
         if needs_write {
             // Any descriptor that still holds LU 8..31 goes first, marked "more
             // to come", so the device only reconfigures once index 0 arrives.
@@ -1193,11 +1342,13 @@ pub fn apply(
     // provisioning — and rescan, so no reboot is needed.
     ctrl.log("applying the new configuration (fDeviceInit) and rescanning");
     {
-        let bsg = ufs::Bsg::open_for_disk(disk)?;
-        ufs::apply_configuration(disk, &bsg)?;
+        let bsg = ufs::Bsg::open(&target.bsg)?;
+        ufs::apply_configuration(target.host, target.disk.as_deref(), &bsg)?;
     }
 
-    let after = probe(disk, scheme, origin)?;
+    // Re-resolve the target before verifying: a device that had no logical units
+    // has one now, behind a block node that did not exist when this started.
+    let after = probe(&target.rediscovered(), scheme, origin)?;
     for line in after.report() {
         ctrl.log(line);
     }
@@ -1247,7 +1398,7 @@ mod tests {
         let built = plan(&scheme, &dev, &geo).expect("plan");
         let mismatches = compare(&built, &current, boot_lun_en, &[]);
         Status {
-            device: "/dev/sda".to_string(),
+            target: Target::for_test("/dev/sda"),
             scheme_origin: "built-in default".to_string(),
             current: current.lus(),
             plan: built,
@@ -1259,6 +1410,113 @@ mod tests {
             geometry: geo,
             mismatches,
         }
+    }
+
+    /// A `Status` for a factory-blank device: real geometry, but a Configuration
+    /// Descriptor with every logical unit disabled, which is what one ships as.
+    fn blank_status() -> Status {
+        let dev = DeviceDescriptor::parse(&unhex(FORESEE64_DEVICE)).expect("device descriptor");
+        let geo = GeometryDescriptor::parse(&unhex(FORESEE64_GEOMETRY)).expect("geometry");
+        let empty = ConfigDescriptor::empty(&dev);
+        let built = plan(&Scheme::embedded_default(), &dev, &geo).expect("plan");
+        let mismatches = compare(&built, &empty, ufs::BOOT_LUN_NONE, &[]);
+        Status {
+            target: Target::blank_for_test(),
+            scheme_origin: "built-in default".to_string(),
+            current: empty.lus(),
+            plan: built,
+            boot_enable: empty.boot_enable(),
+            boot_lun_en: ufs::BOOT_LUN_NONE,
+            config_locked: false,
+            power_on_wp: false,
+            permanent_wp: false,
+            geometry: geo,
+            mismatches,
+        }
+    }
+
+    #[test]
+    fn a_target_names_itself_by_disk_or_by_device() {
+        // With a block node the disk is the name everyone already knows it by.
+        assert_eq!(Target::for_test("/dev/sda").label(), "/dev/sda");
+        // Without one — a blank device — there is no `/dev/sd*` to use, so the
+        // device's own name and its endpoint stand in.
+        let blank = Target::blank_for_test();
+        assert_eq!(blank.label(), "BIWIN BWU2A0526B128G (ufs-bsg0)");
+        assert!(blank.disk.is_none());
+        // Prose on the device's screen drops the endpoint: the model identifies it,
+        // and a 256x144 panel shows six lines.
+        assert_eq!(blank.display_name(), "BIWIN BWU2A0526B128G");
+        assert_eq!(Target::for_test("/dev/sda").display_name(), "/dev/sda");
+    }
+
+    #[test]
+    fn a_blank_device_is_recognised_and_reported_as_such() {
+        let st = blank_status();
+        assert!(st.is_blank());
+        assert!(
+            !st.is_provisioned(),
+            "a blank device is not usable as a target"
+        );
+        let report = st.report().join("\n");
+        assert!(report.contains("no logical units configured"), "{report}");
+        // The geometry is still readable, which is what makes planning possible.
+        assert!(report.contains("allocation unit 4.0 MiB"), "{report}");
+
+        // And a device that does have logical units is not called blank.
+        let populated = status(
+            BIWIN256_DEVICE,
+            BIWIN256_GEOMETRY,
+            BIWIN256_CONFIG,
+            ufs::BOOT_LUN_A,
+        );
+        assert!(!populated.is_blank());
+        assert!(!populated.report().join("\n").contains("no logical units"));
+    }
+
+    #[test]
+    fn the_prompt_does_not_claim_data_loss_on_a_blank_device() {
+        // There is nothing on a device with no logical units, and saying otherwise
+        // would be crying wolf on the one prompt that must be believed.
+        let lines = blank_status().prompt_lines();
+        assert!(
+            lines[0].contains("has no logical units yet"),
+            "{:?}",
+            lines[0]
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("LOST")),
+            "nothing to lose: {lines:?}"
+        );
+        // It still shows what it is about to create.
+        assert!(lines.iter().any(|l| l.contains("16.0 MiB")), "{lines:?}");
+        // But not the logical units it leaves absent: a factory descriptor keeps
+        // `bLogicalBlockSize` set in the blocks it disables, so those compare
+        // unequal without being a change worth showing.
+        assert!(
+            !lines.iter().any(|l| l.contains("absent → absent")),
+            "{lines:?}"
+        );
+        for lu in 4..8 {
+            assert!(
+                !lines.iter().any(|l| l.starts_with(&format!("LU {lu}:"))),
+                "LU {lu} stays absent: {lines:?}"
+            );
+        }
+
+        // A populated device keeps the warning it needs.
+        let lines = status(
+            BIWIN256_DEVICE,
+            BIWIN256_GEOMETRY,
+            BIWIN256_CONFIG,
+            ufs::BOOT_LUN_A,
+        )
+        .prompt_lines();
+        assert!(
+            lines[0].contains("WILL BE PERMANENTLY LOST"),
+            "{:?}",
+            lines[0]
+        );
     }
 
     #[test]

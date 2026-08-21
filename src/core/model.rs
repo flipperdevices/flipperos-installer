@@ -602,8 +602,12 @@ pub struct Prompt {
 /// What confirming a [`Prompt`] sets in motion.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PromptKind {
-    /// Rewrite a UFS target's logical units to the Flipper scheme.
-    ReprovisionUfs { device: String },
+    /// Rewrite a UFS target's logical units to the Flipper scheme. Carries the
+    /// target it described, so confirming cannot act on a different device than
+    /// the operator was shown.
+    ReprovisionUfs {
+        target: crate::core::provision::Target,
+    },
 }
 
 /// The full application state. A clone of this is the "snapshot" broadcast to

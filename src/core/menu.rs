@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use crate::core::model::*;
-use crate::core::{bundle, Controller};
+use crate::core::{bundle, provision, Controller};
 
 /// Channels shown first, in this order, when the bucket lists them. Anything
 /// else the bucket publishes follows, alphabetically.
@@ -57,7 +57,7 @@ pub enum Action {
     ToggleAllProfiles(bool),
     StartInstall,
     /// Offer to rewrite a UFS target's logical units to the Flipper scheme.
-    ReprovisionUfs(String),
+    ReprovisionUfs(provision::Target),
     /// Placeholder rows: `(loading…)`, `(none found)`, `(failed: …)`.
     Inert,
 }
@@ -678,8 +678,13 @@ fn device(state: &AppState) -> Level {
     let selected = state.selection.target_device.as_deref();
     // The provisioning probe result, but only while it still describes the
     // selected target: it is replaced asynchronously when the target changes.
-    let ufs = match (&state.ufs, selected) {
-        (Some(status), Some(path)) if status.device == path => Some(status),
+    // A blank device has no block node to be selected, so its status is always
+    // relevant — offering it is the only way out of the chicken-and-egg where an
+    // unprovisioned device presents no target to provision. Otherwise the status
+    // is shown for the selected device only.
+    let ufs = match &state.ufs {
+        Some(status) if status.target.disk.is_none() => Some(status),
+        Some(status) if status.target.disk.as_deref() == selected => Some(status),
         _ => None,
     };
     let mut items: Vec<MenuItem> = state
@@ -707,17 +712,20 @@ fn device(state: &AppState) -> Level {
         })
         .collect();
 
-    // A UFS target that does not match the scheme can be reprovisioned from
+    // A UFS target that does not match the scheme can be (re)provisioned from
     // here, which is also how the operator gets the offer back after dismissing
-    // it. The row stays visible when the layout is fine, showing that it is.
+    // it. The row stays visible when the layout is fine, showing that it is. For a
+    // blank device this is the only row it has, so it carries the device's name.
     if let Some(status) = ufs {
-        let mut item = MenuItem::plain(
-            "Reprovision UFS\u{2026}",
-            Action::ReprovisionUfs(status.device.clone()),
-        )
-        .with_detail(status.short_label());
+        let text = if status.is_blank() {
+            format!("Provision UFS\u{2026} {}", status.target.name)
+        } else {
+            "Reprovision UFS\u{2026}".to_string()
+        };
+        let mut item = MenuItem::plain(text, Action::ReprovisionUfs(status.target.clone()))
+            .with_detail(status.short_label());
         item.dim = status.is_provisioned();
-        item.details = Some(DetailsTarget::Ufs(status.device.clone()));
+        item.details = Some(DetailsTarget::Ufs(status.target.label()));
         items.push(item);
     }
 
@@ -894,10 +902,10 @@ pub fn activate(ctrl: &Arc<Controller>, level: &Level, index: usize) -> Move {
             ctrl.start_install();
             Move::ToRoot
         }
-        Action::ReprovisionUfs(path) => {
+        Action::ReprovisionUfs(target) => {
             // Raises the confirmation prompt rather than doing anything: the
-            // operator has to agree to losing everything on the device.
-            ctrl.request_reprovision(path);
+            // operator has to agree to what happens to the device.
+            ctrl.request_reprovision(target.clone());
             Move::Stay
         }
     }
@@ -988,9 +996,9 @@ pub fn details_text(state: &AppState, target: &DetailsTarget) -> (String, String
             };
             ("Bundle details".to_string(), text)
         }
-        DetailsTarget::Ufs(path) => {
+        DetailsTarget::Ufs(label) => {
             let text = match &state.ufs {
-                Some(status) if status.device == *path => status.report().join("\n"),
+                Some(status) if status.target.label() == *label => status.report().join("\n"),
                 // Either the probe has not finished or the target moved on.
                 _ => "(not probed)".to_string(),
             };
@@ -1352,7 +1360,8 @@ mod tests {
 
         // Once the probe lands, the selected UFS row gets a details popup and the
         // level gains the reprovisioning row, labelled with the verdict.
-        s.ufs = Some(unprovisioned_status("/dev/sda"));
+        let target = provision::Target::for_test("/dev/sda");
+        s.ufs = Some(unprovisioned_status(target.clone()));
         let level = build(&MenuKey::Device, &s);
         assert_eq!(level.items.len(), 2);
         assert_eq!(
@@ -1360,7 +1369,7 @@ mod tests {
             Some(DetailsTarget::Ufs("/dev/sda".into()))
         );
         let row = &level.items[1];
-        assert_eq!(row.action, Action::ReprovisionUfs("/dev/sda".into()));
+        assert_eq!(row.action, Action::ReprovisionUfs(target.clone()));
         assert_eq!(row.detail, "unprovisioned");
         assert!(!row.dim, "a device needing work must not look inert");
         assert!(level.can_details());
@@ -1371,7 +1380,7 @@ mod tests {
 
         // A device that is already right keeps the row, dimmed, so the operator
         // can still see the verdict and open the report.
-        let mut ok = unprovisioned_status("/dev/sda");
+        let mut ok = unprovisioned_status(target);
         ok.mismatches.clear();
         s.ufs = Some(ok);
         let level = build(&MenuKey::Device, &s);
@@ -1379,9 +1388,37 @@ mod tests {
         assert!(level.items[1].dim);
     }
 
+    #[test]
+    fn a_blank_ufs_device_is_offered_with_no_targets_at_all() {
+        // The chicken-and-egg this exists to break: a factory-blank UFS device has
+        // no logical units, so no block device, so nothing in the target list — and
+        // without a row to activate there would be no way to provision it.
+        let mut s = state();
+        s.devices.clear();
+        s.selection.target_device = None;
+        s.ufs = Some(unprovisioned_status(provision::Target::blank_for_test()));
+
+        let level = build(&MenuKey::Device, &s);
+        assert_eq!(level.items.len(), 1, "{:?}", level.items);
+        let row = &level.items[0];
+        assert!(
+            row.text.starts_with("Provision UFS"),
+            "a device with no logical units is provisioned, not reprovisioned: {:?}",
+            row.text
+        );
+        // Named, so the operator can tell which device they are about to set up.
+        assert!(row.text.contains("BIWIN BWU2A0526B128G"), "{:?}", row.text);
+        assert_eq!(row.detail, "unprovisioned");
+        assert!(!row.dim);
+        assert!(matches!(row.action, Action::ReprovisionUfs(_)));
+        // And no "(no targets found)" placeholder, which is what the operator used
+        // to be left staring at.
+        assert!(!row.text.contains("no targets"));
+    }
+
     /// A UFS probe result standing in for a device that needs reprovisioning,
     /// built without touching hardware.
-    fn unprovisioned_status(device: &str) -> crate::core::provision::Status {
+    fn unprovisioned_status(target: provision::Target) -> provision::Status {
         use crate::core::provision::{Mismatch, Plan};
         use crate::core::ufs::{ConfigDescriptor, DeviceDescriptor, GeometryDescriptor};
 
@@ -1399,8 +1436,8 @@ mod tests {
         geometry_desc[0x11] = 0x01; // one segment per allocation unit
         let geometry = GeometryDescriptor::parse(&geometry_desc).expect("geometry descriptor");
 
-        crate::core::provision::Status {
-            device: device.to_string(),
+        provision::Status {
+            target,
             scheme_origin: "built-in default".to_string(),
             current: ConfigDescriptor::empty(&dev).lus(),
             plan: Plan {

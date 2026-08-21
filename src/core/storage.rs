@@ -11,6 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::core::model::{StorageDevice, StorageKind};
+use crate::core::ufs;
 
 const SYS_BLOCK: &str = "/sys/block";
 /// Linux reports sizes in 512-byte sectors regardless of physical block size.
@@ -160,7 +161,7 @@ pub fn find_ufs_boot_lu(disk: &str, boot_lun_id: u8) -> Option<String> {
         }
         // Resolve this LU's block node; skip it if it *is* the target (a data LU
         // that also happens to be flagged bootable) — that's not a separate area.
-        if let Some(node) = lu_block_node(&lu) {
+        if let Some(node) = ufs::lu_block_node(&lu) {
             if node != disk {
                 return Some(node);
             }
@@ -178,12 +179,6 @@ fn read_boot_lun_id(lu_dir: &Path) -> Option<u8> {
         Some(hex) => u8::from_str_radix(hex, 16).ok(),
         None => raw.parse().ok(),
     }
-}
-
-/// The `/dev/...` node for a UFS LU given its sysfs SCSI-device directory.
-fn lu_block_node(lu_dir: &Path) -> Option<String> {
-    let entry = fs::read_dir(lu_dir.join("block")).ok()?.flatten().next()?;
-    Some(format!("/dev/{}", entry.file_name().to_string_lossy()))
 }
 
 /// Report the reasons the whole-disk `disk` (or any of its partitions) is

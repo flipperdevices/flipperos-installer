@@ -272,6 +272,32 @@ lost. Differences that do not change what the device *is* (the WriteBooster size
 data reliability, provisioning type) are logged and tolerated. The full report is
 on the target-device level's details popup.
 
+A **factory-blank** device is the case that has to be handled without a target at
+all. It has no logical units, so it presents no block device: nothing in
+`/sys/block`, nothing in the target list, and so — if provisioning were keyed on a
+disk — nothing to select in order to provision it. Provisioning is therefore keyed
+on the UFS *host controller*, found from the SCSI host (`proc_name` is `ufshcd`)
+with its `/dev/bsg/ufs-bsg<host>` endpoint, which exists from `ufshcd_init` onwards
+regardless of logical units. Such a device still identifies itself — the SCSI
+vendor and model of its well-known UFS DEVICE logical unit — so it appears as
+`Provision UFS… <vendor> <model>` and is offered as soon as discovery finds it.
+Offering it unprompted is safe precisely because it is blank, and the prompt says
+so rather than claiming data loss:
+
+```
+Provision UFS?
+  BIWIN BWU2A0526B128G has no logical units yet. Provisioning creates them:
+
+  Logical units, now and wanted:
+  LU 0: absent → 118.7 GiB
+  LU 1: absent → 16.0 MiB boot A
+  LU 2: absent → 16.0 MiB boot B
+  LU 3: absent → 128.0 MiB
+```
+
+Once it is provisioned, LU 0 shows up as an ordinary `/dev/sd*`, is selected
+automatically, and the install proceeds as it would on any other target.
+
 Provisioning goes through `/dev/bsg/ufs-bsg<host>` (needs `CONFIG_SCSI_UFS_BSG`) and
 takes four steps: write the Configuration Descriptor, set `bBootLunEn`, set
 **`fDeviceInit`** so the device rebuilds its logical units, and rescan the SCSI host

@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::core::menu::LoadRequest;
 use crate::core::model::*;
-use crate::core::{board, bundle, catalog, install, provision, removable};
+use crate::core::{board, bundle, catalog, install, provision, removable, ufs};
 
 /// Runtime configuration for the installer.
 #[derive(Clone, Debug)]
@@ -294,6 +294,36 @@ impl Controller {
         // insert an SD card should not have to answer for the one soldered on.
         if let Some(path) = self.snapshot().selection.target_device {
             self.check_ufs_provisioning(&path, Offer::ReportOnly);
+        }
+        self.discover_blank_ufs();
+    }
+
+    /// Look for a UFS controller whose device has no logical units at all.
+    ///
+    /// Such a device presents no block device, so [`storage::enumerate`] cannot see
+    /// it and none of the target-selection machinery can reach it — it would be a
+    /// dead end: unprovisioned, so no target; no target, so nothing to provision.
+    /// The controller itself is always there, so it is discovered from the SCSI
+    /// host instead, and offered straight away. Offering it unprompted is safe
+    /// precisely because it is blank: there is no data to lose.
+    fn discover_blank_ufs(self: &Arc<Self>) {
+        if !self.config.ufs_check {
+            return;
+        }
+        for endpoint in ufs::endpoints() {
+            let target = provision::Target::for_endpoint(&endpoint);
+            if target.disk.is_some() {
+                // It has logical units; whichever one is the target was handled
+                // above, and offering to rewrite an unselected device is not ours
+                // to do.
+                continue;
+            }
+            self.log(format!(
+                "{} has no logical units — it must be provisioned before it can hold an \
+                 installation",
+                target.label()
+            ));
+            self.check_ufs_target(target, Offer::Prompt);
         }
     }
 
@@ -773,8 +803,8 @@ impl Controller {
 
     // --- UFS provisioning -------------------------------------------------
 
-    /// Probe a UFS target against the Flipper provisioning scheme, on a worker
-    /// thread since it talks to the device. Non-UFS targets are left alone.
+    /// Probe a UFS block device against the Flipper provisioning scheme, on a
+    /// worker thread since it talks to the device. Non-UFS targets are left alone.
     ///
     /// `offer` decides whether a layout that does not match raises the
     /// reprovisioning prompt or is only reported. `--reprovision-ufs` skips the
@@ -791,18 +821,32 @@ impl Controller {
         if !is_ufs {
             return;
         }
+        let target = match provision::Target::for_disk(path) {
+            Ok(target) => target,
+            Err(e) => {
+                self.log(probe_failure(path, &e));
+                return;
+            }
+        };
+        self.check_ufs_target(target, offer);
+    }
+
+    /// Probe a UFS controller, whatever logical units it does or does not have.
+    pub fn check_ufs_target(self: &Arc<Self>, target: provision::Target, offer: Offer) {
+        if !self.config.ufs_check {
+            return;
+        }
         let this = Arc::clone(self);
-        let path = path.to_string();
-        std::thread::spawn(move || this.probe_ufs(&path, offer));
+        std::thread::spawn(move || this.probe_ufs(&target, offer));
     }
 
     /// Read the target's provisioning and publish it. Runs on a worker thread.
-    fn probe_ufs(self: &Arc<Self>, path: &str, offer: Offer) {
+    fn probe_ufs(self: &Arc<Self>, target: &provision::Target, offer: Offer) {
         let (scheme, origin) = provision::Scheme::resolve(&self.config);
-        let status = match provision::probe(path, &scheme, &origin) {
+        let status = match provision::probe(target, &scheme, &origin) {
             Ok(status) => status,
             Err(e) => {
-                self.log(probe_failure(path, &e));
+                self.log(probe_failure(&target.label(), &e));
                 return;
             }
         };
@@ -810,15 +854,20 @@ impl Controller {
             self.log(line);
         }
         let provisioned = status.is_provisioned();
-        let device = status.device.clone();
+        let device = status.target.label();
         let prompt = match (provisioned, offer) {
             (false, Offer::Prompt) => Some(reprovision_prompt(&status)),
             _ => None,
         };
+        let disk = target.disk.clone();
         self.update(|s| {
-            // Only publish it if the operator has not moved on to another target.
-            if s.selection.target_device.as_deref() != Some(path) {
-                return;
+            // A device with logical units is only published while it is still the
+            // selected target; a blank one has no block node to be selected, and is
+            // the only way the operator can reach it at all.
+            if let Some(disk) = &disk {
+                if s.selection.target_device.as_deref() != Some(disk.as_str()) {
+                    return;
+                }
             }
             s.ufs = Some(status);
             if prompt.is_some() {
@@ -833,7 +882,7 @@ impl Controller {
                 "{device}: --reprovision-ufs given, reprovisioning without asking"
             ));
             self.dismiss_prompt();
-            self.start_reprovision(&device);
+            self.start_reprovision(target.clone());
         } else if offer == Offer::ReportOnly {
             // Say where the offer lives, since it is not being made here.
             self.log(format!(
@@ -843,21 +892,21 @@ impl Controller {
         }
     }
 
-    /// Raise the reprovisioning prompt again for `path`, e.g. after it was
+    /// Raise the reprovisioning prompt again for `target`, e.g. after it was
     /// dismissed. Re-probes first, so it never offers to fix something already
     /// fixed.
-    pub fn request_reprovision(self: &Arc<Self>, path: &str) {
+    pub fn request_reprovision(self: &Arc<Self>, target: provision::Target) {
         let this = Arc::clone(self);
-        let path = path.to_string();
         std::thread::spawn(move || {
+            let label = target.label();
             let (scheme, origin) = provision::Scheme::resolve(&this.config);
-            match provision::probe(&path, &scheme, &origin) {
-                Err(e) => this.log(probe_failure(&path, &e)),
+            match provision::probe(&target, &scheme, &origin) {
+                Err(e) => this.log(probe_failure(&label, &e)),
                 Ok(status) if status.is_provisioned() => {
                     for line in status.report() {
                         this.log(line);
                     }
-                    this.log(format!("{path}: already matches the Flipper scheme"));
+                    this.log(format!("{label}: already matches the Flipper scheme"));
                     this.update(|s| s.ufs = Some(status));
                 }
                 Ok(status) => {
@@ -882,7 +931,7 @@ impl Controller {
             return;
         };
         match prompt.kind {
-            PromptKind::ReprovisionUfs { device } => self.start_reprovision(&device),
+            PromptKind::ReprovisionUfs { target } => self.start_reprovision(target),
         }
     }
 
@@ -901,24 +950,25 @@ impl Controller {
         taken
     }
 
-    /// Rewrite a UFS target's logical units on a worker thread. Destructive, so
-    /// it only ever runs from a confirmed prompt or `--reprovision-ufs`.
-    fn start_reprovision(self: &Arc<Self>, device: &str) {
+    /// Rewrite a UFS target's logical units on a worker thread. Destructive on a
+    /// device that holds data, so it only ever runs from a confirmed prompt or
+    /// `--reprovision-ufs`.
+    fn start_reprovision(self: &Arc<Self>, target: provision::Target) {
         if self.snapshot().phase.is_busy() {
             self.log("cannot reprovision while another operation is running");
             return;
         }
         let this = Arc::clone(self);
-        let device = device.to_string();
         std::thread::spawn(move || {
             this.set_phase(Phase::Provisioning);
             let (scheme, origin) = provision::Scheme::resolve(&this.config);
-            let result = provision::apply(&this.config, &this, &device, &scheme, &origin);
+            let result = provision::apply(&this.config, &this, &target, &scheme, &origin);
             match result {
                 Ok(()) => {
-                    // The logical units may have changed size, or been renamed by
-                    // the rescan, so the device list has to be rebuilt.
-                    this.rediscover_storage(&device);
+                    // The logical units may have changed size, been renamed by the
+                    // rescan, or — on a device that had none — appeared for the
+                    // first time, so the device list has to be rebuilt.
+                    this.rediscover_storage(&target);
                     this.set_phase(Phase::Ready);
                 }
                 Err(e) => {
@@ -929,15 +979,20 @@ impl Controller {
         });
     }
 
-    /// Re-enumerate storage after a device was reprovisioned, keeping `preferred`
-    /// selected when it is still there and falling back to the same rule
-    /// [`Self::discover`] uses when it is not.
-    fn rediscover_storage(self: &Arc<Self>, preferred: &str) {
+    /// Re-enumerate storage after a device was reprovisioned, keeping the previous
+    /// selection when it is still there and falling back to the same rule
+    /// [`Self::discover`] uses when it is not — which is what picks up the brand
+    /// new main logical unit of a device that had none.
+    fn rediscover_storage(self: &Arc<Self>, target: &provision::Target) {
         let devices = storage_list();
         for d in &devices {
             self.log(format!("  found {}", d.summary()));
         }
-        let still_there = devices.iter().any(|d| d.path == preferred);
+        let preferred = self.snapshot().selection.target_device;
+        let still_there = preferred
+            .as_deref()
+            .map(|p| devices.iter().any(|d| d.path == p))
+            .unwrap_or(false);
         self.update(|s| {
             s.devices = devices;
             if !still_there {
@@ -949,10 +1004,12 @@ impl Controller {
             }
         });
         if let Some(path) = self.snapshot().selection.target_device {
-            // Straight after a reprovision, so report the outcome rather than
-            // offering to do it again.
-            self.probe_ufs(&path, Offer::ReportOnly);
+            self.log(format!("target device: {path}"));
         }
+        // Straight after a reprovision, so report the outcome rather than offering
+        // to do it again. Re-resolve first: the device may have gained the logical
+        // unit this target did not have.
+        self.probe_ufs(&target.rediscovered(), Offer::ReportOnly);
     }
 
     /// Pick a U-Boot build by hand, which is only meaningful for the custom flow,
@@ -1057,9 +1114,15 @@ impl Controller {
 fn reprovision_prompt(status: &provision::Status) -> Prompt {
     Prompt {
         kind: PromptKind::ReprovisionUfs {
-            device: status.device.clone(),
+            target: status.target.clone(),
         },
-        title: "Reprovision UFS?".to_string(),
+        // A device with no logical units is being set up, not rewritten, and the
+        // title should not imply there is something there to lose.
+        title: if status.is_blank() {
+            "Provision UFS?".to_string()
+        } else {
+            "Reprovision UFS?".to_string()
+        },
         lines: status.prompt_lines(),
         // Both captions have to fit a 48 px soft-button slot on the device's
         // screen, which "Reprovision" overflows. The title and the body say what
@@ -1119,7 +1182,7 @@ mod tests {
         ctrl.update(|s| {
             s.prompt = Some(Prompt {
                 kind: PromptKind::ReprovisionUfs {
-                    device: "/dev/sda".to_string(),
+                    target: provision::Target::for_test("/dev/sda"),
                 },
                 title: "Reprovision UFS?".to_string(),
                 lines: vec!["ALL DATA WILL BE LOST.".to_string()],

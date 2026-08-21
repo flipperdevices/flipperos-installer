@@ -277,6 +277,22 @@ fn main() {
     ui.set_screen(3);
     shoot(&window, "10-prompt-reprovision");
 
+    // The same prompt for a factory-blank device, which has nothing to lose and so
+    // must not be worded as though it had. Text as `prompt_lines` produces it on a
+    // blank BIWIN 128 GB part.
+    ui.set_prompt_title("Provision UFS?".into());
+    let blank = "BIWIN BWU2A0526B128G has no logical units yet. \
+                 Provisioning creates them:\n\
+                 \n\
+                 Logical units, now and wanted:\n\
+                 LU 0: absent \u{2192} 118.7 GiB\n\
+                 LU 1: absent \u{2192} 16.0 MiB boot A\n\
+                 LU 2: absent \u{2192} 16.0 MiB boot B\n\
+                 LU 3: absent \u{2192} 128.0 MiB";
+    ui.set_prompt_model(wrapped(blank));
+    ui.set_prompt_scroll(0);
+    shoot(&window, "11-prompt-provision-blank");
+
     println!("wrote PNGs to target/screenshots/");
 }
 

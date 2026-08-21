@@ -511,6 +511,81 @@ pub fn bsg_node(disk: &str) -> Result<PathBuf> {
     }
 }
 
+/// One UFS host controller: the SCSI host it registered and the BSG endpoint that
+/// talks to the device behind it.
+///
+/// Found without reference to any block device, which is the point: a
+/// factory-blank device presents no logical units at all — only its well-known
+/// ones — so a controller is the only handle provisioning can start from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Endpoint {
+    pub bsg: PathBuf,
+    pub host: u32,
+}
+
+/// Every UFS host controller on the system.
+///
+/// SCSI hosts advertise their driver in `proc_name`, and the UFS ones each carry a
+/// `ufs-bsg<host>` device (created by `ufs_bsg_probe` during `ufshcd_init`, before
+/// `scsi_scan_host` — hence before any logical unit exists).
+pub fn endpoints() -> Vec<Endpoint> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir("/sys/class/scsi_host") else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(host) = name.strip_prefix("host").and_then(|n| n.parse().ok()) else {
+            continue;
+        };
+        let driver = fs::read_to_string(entry.path().join("proc_name"))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        if driver != UFS_DRIVER {
+            continue;
+        }
+        let bsg = PathBuf::from(format!("/dev/bsg/ufs-bsg{host}"));
+        if bsg.exists() {
+            out.push(Endpoint { bsg, host });
+        }
+    }
+    out.sort_by_key(|e| e.host);
+    out
+}
+
+/// `proc_name` of the UFS host controller driver.
+const UFS_DRIVER: &str = "ufshcd";
+
+/// How the device on `host` names itself: the SCSI vendor and model of its
+/// well-known UFS DEVICE logical unit.
+///
+/// Readable on a blank device, which has nothing else to identify it by — the
+/// descriptors carry no model string, only string-descriptor indices.
+pub fn identity(host: u32) -> Option<String> {
+    for target in scsi_target_dirs(host) {
+        let Ok(entries) = fs::read_dir(&target) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let lun = lun_of(&entry.file_name().to_string_lossy());
+            if !lun.map(is_well_known_lun).unwrap_or(false) {
+                continue;
+            }
+            let read = |what: &str| {
+                fs::read_to_string(entry.path().join(what))
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default()
+            };
+            let name = format!("{} {}", read("vendor"), read("model"));
+            let name = name.trim().to_string();
+            if !name.is_empty() {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
 /// The SCSI host number of whole-disk `disk`, from the `hostN` component of its
 /// canonical sysfs path.
 pub fn scsi_host_number(disk: &str) -> Option<u32> {
@@ -533,7 +608,7 @@ pub fn scsi_host_number(disk: &str) -> Option<u32> {
 /// Deliberately no `SG_SCSI_RESET`: on RK3576 a host reset goes through the error
 /// handler and has been observed to leave the controller in `eh_fatal` with
 /// `ufs_eh_wq` stuck, which would take the rest of an install down with it.
-pub fn apply_configuration(disk: &str, bsg: &Bsg) -> Result<()> {
+pub fn apply_configuration(host: u32, disk: Option<&str>, bsg: &Bsg) -> Result<()> {
     bsg.write_flag(FLAG_DEVICE_INIT, true)?;
     // The device clears it when its internal configuration is complete.
     let deadline = std::time::Instant::now() + DEVICE_INIT_TIMEOUT;
@@ -547,13 +622,33 @@ pub fn apply_configuration(disk: &str, bsg: &Bsg) -> Result<()> {
             Err(e) => return Err(format!("reading fDeviceInit: {e}")),
         }
     }
-    rescan_logical_units(disk)?;
-    if !wait_for_path(disk, RESCAN_TIMEOUT) {
-        return Err(format!(
-            "{disk} did not come back after the rescan; its logical units may have been              renamed"
-        ));
+    rescan_logical_units(host)?;
+
+    // Wait for the logical units to come back. A device that had none — the whole
+    // reason for provisioning it — has no path to wait for, so wait for whatever
+    // block device the new configuration produced.
+    let deadline = std::time::Instant::now() + RESCAN_TIMEOUT;
+    loop {
+        let back = match disk {
+            Some(disk) => Path::new(disk).exists(),
+            None => data_lu_dirs(host)
+                .iter()
+                .any(|lu| lu_block_node(lu).is_some()),
+        };
+        if back {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(match disk {
+                Some(disk) => format!(
+                    "{disk} did not come back after the rescan; its logical units may \
+                     have been renamed"
+                ),
+                None => format!("host{host} still has no logical units after the rescan"),
+            });
+        }
+        thread::sleep(Duration::from_millis(100));
     }
-    Ok(())
 }
 
 /// How long to wait for the logical units to reappear after a rescan.
@@ -562,12 +657,10 @@ const RESCAN_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long to wait for the device to clear `fDeviceInit`.
 const DEVICE_INIT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Drop every logical unit of `disk` and let the SCSI host find them again, so
-/// their capacities are re-read.
-pub fn rescan_logical_units(disk: &str) -> Result<()> {
-    let host =
-        scsi_host_number(disk).ok_or_else(|| format!("cannot find the SCSI host of {disk}"))?;
-    for lu in data_lu_dirs(disk) {
+/// Drop every data logical unit of `host` and let it find them again, so their
+/// capacities are re-read.
+pub fn rescan_logical_units(host: u32) -> Result<()> {
+    for lu in data_lu_dirs(host) {
         let _ = fs::write(lu.join("delete"), "1\n");
     }
     fs::write(format!("/sys/class/scsi_host/host{host}/scan"), "- - -\n")
@@ -575,8 +668,11 @@ pub fn rescan_logical_units(disk: &str) -> Result<()> {
     Ok(())
 }
 
-/// The sysfs SCSI-device directories of the *data* logical units of `disk` — its
-/// own and its siblings under the shared SCSI target.
+/// The sysfs SCSI-device directories of the *data* logical units on a UFS host.
+///
+/// Walked from the host rather than from a block device on purpose: a
+/// factory-blank device has no block device at all, and this is how provisioning
+/// still reaches its logical units.
 ///
 /// Every data LU is included, not just the eight one Configuration Descriptor
 /// covers: a device reporting `bMaxNumberLU = 0x01` can have LUs 8..31 as well,
@@ -589,35 +685,61 @@ pub fn rescan_logical_units(disk: &str) -> Result<()> {
 /// dereference in `rpm_drop_usage_count` from `ufshcd_err_handler`, killing the
 /// error-handler worker. The kernel puts them at `SCSI_W_LUN_BASE` and above
 /// (`include/scsi/scsi.h`), which is what separates them from a data LU.
-fn data_lu_dirs(disk: &str) -> Vec<PathBuf> {
-    let name = disk.trim_start_matches("/dev/");
-    let Ok(scsi_dev) = fs::canonicalize(format!("/sys/block/{name}/device")) else {
-        return Vec::new();
-    };
-    let Some(target) = scsi_dev.parent() else {
-        return Vec::new();
-    };
+pub fn data_lu_dirs(host: u32) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    if let Ok(entries) = fs::read_dir(target) {
+    for target in scsi_target_dirs(host) {
+        let Ok(entries) = fs::read_dir(&target) else {
+            continue;
+        };
         for entry in entries.flatten() {
             // An LU directory is named `host:channel:target:lun` and carries a
             // `scsi_device` link; siblings like `power/` do not.
             if !entry.path().join("scsi_device").exists() {
                 continue;
             }
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let lun: u32 = match name.rsplit(':').next().and_then(|l| l.parse().ok()) {
-                Some(lun) => lun,
+            match lun_of(&entry.file_name().to_string_lossy()) {
                 // An unparseable name is not something to delete on a guess.
                 None => continue,
-            };
-            if !is_well_known_lun(lun) {
+                Some(lun) if is_well_known_lun(lun) => continue,
+                Some(_) => out.push(entry.path()),
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The `target<h>:<c>:<t>` directories of a SCSI host.
+fn scsi_target_dirs(host: u32) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(entries) = fs::read_dir(format!("/sys/class/scsi_host/host{host}/device")) {
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(SCSI_TARGET_PREFIX)
+            {
                 out.push(entry.path());
             }
         }
     }
     out.sort();
     out
+}
+
+const SCSI_TARGET_PREFIX: &str = "target";
+
+/// The LUN out of a `host:channel:target:lun` sysfs directory name.
+fn lun_of(dir_name: &str) -> Option<u32> {
+    dir_name.rsplit(':').next()?.parse().ok()
+}
+
+/// The `/dev/...` node of a logical unit, given its sysfs SCSI-device directory.
+/// `None` for a logical unit with no block device — every well-known one, and a
+/// data LU whose disk has not been probed yet.
+pub fn lu_block_node(lu_dir: &Path) -> Option<String> {
+    let entry = fs::read_dir(lu_dir.join("block")).ok()?.flatten().next()?;
+    Some(format!("/dev/{}", entry.file_name().to_string_lossy()))
 }
 
 /// Wait until `path` shows up, polling for at most `timeout`.
