@@ -264,7 +264,7 @@ against the scheme in [config/flipperos-ufs.toml](config/flipperos-ufs.toml):
 | 3  | recovery — kernel + initrd for on-device rescue | Enhanced1 | 128 MiB |
 
 If the layout differs in a way that matters — which units exist, their size,
-memory type or boot flag, whether the boot feature is on, or whether the mask ROM
+memory type or boot flag, whether the boot feature is on, or whether the boot ROM
 is pointed at a boot LU at all — both frontends raise a confirmation prompt.
 Reprovisioning is
 **destructive**: the device rebuilds its whole mapping and everything on it is
@@ -327,7 +327,7 @@ same SCSI target, the driver holds pointers to them, and deleting
 Because each boot LU then holds 16 MiB, a whole `u-boot-rockchip.bin` fits in one,
 so a UFS bootloader update is fail-safe:
 
-1. read `bBootLunEn` to see which boot LU the mask ROM currently reads;
+1. read `bBootLunEn` to see which boot LU the boot ROM currently reads;
 2. write the image to the **other** one, in full;
 3. verify it against the manifest digest;
 4. only then point `bBootLunEn` at it, and read the attribute back.

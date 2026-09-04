@@ -1,6 +1,6 @@
 //! Enumeration of local block storage via sysfs.
 //!
-//! The RK3576 mask ROM can boot from UFS, eMMC and SD. We walk `/sys/block`,
+//! The RK3576 boot ROM can boot from UFS, eMMC and SD. We walk `/sys/block`,
 //! skip virtual/loop/ram devices and partitions, and classify each whole disk.
 //! Classification is heuristic and based on the device node name plus the sysfs
 //! topology (a device whose parent bus is `mmc` with a non-removable flag is
@@ -144,7 +144,7 @@ fn has_ufs_host(real: &Path) -> bool {
 /// sysfs. On RK3576 the boot LUs are normal (small) LUs rather than well-known
 /// LUNs, so we can't derive them from the LUN number; instead we read each
 /// sibling's UFS unit descriptor and pick the one whose `bBootLunID` matches.
-/// Which of the pair the mask ROM actually reads is the device's `bBootLunEn`
+/// Which of the pair the boot ROM actually reads is the device's `bBootLunEn`
 /// attribute, not this flag. Returns `None` when no such LU exists (the caller
 /// then warns).
 pub fn find_ufs_boot_lu(disk: &str, boot_lun_id: u8) -> Option<String> {

@@ -67,7 +67,7 @@ impl StorageKind {
         }
     }
 
-    /// Whether the RK3576 mask ROM can boot from this class of device.
+    /// Whether the RK3576 boot ROM can boot from this class of device.
     pub fn boot_rom_capable(&self) -> bool {
         matches!(
             self,

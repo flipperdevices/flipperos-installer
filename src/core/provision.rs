@@ -35,7 +35,7 @@ const DEFAULT_SCHEME: &str = include_str!("../../config/flipperos-ufs.toml");
 /// logical unit that should exist.
 #[derive(Clone, Debug, Deserialize)]
 pub struct Scheme {
-    /// `bBootEnable`. Without it the mask ROM cannot read the bootloader from a
+    /// `bBootEnable`. Without it the boot ROM cannot read the bootloader from a
     /// boot LU at all.
     #[serde(default = "default_true")]
     pub boot_enable: bool,
@@ -847,7 +847,7 @@ fn boot_lun_name(code: u8) -> &'static str {
 ///
 /// Critical differences are the ones that change what the device *is*: which
 /// logical units exist, how big they are, what memory they use, which one the
-/// mask ROM boots from, and whether booting is enabled at all. Everything else is
+/// boot ROM boots from, and whether booting is enabled at all. Everything else is
 /// reported and tolerated — a reprovision normalises it anyway, since the whole
 /// descriptor is rewritten.
 pub fn compare(
@@ -866,7 +866,7 @@ pub fn compare(
         want.boot_enable(),
         current.boot_enable(),
     );
-    // `bBootLunEn` says which boot LU the mask ROM reads, and the installer moves
+    // `bBootLunEn` says which boot LU the boot ROM reads, and the installer moves
     // it between the pair on every bootloader update (writing the spare LU, then
     // switching once the image verifies). So any LU the scheme flags as bootable
     // is an acceptable value here — what would be wrong is booting an LU the
@@ -1757,7 +1757,7 @@ mod tests {
         let built = plan(&scheme, &dev, &geo).unwrap();
         let written = built.descriptor.clone();
 
-        // A device on the scheme, except that the mask ROM is pointed at no boot
+        // A device on the scheme, except that the boot ROM is pointed at no boot
         // LU at all — so it would not boot, but one attribute write fixes it.
         let mismatches = compare(&built, &written, ufs::BOOT_LUN_NONE, &[]);
         let critical: Vec<&Mismatch> = mismatches.iter().filter(|m| m.critical).collect();

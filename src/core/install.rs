@@ -8,7 +8,7 @@
 //!   1. `blkdiscard` the whole target device.
 //!   2. Write a fresh GPT reserving the RK3576 bootloader area.
 //!   3. Write the selected U-Boot image directly to the reserved boot area — and,
-//!      on UFS, to the spare boot LU, switching the mask ROM over to it only once
+//!      on UFS, to the spare boot LU, switching the boot ROM over to it only once
 //!      the image verifies.
 //!   4. `mkfs.btrfs` on the root partition and create the subvolume skeleton.
 //!   5. If the build ships a `/home` seed, `btrfs receive` it to a transient
@@ -35,7 +35,7 @@ use crate::core::{fetch, stage, storage, ufs};
 // metadata: [60 MiB, 64 MiB)
 // root:     [64 MiB, end]     (Btrfs)
 //
-// The RK3576 mask ROM reads `idbloader`/U-Boot starting at byte offset 32 KiB,
+// The RK3576 boot ROM reads `idbloader`/U-Boot starting at byte offset 32 KiB,
 // which is the start of the `loader` partition (p1), so the image is written
 // to that partition from its beginning.
 const LOADER_START: u64 = 32 * 1024;
@@ -600,7 +600,7 @@ fn guard_target(cfg: &Config, ctrl: &Controller, device: &StorageDevice) -> Resu
 
 /// Refuse a UFS target whose boot LU cannot hold the whole U-Boot image.
 ///
-/// The mask ROM reads DRAM init and the SPL from a boot LU, so [`install_uboot`]
+/// The boot ROM reads DRAM init and the SPL from a boot LU, so [`install_uboot`]
 /// writes the image there in full and verifies its digest. A device still
 /// carrying the factory 4 MiB boot LU cannot hold one, and finding that out at
 /// the U-Boot step would mean failing with the target already wiped — so it is
@@ -631,7 +631,7 @@ fn guard_ufs_boot_lu(
 
     let Some(plan) = boot_lu else {
         return refuse(format!(
-            "{} is UFS but has no boot LU, so the mask ROM would have nothing to \
+            "{} is UFS but has no boot LU, so the boot ROM would have nothing to \
              boot; reprovision the device first",
             device.path
         ));
@@ -815,7 +815,7 @@ fn install_uboot(
     policy: OnMismatch,
 ) -> Result<()> {
     // Write the image directly onto the loader partition (p1) from its start.
-    // The GPT places p1 at the RK3576 mask-ROM offset, so this lands the
+    // The GPT places p1 at the RK3576 boot-ROM offset, so this lands the
     // bootloader exactly where the boot ROM expects it. Wait for the freshly
     // created node before opening it.
     let loader = partition_path(&device.path, LOADER_PART_INDEX);
@@ -831,7 +831,7 @@ fn install_uboot(
         policy,
     )?;
 
-    // On UFS the RK3576 mask ROM fetches DRAM init + SPL from whichever boot LU
+    // On UFS the RK3576 boot ROM fetches DRAM init + SPL from whichever boot LU
     // `bBootLunEn` selects, and ignores the copy on the main LU's loader
     // partition. So the image goes to the *other* boot LU of the pair, at the same
     // 32 KiB offset, and only a verified write flips the flag over to it — an
@@ -842,7 +842,7 @@ fn install_uboot(
     }
     let Some(plan) = boot_lu else {
         ctrl.log(format!(
-            "warning: {} is UFS but no boot LU was found — the mask ROM may fail to \
+            "warning: {} is UFS but no boot LU was found — the boot ROM may fail to \
              load the bootloader; check the device's UFS provisioning",
             device.path
         ));
@@ -876,7 +876,7 @@ fn install_uboot(
         // Only reachable in `stream` mode, where the fetch policy has decided a
         // digest mismatch is a warning rather than a failure (`verify first` has
         // already returned an error by this point). The run may go on, but the
-        // switch must not: pointing the mask ROM at an image we know is wrong is
+        // switch must not: pointing the boot ROM at an image we know is wrong is
         // how a board stops booting at all.
         ctrl.log(format!(
             "warning: the u-boot image on boot LU {} does not match its digest, so \
@@ -895,11 +895,11 @@ struct BootLuPlan {
     node: String,
     /// Its `bBootLunID` — which one of the pair it is.
     id: u8,
-    /// The boot LU the mask ROM reads right now; `0` when booting is disabled.
+    /// The boot LU the boot ROM reads right now; `0` when booting is disabled.
     active: u8,
 }
 
-/// Pick the boot LU to write on a UFS target: the one the mask ROM is *not*
+/// Pick the boot LU to write on a UFS target: the one the boot ROM is *not*
 /// reading, so a failed or corrupted write cannot take the board down with it.
 /// Only after the image is written and its digest checked does `bBootLunEn` move
 /// over ([`activate_boot_lu`]).
@@ -950,7 +950,7 @@ fn ufs_boot_lu_plan(ctrl: &Controller, device: &StorageDevice) -> Option<BootLuP
     None
 }
 
-/// The side of the boot pair to write, given which one the mask ROM reads. With
+/// The side of the boot pair to write, given which one the boot ROM reads. With
 /// booting disabled there is nothing to preserve, so A is as good as B.
 fn spare_boot_lu(active: u8) -> u8 {
     if active == ufs::BOOT_LUN_A {
@@ -960,7 +960,7 @@ fn spare_boot_lu(active: u8) -> u8 {
     }
 }
 
-/// Read `bBootLunEn`: which boot LU the mask ROM reads.
+/// Read `bBootLunEn`: which boot LU the boot ROM reads.
 fn read_boot_lun_en(disk: &str) -> std::result::Result<u8, String> {
     let bsg = ufs::Bsg::open_for_disk(disk)?;
     Ok(bsg.read_attr(ufs::ATTR_BOOT_LUN_EN)? as u8)

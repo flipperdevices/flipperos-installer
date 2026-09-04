@@ -19,12 +19,12 @@
 # writes, so a device provisioned by either agrees with the other and they never
 # fight over it.
 
-# `bBootEnable`: the boot feature must be on, or the RK3576 mask ROM cannot read
+# `bBootEnable`: the boot feature must be on, or the RK3576 boot ROM cannot read
 # the bootloader from the boot LU at all and the board comes back dead. Some
 # parts (the Foresee 64 GB) ship with it off.
 boot_enable = true
 
-# `bBootLunEn`: which of the two boot LUs the mask ROM reads. Set to this when a
+# `bBootLunEn`: which of the two boot LUs the boot ROM reads. Set to this when a
 # device is provisioned, but not fixed afterwards: every install writes the boot
 # LU that is *not* currently active and switches over only once the image is
 # written and its digest verified, so an interrupted update leaves the board
@@ -62,7 +62,7 @@ id = 0
 name = "system"
 memory_type = "normal"
 
-# LU 1 and LU 2 — the A/B pair holding U-Boot. The RK3576 mask ROM fetches DRAM
+# LU 1 and LU 2 — the A/B pair holding U-Boot. The RK3576 boot ROM fetches DRAM
 # init and the SPL from whichever one `bBootLunEn` selects, so each must hold a
 # whole u-boot-rockchip.bin; 16 MiB is comfortably more than the ~10 MiB image
 # needs at its 32 KiB offset. The installer alternates between them, which is
