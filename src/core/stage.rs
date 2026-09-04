@@ -7,9 +7,9 @@
 //! with a wiped device and half an installation.
 //!
 //! Only what the run actually needs is staged: the U-Boot image for the detected
-//! board, the Minimal full pack, the incremental pack of each selected profile,
-//! and the `/home` seed. For a bundle that means well under the size of the
-//! published archive.
+//! board, the boot menu when the target is one that takes it, the Minimal full
+//! pack, the incremental pack of each selected profile, and the `/home` seed. For
+//! a bundle that means well under the size of the published archive.
 //!
 //! [`FetchMode::VerifyFirst`]: crate::core::model::FetchMode::VerifyFirst
 
@@ -48,6 +48,11 @@ pub struct Artifact {
 }
 
 /// Everything the run will read, in install order.
+///
+/// The boot menu is staged whenever the U-Boot build carries one. Deciding
+/// whether it is wanted at all is [`crate::core::install::run`]'s job: it clears
+/// the field for a target that has no loader partition to spare, so nothing here
+/// has to know what kind of device is being installed onto.
 pub fn plan(uboot: &UbootBuild, build: &SnapshotBuild, extras: &[ProfilePack]) -> Vec<Artifact> {
     let mut out = Vec::new();
     out.push(Artifact {
@@ -58,6 +63,16 @@ pub fn plan(uboot: &UbootBuild, build: &SnapshotBuild, extras: &[ProfilePack]) -
         size: uboot.size_bytes,
         rel: "u-boot-rockchip.bin".to_string(),
     });
+    if let Some(menu) = &uboot.boot_menu {
+        out.push(Artifact {
+            label: "boot menu image".to_string(),
+            location: menu.location.clone(),
+            source: menu.source.clone(),
+            sha256: menu.sha256.clone(),
+            size: menu.size_bytes,
+            rel: file_name(&menu.location),
+        });
+    }
     if let Some(home) = &build.home_pack {
         out.push(pack_artifact("/home seed", home));
     }
@@ -120,11 +135,18 @@ impl Staged {
         }
     }
 
-    /// Point a U-Boot build at its staged image.
+    /// Point a U-Boot build at its staged image, and its boot menu at the staged
+    /// copy of that.
     pub fn localise_uboot(&self, uboot: &mut UbootBuild) {
         if let Some(path) = self.staged_path(&uboot.image_location) {
             uboot.image_location = path.to_string();
             uboot.source = self.local_source();
+        }
+        if let Some(menu) = uboot.boot_menu.as_mut() {
+            if let Some(path) = self.staged_path(&menu.location) {
+                menu.location = path.to_string();
+                menu.source = self.local_source();
+            }
         }
     }
 
@@ -439,6 +461,7 @@ fn copy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::model::BootMenu;
 
     fn pack(name: &str, size: u64, sha: Option<&str>) -> PackFile {
         PackFile {
@@ -494,7 +517,21 @@ mod tests {
             size_bytes: 42,
             sha256: Some("dd".into()),
             details: None,
+            boot_menu: None,
             loaded: true,
+        }
+    }
+
+    /// The same build, carrying the boot menu a UFS run would install.
+    fn uboot_with_boot_menu() -> UbootBuild {
+        UbootBuild {
+            boot_menu: Some(BootMenu {
+                location: "https://example.invalid/u/flipper-one/bootmenu-falcon.itb".into(),
+                source: Source::Server,
+                size_bytes: 99,
+                sha256: Some("ee".into()),
+            }),
+            ..uboot()
         }
     }
 
@@ -521,15 +558,35 @@ mod tests {
     }
 
     #[test]
+    fn plans_the_boot_menu_right_after_the_bootloader() {
+        let b = build();
+        let p = plan(&uboot_with_boot_menu(), &b, &[]);
+
+        let labels: Vec<&str> = p.iter().map(|a| a.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["u-boot image", "boot menu image", "/home seed", "Minimal (full)"]
+        );
+        assert_eq!(p[1].rel, "bootmenu-falcon.itb");
+        assert_eq!(p[1].size, 99);
+        assert_eq!(p[1].sha256.as_deref(), Some("ee"));
+    }
+
+    #[test]
     fn localise_rewrites_only_staged_artifacts() {
         let mut b = build();
-        let mut u = uboot();
+        let mut u = uboot_with_boot_menu();
+        let menu_location = u.boot_menu.as_ref().unwrap().location.clone();
         let staged = Staged {
             dir: PathBuf::from("/run/cache"),
             map: vec![
                 (
                     u.image_location.clone(),
                     "/run/cache/u-boot-rockchip.bin".to_string(),
+                ),
+                (
+                    menu_location,
+                    "/run/cache/bootmenu-falcon.itb".to_string(),
                 ),
                 (
                     b.profiles[0].full.as_ref().unwrap().location.clone(),
@@ -544,6 +601,9 @@ mod tests {
 
         assert_eq!(u.image_location, "/run/cache/u-boot-rockchip.bin");
         assert_eq!(u.source, Source::Local { root: "/run/cache".into() });
+        let menu = u.boot_menu.as_ref().unwrap();
+        assert_eq!(menu.location, "/run/cache/bootmenu-falcon.itb");
+        assert_eq!(menu.source, Source::Local { root: "/run/cache".into() });
         let minimal = b.profiles[0].full.as_ref().unwrap();
         assert_eq!(minimal.location, "/run/cache/Minimal_9_stock_pack.zst");
         assert_eq!(minimal.source, Source::Local { root: "/run/cache".into() });

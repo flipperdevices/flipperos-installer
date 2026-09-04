@@ -187,8 +187,9 @@ bundles/dev/<user>/<branch>/<build>/     per-developer topic branches
 ```
 
 and each build directory holds a `manifest.json`, the flashable
-`u-boot/<board>/u-boot-rockchip.bin` for every supported board, the
-`profile-packs/` (the same `<Profile>_<build>_stock[_inc]_pack.zst` and
+`u-boot/<board>/u-boot-rockchip.bin` for every supported board, the matching
+`boot-menu/<board>/bootmenu-falcon.itb` (see [The boot menu](#the-boot-menu)),
+the `profile-packs/` (the same `<Profile>_<build>_stock[_inc]_pack.zst` and
 `home_<build>_pack.zst` files the image server publishes), MCU firmware the
 installer ignores, and a `*.tar.zst` of the whole tree.
 
@@ -211,10 +212,12 @@ lists and the operator's profile selection call for.
 The **Fetch** row chooses when artifacts are checked:
 
 - `verify first` (the default) downloads exactly what the run needs — the U-Boot
-  image, the Minimal full pack, each selected incremental and the `/home` seed —
+  image, the boot menu on a UFS target, the Minimal full pack, each selected
+  incremental and the `/home` seed —
   into `--cache-dir`, compares each against its manifest digest, and only then
   starts partitioning. A bad or truncated artifact therefore cannot leave a wiped
-  device behind. The space needed (~0.8–1.3 GiB) is checked up front.
+  device behind. The space needed (~0.9–1.4 GiB, the higher end of it on UFS,
+  which also stages the boot menu) is checked up front.
 - `stream` writes as it downloads, hashing on the way through. The verdict
   necessarily arrives after the bytes have landed, so a mismatch is reported as a
   warning that says the target must not be booted.
@@ -229,9 +232,10 @@ The *custom development build* flow reads the image server's two-level catalog
 (default base `https://dl-linux-images.flipp.dev`, override with `--server`):
 
 - **U-Boot:** `/u-boot/manifest.json` lists build directories; each build's
-  `manifest.json` contains `<board>/u-boot-rockchip.bin`. The installer flashes
+  `manifest.json` contains `<board>/u-boot-rockchip.bin` and, beside it,
+  `<board>/bootmenu-falcon.itb`. The installer flashes
   `<board>/u-boot-rockchip.bin` for the detected board (`flipper-one`, else
-  `generic`).
+  `generic`), and takes the boot menu from the same directory.
 - **Snapshots (rootfs):** `/rootfs/manifest.json` lists build directories; each
   build's `manifest.json` contains per-profile packs
   `<Profile>_<build>_stock_pack.zst` (full) and `<Profile>_<build>_stock_inc_pack.zst`
@@ -258,7 +262,7 @@ against the scheme in [config/flipperos-ufs.toml](config/flipperos-ufs.toml):
 
 | LU | Role | Memory type | Size |
 |----|------|-------------|------|
-| 0  | main system — GPT, loader partition, Btrfs | Normal | all remaining |
+| 0  | main system — GPT, loader partition (the boot menu), Btrfs | Normal | all remaining |
 | 1  | U-Boot, flagged **Boot LU A** | Enhanced1 | 16 MiB |
 | 2  | U-Boot, flagged **Boot LU B** | Enhanced1 | 16 MiB |
 | 3  | recovery — kernel + initrd for on-device rescue | Enhanced1 | 128 MiB |
@@ -324,8 +328,15 @@ same SCSI target, the driver holds pointers to them, and deleting
 
 ### The A/B bootloader pair
 
-Because each boot LU then holds 16 MiB, a whole `u-boot-rockchip.bin` fits in one,
-so a UFS bootloader update is fail-safe:
+On UFS the boot LU is the **only** place the bootloader goes. The boot ROM reads
+DRAM init and the SPL from whichever LU `bBootLunEn` selects and never looks at
+the main LU's loader partition, so a copy there would be dead weight — the
+installer writes none, and puts [the boot menu](#the-boot-menu) in that partition
+instead. Every other kind of target keeps its bootloader on the loader partition,
+which is where its boot ROM reads it from.
+
+Because each boot LU holds 16 MiB, a whole `u-boot-rockchip.bin` fits in one, so a
+UFS bootloader update is fail-safe:
 
 1. read `bBootLunEn` to see which boot LU the boot ROM currently reads;
 2. write the image to the **other** one, in full;
@@ -350,6 +361,32 @@ after a power-on reset, which would break the installer's own U-Boot write).
 mismatched target without asking (for unattended and factory runs), and
 `--ufs-scheme <PATH>` tries a different scheme without a rebuild.
 
+## The boot menu
+
+`bootmenu-falcon.itb` is a FIT image holding a Falcon-mode Linux kernel and an
+initramfs that draws the graphical boot menu. It is written raw to the **start of
+the loader partition** (`/dev/sda1`), and **only when the target is UFS** — that
+is the one case where the bootloader lives elsewhere and leaves the partition
+free. Nothing changes for eMMC, SD or USB targets, whose loader partition is
+occupied by U-Boot and has nowhere else to put it.
+
+Where it comes from:
+
+- bundle: `boot-menu/<board>/bootmenu-falcon.itb`, for the same board directory
+  the bootloader is taken from;
+- custom development build: `<board>/bootmenu-falcon.itb`, published beside
+  `<board>/u-boot-rockchip.bin` in the U-Boot build directory.
+
+It is verified against its manifest digest exactly like the bootloader, and it is
+staged with the other artifacts under `verify first`. A build that ships no boot
+menu is still installable: the loader partition is left empty, with a warning, and
+the board boots through full U-Boot as it did before.
+
+The loader partition runs from 32 KiB to 60 MiB, so it holds 58.6 MiB. The image
+is ~39 MiB today and grows with the menu, so an install that would not fit is
+refused **before** anything is erased, rather than failing with the target already
+wiped. That check is what will eventually ask for a larger partition.
+
 ## Btrfs layout
 
 The shared, top-level Btrfs subvolume skeleton (`boot`, `@home`, `@var-log`,
@@ -365,8 +402,9 @@ selected snapshot packs.
 ## Status
 
 This is an early scaffold: the architecture, discovery, both frontends and the
-dry-run install pipeline are in place. GPT partitioning, the U-Boot write and UFS
-provisioning are done in-process (the `gpt` crate, and `SG_IO` ioctls for UFS);
+dry-run install pipeline are in place. GPT partitioning, the U-Boot and boot menu
+writes and UFS provisioning are done in-process (the `gpt` crate, and `SG_IO`
+ioctls for UFS);
 the remaining destructive steps shell out to
 `blkdiscard`, `mkfs.btrfs`, `btrfs` and `chattr`. Kernel installation is driven
 by an embedded POSIX shell script

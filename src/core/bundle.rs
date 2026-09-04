@@ -9,6 +9,7 @@
 //! and inside a build directory:
 //! ```text
 //! u-boot/<board>/u-boot-rockchip.bin
+//! boot-menu/<board>/bootmenu-falcon.itb        UFS targets only
 //! profile-packs/<Profile>_<build>_stock[_inc]_pack.zst
 //! profile-packs/home_<build>_pack.zst
 //! mcu/…                                        not installed by this tool
@@ -27,8 +28,8 @@
 use serde::Deserialize;
 
 use crate::core::model::{
-    BuildDetails, BuildMeta, BundleLocation, BundleRef, PackFile, ProfilePack, SelectedBundle,
-    SnapshotBuild, Source, SourceStamp, UbootBuild,
+    BootMenu, BuildDetails, BuildMeta, BundleLocation, BundleRef, PackFile, ProfilePack,
+    SelectedBundle, SnapshotBuild, Source, SourceStamp, UbootBuild,
 };
 use crate::core::{archive, catalog, fetch};
 
@@ -36,6 +37,10 @@ pub type Result<T> = std::result::Result<T, String>;
 
 /// The flashable bootloader inside a bundle's per-board U-Boot directory.
 const UBOOT_IMAGE: &str = "u-boot-rockchip.bin";
+/// Directory inside a bundle that holds the per-board boot menu images.
+const BOOT_MENU_DIR: &str = "boot-menu";
+/// The Falcon-mode boot menu FIT inside a bundle's per-board boot-menu directory.
+const BOOT_MENU_IMAGE: &str = "bootmenu-falcon.itb";
 /// Directory inside a bundle that holds the profile packs and the `/home` seed.
 const PACKS_DIR: &str = "profile-packs";
 /// Channel that holds per-developer topic branches rather than build dirs.
@@ -365,6 +370,22 @@ pub fn resolve(
                 manifest.device_types().join(", ")
             )
         })?;
+    // The Falcon boot menu for the same board, when the bundle ships one. Bundles
+    // predating it simply have no such file, and installing from them still works
+    // — the boot menu is only ever written on UFS, where its absence costs a
+    // graphical menu rather than a boot.
+    let menu_rel = format!("{BOOT_MENU_DIR}/{board_dir}/{BOOT_MENU_IMAGE}");
+    let boot_menu = manifest
+        .files
+        .iter()
+        .find(|f| f.path == menu_rel)
+        .map(|f| BootMenu {
+            location: location.join(&menu_rel),
+            source: source.clone(),
+            size_bytes: f.size,
+            sha256: f.digest(),
+        });
+
     let uboot = UbootBuild {
         id: reference.id.clone(),
         label: format!("u-boot {}", manifest.bundle.version),
@@ -375,6 +396,7 @@ pub fn resolve(
         size_bytes: image.size,
         sha256: image.digest(),
         details: Some(details.clone()),
+        boot_menu,
         loaded: true,
     };
 
@@ -772,6 +794,19 @@ mod tests {
             bundle.uboot.sha256.as_deref(),
             Some("4c383d5b2c89245de80d7f3f1c84f0db7ee79995eebebf12e6479016f71255b5")
         );
+        // The boot menu comes from the same board's boot-menu directory.
+        let menu = bundle.uboot.boot_menu.as_ref().expect("boot menu");
+        assert!(
+            menu.location
+                .ends_with("/boot-menu/flipper-one/bootmenu-falcon.itb"),
+            "{}",
+            menu.location
+        );
+        assert_eq!(menu.size_bytes, 40765440);
+        assert_eq!(
+            menu.sha256.as_deref(),
+            Some("495f4fa9ee07deed190d353910671816b359e649c332917383eafacbeef83ead")
+        );
         // Nothing further to fetch for either build.
         assert!(bundle.uboot.loaded);
         assert!(bundle.build.loaded);
@@ -866,6 +901,32 @@ mod tests {
         let err =
             resolve(&reference, &reference.location, &manifest, "unknown-board").unwrap_err();
         assert!(err.contains("ships no u-boot/generic/"), "{err}");
+    }
+
+    #[test]
+    fn a_bundle_without_a_boot_menu_still_resolves() {
+        // Bundles predating the Falcon boot menu ship no `boot-menu/` tree. They
+        // are still installable — the menu is optional, unlike the bootloader.
+        let mut manifest = parse(MANIFEST);
+        manifest.files.retain(|f| !f.path.starts_with("boot-menu/"));
+        let repo = repo();
+        let reference = remote_ref(&repo, "nightly", "x");
+        let bundle = resolve(&reference, &reference.location, &manifest, "flipper-one").unwrap();
+        assert!(bundle.uboot.boot_menu.is_none());
+    }
+
+    #[test]
+    fn a_board_without_a_boot_menu_takes_none_of_anothers() {
+        // The lookup is pinned to the resolved board directory, so a board that
+        // ships a bootloader but no menu must not pick up a neighbour's.
+        let mut manifest = parse(MANIFEST);
+        manifest
+            .files
+            .retain(|f| !f.path.starts_with("boot-menu/flipper-one/"));
+        let repo = repo();
+        let reference = remote_ref(&repo, "nightly", "x");
+        let bundle = resolve(&reference, &reference.location, &manifest, "flipper-one").unwrap();
+        assert!(bundle.uboot.boot_menu.is_none());
     }
 
     #[test]

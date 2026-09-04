@@ -172,11 +172,32 @@ pub struct UbootBuild {
     pub sha256: Option<String>,
     /// Build + source details from the manifest; `None` until fetched.
     pub details: Option<BuildDetails>,
+    /// The Falcon boot menu shipped with this build, if it ships one. `None`
+    /// until the manifest has been read, and after that for a build predating
+    /// the boot menu.
+    pub boot_menu: Option<BootMenu>,
     /// Whether this build's manifest has been read (filling [`Self::size_bytes`],
-    /// [`Self::sha256`] and [`Self::details`]). Mirrors
+    /// [`Self::sha256`], [`Self::details`] and [`Self::boot_menu`]). Mirrors
     /// [`SnapshotBuild::loaded`]: both kinds of build carry a manifest and are
     /// loaded through the same path.
     pub loaded: bool,
+}
+
+/// The Falcon-mode boot menu FIT image (`bootmenu-falcon.itb`) that ships
+/// alongside a U-Boot build: a kernel plus an initramfs that draws the graphical
+/// boot menu.
+///
+/// It is written to the start of the loader partition, and only on UFS, where
+/// the boot ROM reads U-Boot from a boot LU and leaves that partition free.
+/// Everywhere else U-Boot itself occupies it.
+#[derive(Clone, Debug)]
+pub struct BootMenu {
+    /// URL (server) or path (media) of the `.itb`.
+    pub location: String,
+    pub source: Source,
+    pub size_bytes: u64,
+    /// SHA-256 the manifest publishes for the image, if it publishes one.
+    pub sha256: Option<String>,
 }
 
 impl UbootBuild {

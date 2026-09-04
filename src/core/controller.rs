@@ -740,14 +740,15 @@ impl Controller {
             }
         };
         match catalog::load_uboot_contents(&build, &board_dir) {
-            Ok((size, sha256, mtime, details)) => self.update(|s| {
+            Ok(c) => self.update(|s| {
                 if let Some(b) = s.uboot_builds.iter_mut().find(|b| b.id == id) {
-                    b.size_bytes = size;
-                    b.sha256 = sha256;
-                    if !mtime.is_empty() {
-                        b.mtime = mtime;
+                    b.size_bytes = c.size;
+                    b.sha256 = c.sha256;
+                    if !c.mtime.is_empty() {
+                        b.mtime = c.mtime;
                     }
-                    b.details = Some(details);
+                    b.details = Some(c.details);
+                    b.boot_menu = c.boot_menu;
                     b.loaded = true;
                 }
             }),

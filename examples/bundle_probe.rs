@@ -121,6 +121,13 @@ fn print_bundle(b: &flipperos_installer::core::model::SelectedBundle) {
     println!("  boards  : {}", b.device_types.join(", "));
     println!("  u-boot  : {} ({})", b.uboot.image_location, human_bytes(b.uboot.size_bytes));
     println!("            sha256 {}", b.uboot.sha256.as_deref().unwrap_or("(none)"));
+    match &b.uboot.boot_menu {
+        Some(m) => {
+            println!("  menu    : {} ({})", m.location, human_bytes(m.size_bytes));
+            println!("            sha256 {}", m.sha256.as_deref().unwrap_or("(none)"));
+        }
+        None => println!("  menu    : (none)"),
+    }
     println!("  profiles: {}", b.build.profiles.len());
     for p in &b.build.profiles {
         for (kind, pack) in [("full", &p.full), ("inc", &p.incremental)] {

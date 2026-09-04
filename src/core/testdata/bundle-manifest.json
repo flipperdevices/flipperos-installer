@@ -41,6 +41,11 @@
   ],
   "items": [
     {
+      "name": "falcon-bootmenu",
+      "builder": "u-boot",
+      "artifact_key": "u-boot/u=fddd7e00447fb4c63d156aefea7177f90b8793d2__rk=2e2961b363274470d8d805985af0dc1915e7d147__tfa=3ca70972bc4656f59d5dac4a1848c171ec0ec540__tee=5ba2ed69af2667bf59f17959be2f9e05b2d84436__scripts=d0b14e8288cd0d42374506a7bf74b8d22c99c2f2__linux=9111dec8abe8a20e1cfb2402576b09db162557af__initramfs=776e9f1e8b076d4941131d3d3b260dbe79eb788d__installer=d8542285bf79ce4b3bc747c671a5b1eb230d1a9e"
+    },
+    {
       "name": "mcu-firmware",
       "builder": "mcu-firmware",
       "artifact_key": "mcu-firmware/mcu=91da1b81cc1d1c549959695cac1b27c69b981492"
@@ -57,6 +62,34 @@
     }
   ],
   "files": [
+    {
+      "path": "boot-menu/evb/bootmenu-falcon.itb",
+      "size": 40537600,
+      "mtime": "2026-08-11T15:27:22Z",
+      "sha256": "ba623b8591452f9d1536d02895a222a9bb40d285e67f2f3ce25d53ae481b37cd",
+      "item": "falcon-bootmenu"
+    },
+    {
+      "path": "boot-menu/flipper-one/bootmenu-falcon.itb",
+      "size": 40765440,
+      "mtime": "2026-08-11T15:27:23Z",
+      "sha256": "495f4fa9ee07deed190d353910671816b359e649c332917383eafacbeef83ead",
+      "item": "falcon-bootmenu"
+    },
+    {
+      "path": "boot-menu/generic/bootmenu-falcon.itb",
+      "size": 40517632,
+      "mtime": "2026-08-11T15:27:26Z",
+      "sha256": "f69acea7c6e05b5565c784db18f2798a04b3aa28624447d14e0f8c1b0fc5be61",
+      "item": "falcon-bootmenu"
+    },
+    {
+      "path": "boot-menu/nanopi-m5/bootmenu-falcon.itb",
+      "size": 40535552,
+      "mtime": "2026-08-11T15:27:27Z",
+      "sha256": "70fd995a06c04d25dad116c908442c439b932666388f4f6c09a11991c8286ff4",
+      "item": "falcon-bootmenu"
+    },
     {
       "path": "mcu/flipperone-mcu-firmware.uf2",
       "size": 843264,

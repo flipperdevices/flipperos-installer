@@ -19,6 +19,21 @@ fn main() {
     for b in &uboot {
         println!("  {}  [{}]", b.summary(), b.mtime);
         println!("      -> {}", b.image_location);
+        // The image size, digest and boot menu only arrive with the manifest.
+        // The locations share this build's (very long) directory, so print only
+        // what distinguishes them.
+        match catalog::load_uboot_contents(b, "flipper-one") {
+            Ok(c) => match c.boot_menu {
+                Some(m) => println!(
+                    "      image {} B, menu {} B ({})",
+                    c.size,
+                    m.size_bytes,
+                    m.location.rsplit('/').next().unwrap_or(&m.location)
+                ),
+                None => println!("      image {} B, menu (none)", c.size),
+            },
+            Err(e) => println!("      manifest error: {e}"),
+        }
     }
 
     let snaps = catalog::snapshot_builds(&origin, 5);

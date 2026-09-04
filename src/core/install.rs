@@ -7,9 +7,11 @@
 //! The high-level flow mirrors what the user selected in either frontend:
 //!   1. `blkdiscard` the whole target device.
 //!   2. Write a fresh GPT reserving the RK3576 bootloader area.
-//!   3. Write the selected U-Boot image directly to the reserved boot area — and,
-//!      on UFS, to the spare boot LU, switching the boot ROM over to it only once
-//!      the image verifies.
+//!   3. Write the bootloader. On UFS it goes only to the spare boot LU, and the
+//!      boot ROM is switched over to it once the image verifies; everywhere else
+//!      it goes to the reserved boot area at the start of the loader partition.
+//!      On UFS the Falcon boot menu then goes to that reserved area instead, the
+//!      bootloader having no need of it.
 //!   4. `mkfs.btrfs` on the root partition and create the subvolume skeleton.
 //!   5. If the build ships a `/home` seed, `btrfs receive` it to a transient
 //!      base and snapshot a writable `@home` from it so /home starts populated.
@@ -38,9 +40,18 @@ use crate::core::{fetch, stage, storage, ufs};
 // The RK3576 boot ROM reads `idbloader`/U-Boot starting at byte offset 32 KiB,
 // which is the start of the `loader` partition (p1), so the image is written
 // to that partition from its beginning.
+//
+// On UFS the boot ROM reads the bootloader from a boot LU instead and ignores
+// this partition entirely, which is what leaves it free for the Falcon boot menu
+// (see [`install_boot_menu`]). The menu is by far the largest thing that goes
+// here, so it is what now sets the floor under `METADATA_START`.
 const LOADER_START: u64 = 32 * 1024;
 const METADATA_START: u64 = 60 * 1024 * 1024;
 const ROOT_START: u64 = 64 * 1024 * 1024;
+/// Room the loader partition offers whatever is written to it from its start.
+/// Both ends are fixed by [`write_gpt`], so an image that does not fit here does
+/// not fit on any target.
+const LOADER_CAPACITY: u64 = METADATA_START - LOADER_START;
 /// The loader (U-Boot) partition is the first partition.
 const LOADER_PART_INDEX: u32 = 1;
 /// The Btrfs root is the third partition.
@@ -243,6 +254,13 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
     if build.minimal().is_none() {
         return Err("snapshot build has no Minimal profile".to_string());
     }
+    // The boot menu goes to the loader partition, and only a UFS target has one to
+    // spare — everywhere else U-Boot itself occupies it. Dropping it here is what
+    // keeps it out of the staging plan too, so a non-UFS run never fetches an
+    // image it has nowhere to put.
+    if device.kind != StorageKind::Ufs {
+        uboot.boot_menu = None;
+    }
     // Extra profiles the user opted into, in build order.
     let extras: Vec<ProfilePack> = build
         .extra_profiles()
@@ -293,6 +311,7 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
     // this run will write, and `install_uboot` writes that same one.
     let boot_lu = ufs_boot_lu_plan(ctrl, &device);
     guard_ufs_boot_lu(cfg, ctrl, &device, &uboot, boot_lu.as_ref())?;
+    guard_boot_menu_fits(cfg, ctrl, &uboot)?;
     stage::guard_not_on_target(&uboot, &build, &extras, &device.path)?;
 
     // Resolve the Btrfs layout: prefer one shipped with the images, else the
@@ -320,15 +339,16 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
         .filter(|r| r.archive.is_some());
 
     // 4 fixed steps, then receive + snapshot + kernel per deployed profile, plus
-    // one receive step for the shared /home seed when the build ships one, one
-    // staging step per artifact when verifying up front, and one for unpacking a
-    // local archive.
+    // one receive step for the shared /home seed when the build ships one, one for
+    // the boot menu when the target takes one, one staging step per artifact when
+    // verifying up front, and one for unpacking a local archive.
     let deployed = 1 + extras.len();
     let verify_steps = match fetch_mode {
         FetchMode::VerifyFirst => plan.len() as u32,
         FetchMode::Stream => 0,
     };
     let total_steps = 4
+        + uboot.boot_menu.is_some() as u32
         + pending_archive.is_some() as u32
         + verify_steps
         + deployed as u32 * 3
@@ -391,6 +411,10 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
     // 3. Bootloader.
     ticker.begin(ctrl, &format!("installing u-boot {}", uboot.label));
     install_uboot(cfg, ctrl, &device, &uboot, boot_lu.as_ref(), policy)?;
+
+    // 3a. Boot menu, onto the loader partition the bootloader left free. A no-op
+    // unless the target is UFS and the build ships one.
+    install_boot_menu(cfg, ctrl, &device, &uboot, policy, &mut ticker)?;
 
     // 4. Filesystem + subvolumes.
     ticker.begin(ctrl, &format!("mkfs.btrfs {root_part}"));
@@ -618,16 +642,7 @@ fn guard_ufs_boot_lu(
     }
     // In dry-run nothing is written, so an unusable boot LU is a warning; a real
     // run refuses, the same split `guard_target` makes.
-    let refuse = |reason: String| -> Result<()> {
-        if cfg.dry_run {
-            ctrl.log(format!(
-                "[dry-run] warning: {reason} — a real run would refuse it"
-            ));
-            Ok(())
-        } else {
-            Err(reason)
-        }
-    };
+    let refuse = |reason: String| refuse_unless_dry_run(cfg, ctrl, reason);
 
     let Some(plan) = boot_lu else {
         return refuse(format!(
@@ -667,6 +682,60 @@ fn guard_ufs_boot_lu(
         )),
     }
     Ok(())
+}
+
+/// Refuse a boot menu image the loader partition cannot hold.
+///
+/// Checked before the first destructive command for the same reason
+/// [`guard_ufs_boot_lu`] is: discovering it at the write step would mean failing
+/// with the target already wiped. The image is the largest thing the installer
+/// writes outside the filesystem and it grows with every Falcon build, so this is
+/// the check that will eventually ask for a bigger partition.
+fn guard_boot_menu_fits(cfg: &Config, ctrl: &Controller, uboot: &UbootBuild) -> Result<()> {
+    let Some(menu) = &uboot.boot_menu else {
+        return Ok(());
+    };
+    match menu.size_bytes {
+        // A manifest that publishes no size leaves nothing to compare against.
+        0 => ctrl.log(
+            "warning: the manifest gives no boot menu image size, so the loader \
+             partition cannot be checked for room up front"
+                .to_string(),
+        ),
+        size if size > LOADER_CAPACITY => {
+            return refuse_unless_dry_run(
+                cfg,
+                ctrl,
+                format!(
+                    "the loader partition holds {}, too small for a {} boot menu image; \
+                     the partition layout has to grow before this build can be installed",
+                    human_bytes(LOADER_CAPACITY),
+                    human_bytes(size)
+                ),
+            )
+        }
+        size => ctrl.log(format!(
+            "loader partition: {} for a {} boot menu image",
+            human_bytes(LOADER_CAPACITY),
+            human_bytes(size)
+        )),
+    }
+    Ok(())
+}
+
+/// Report a guard's verdict: a real run refuses, a dry run only says it would.
+///
+/// Dry runs write nothing, so refusing one would keep the operator from
+/// exercising the rest of the pipeline over a device that is never touched.
+fn refuse_unless_dry_run(cfg: &Config, ctrl: &Controller, reason: String) -> Result<()> {
+    if cfg.dry_run {
+        ctrl.log(format!(
+            "[dry-run] warning: {reason} — a real run would refuse it"
+        ));
+        Ok(())
+    } else {
+        Err(reason)
+    }
 }
 
 /// Whole-disk path + 1-based index -> partition node path
@@ -814,32 +883,34 @@ fn install_uboot(
     boot_lu: Option<&BootLuPlan>,
     policy: OnMismatch,
 ) -> Result<()> {
-    // Write the image directly onto the loader partition (p1) from its start.
-    // The GPT places p1 at the RK3576 boot-ROM offset, so this lands the
-    // bootloader exactly where the boot ROM expects it. Wait for the freshly
-    // created node before opening it.
-    let loader = partition_path(&device.path, LOADER_PART_INDEX);
-    wait_for_device(cfg, ctrl, &loader)?;
-    write_source_to_offset(
-        cfg,
-        ctrl,
-        &build.image_location,
-        &build.source,
-        &loader,
-        0,
-        build.sha256.as_deref(),
-        policy,
-    )?;
-
-    // On UFS the RK3576 boot ROM fetches DRAM init + SPL from whichever boot LU
-    // `bBootLunEn` selects, and ignores the copy on the main LU's loader
-    // partition. So the image goes to the *other* boot LU of the pair, at the same
-    // 32 KiB offset, and only a verified write flips the flag over to it — an
-    // interrupted or corrupted update therefore leaves the board booting the
-    // bootloader it booted before.
+    // Everywhere but UFS the RK3576 boot ROM reads the bootloader from byte offset
+    // 32 KiB of the disk, which the GPT makes the start of the loader partition
+    // (p1), so the image is written onto that partition from its beginning. Wait
+    // for the freshly created node before opening it.
     if device.kind != StorageKind::Ufs {
+        let loader = partition_path(&device.path, LOADER_PART_INDEX);
+        wait_for_device(cfg, ctrl, &loader)?;
+        write_source_to_offset(
+            cfg,
+            ctrl,
+            "u-boot image",
+            &build.image_location,
+            &build.source,
+            &loader,
+            0,
+            build.sha256.as_deref(),
+            policy,
+        )?;
         return Ok(());
     }
+
+    // On UFS the boot ROM fetches DRAM init + SPL from whichever boot LU
+    // `bBootLunEn` selects and never looks at the main LU's loader partition, so
+    // that is the *only* copy — the partition is left to the boot menu. The image
+    // goes to the boot LU the boot ROM is not reading, at the same 32 KiB offset,
+    // and only a verified write flips the flag over to it — an interrupted or
+    // corrupted update therefore leaves the board booting the bootloader it
+    // booted before.
     let Some(plan) = boot_lu else {
         ctrl.log(format!(
             "warning: {} is UFS but no boot LU was found — the boot ROM may fail to \
@@ -859,6 +930,7 @@ fn install_uboot(
     let verified = write_source_to_offset(
         cfg,
         ctrl,
+        "u-boot image",
         &build.image_location,
         &build.source,
         &plan.node,
@@ -887,6 +959,51 @@ fn install_uboot(
         return Ok(());
     }
     activate_boot_lu(cfg, ctrl, &device.path, plan.id)
+}
+
+/// Write the Falcon boot menu onto the loader partition, from its start.
+///
+/// Only UFS gets one: there the boot ROM reads the bootloader from a boot LU and
+/// never looks at this partition, whereas on every other kind of device U-Boot
+/// occupies it and has nowhere else to go.
+///
+/// A build that ships no boot menu leaves the partition empty rather than falling
+/// back to a copy of U-Boot the boot ROM would never read. The board then boots
+/// through full U-Boot as it always did, only without the graphical menu.
+fn install_boot_menu(
+    cfg: &Config,
+    ctrl: &Controller,
+    device: &StorageDevice,
+    build: &UbootBuild,
+    policy: OnMismatch,
+    ticker: &mut Ticker,
+) -> Result<()> {
+    if device.kind != StorageKind::Ufs {
+        return Ok(());
+    }
+    let Some(menu) = &build.boot_menu else {
+        ctrl.log(format!(
+            "warning: u-boot {} ships no boot menu image, so the loader partition is \
+             left empty and the board boots through full u-boot",
+            build.label
+        ));
+        return Ok(());
+    };
+    ticker.begin(ctrl, "installing boot menu");
+    let loader = partition_path(&device.path, LOADER_PART_INDEX);
+    wait_for_device(cfg, ctrl, &loader)?;
+    write_source_to_offset(
+        cfg,
+        ctrl,
+        "boot menu image",
+        &menu.location,
+        &menu.source,
+        &loader,
+        0,
+        menu.sha256.as_deref(),
+        policy,
+    )?;
+    Ok(())
 }
 
 /// Which boot LU of a UFS device the next bootloader goes to.
@@ -1444,6 +1561,7 @@ fn open_source(location: &str, source: &Source) -> Result<Box<dyn Read + Send>> 
 fn write_source_to_offset(
     cfg: &Config,
     ctrl: &Controller,
+    what: &str,
     location: &str,
     source: &Source,
     device: &str,
@@ -1478,7 +1596,7 @@ fn write_source_to_offset(
     drop(reader);
     let verdict = fetch::verify(sha, expect);
     let trustworthy = !matches!(verdict, fetch::Verdict::Mismatch(_, _));
-    apply_verdict(ctrl, "u-boot image", verdict, policy)?;
+    apply_verdict(ctrl, what, verdict, policy)?;
     Ok(trustworthy)
 }
 
@@ -1549,6 +1667,7 @@ fn render(cmd: &Command) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::model::BootMenu;
     use std::io::Cursor;
 
     #[test]
@@ -1560,6 +1679,59 @@ mod tests {
         // Nothing is live yet on a device with booting disabled, so either side
         // will do; A keeps a freshly provisioned device predictable.
         assert_eq!(spare_boot_lu(ufs::BOOT_LUN_NONE), ufs::BOOT_LUN_A);
+    }
+
+    /// A U-Boot build carrying a boot menu image of `size` bytes.
+    fn build_with_boot_menu(size: u64) -> UbootBuild {
+        UbootBuild {
+            id: "u".into(),
+            label: "u".into(),
+            mtime: String::new(),
+            image_location: "https://example.invalid/u-boot-rockchip.bin".into(),
+            manifest_location: "https://example.invalid/manifest.json".into(),
+            source: Source::Server,
+            size_bytes: 9_961_984,
+            sha256: None,
+            details: None,
+            boot_menu: Some(BootMenu {
+                location: "https://example.invalid/bootmenu-falcon.itb".into(),
+                source: Source::Server,
+                size_bytes: size,
+                sha256: None,
+            }),
+            loaded: true,
+        }
+    }
+
+    #[test]
+    fn a_boot_menu_too_big_for_the_loader_partition_is_refused() {
+        let ctrl = Controller::new(Config {
+            automount: false,
+            ..Config::default()
+        });
+        // `Config::default()` is a dry run; a real run is what refuses.
+        let cfg = Config {
+            dry_run: false,
+            automount: false,
+            ..Config::default()
+        };
+
+        // The largest image that still fits, and the first one that does not.
+        guard_boot_menu_fits(&cfg, &ctrl, &build_with_boot_menu(LOADER_CAPACITY)).unwrap();
+        let err = guard_boot_menu_fits(&cfg, &ctrl, &build_with_boot_menu(LOADER_CAPACITY + 1))
+            .unwrap_err();
+        assert!(err.contains("too small for a"), "{err}");
+
+        // A dry run writes nothing, so it only says a real run would refuse.
+        let dry = Config {
+            automount: false,
+            ..Config::default()
+        };
+        assert!(dry.dry_run);
+        guard_boot_menu_fits(&dry, &ctrl, &build_with_boot_menu(LOADER_CAPACITY + 1)).unwrap();
+
+        // A manifest that publishes no size leaves nothing to compare against.
+        guard_boot_menu_fits(&cfg, &ctrl, &build_with_boot_menu(0)).unwrap();
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! Layout:
 //!   `<base>/u-boot/manifest.json`            -> list of U-Boot build dirs
 //!   `<base>/u-boot/<dir>/manifest.json`      -> files incl. `<board>/u-boot-rockchip.bin`
+//!                                               and `<board>/bootmenu-falcon.itb`
 //!   `<base>/rootfs/manifest.json`            -> list of rootfs build dirs
 //!   `<base>/rootfs/<dir>/manifest.json`      -> `<Profile>_<build>_stock[_inc]_pack.zst`
 //!
@@ -12,7 +13,14 @@
 use serde::Deserialize;
 
 use crate::core::fetch;
-use crate::core::model::{BuildDetails, PackFile, ProfilePack, SnapshotBuild, Source, UbootBuild};
+use crate::core::model::{
+    BootMenu, BuildDetails, PackFile, ProfilePack, SnapshotBuild, Source, UbootBuild,
+};
+
+/// The flashable bootloader inside a U-Boot build's per-board directory.
+const UBOOT_IMAGE: &str = "u-boot-rockchip.bin";
+/// The Falcon-mode boot menu FIT, published beside the bootloader it belongs to.
+const BOOT_MENU_IMAGE: &str = "bootmenu-falcon.itb";
 
 /// A place to read the catalog from.
 #[derive(Clone, Debug)]
@@ -83,7 +91,7 @@ pub fn supported_device_types(origin: &Origin) -> Vec<String> {
 
     let mut types: Vec<String> = Vec::new();
     for f in &bm.files {
-        if let Some(dir) = f.path.strip_suffix("/u-boot-rockchip.bin") {
+        if let Some(dir) = f.path.strip_suffix(&format!("/{UBOOT_IMAGE}")) {
             let id = dir.rsplit('/').next().unwrap_or(dir).to_string();
             if !id.is_empty() && !types.contains(&id) {
                 types.push(id);
@@ -105,7 +113,7 @@ pub fn uboot_builds(origin: &Origin, board_dir: &str, limit: usize) -> Vec<Uboot
         .into_iter()
         .map(|d| {
             let base_location = origin.join(&format!("u-boot/{}", d.name));
-            let image_location = format!("{base_location}{board_dir}/u-boot-rockchip.bin");
+            let image_location = format!("{base_location}{board_dir}/{UBOOT_IMAGE}");
             UbootBuild {
                 id: d.name.clone(),
                 label: uboot_label(&d.name),
@@ -116,6 +124,7 @@ pub fn uboot_builds(origin: &Origin, board_dir: &str, limit: usize) -> Vec<Uboot
                 size_bytes: 0,
                 sha256: None,
                 details: None,
+                boot_menu: None,
                 loaded: false,
             }
         })
@@ -123,31 +132,80 @@ pub fn uboot_builds(origin: &Origin, board_dir: &str, limit: usize) -> Vec<Uboot
 }
 
 /// Parsed contents of a U-Boot build manifest: the flashable image's size and
-/// digest, plus the build metadata for the details popup.
-pub type UbootContents = (u64, Option<String>, String, BuildDetails);
+/// digest, the build metadata for the details popup, and the boot menu the build
+/// ships beside the image.
+#[derive(Debug)]
+pub struct UbootContents {
+    pub size: u64,
+    pub sha256: Option<String>,
+    pub mtime: String,
+    pub details: BuildDetails,
+    /// `None` for a build predating the boot menu.
+    pub boot_menu: Option<BootMenu>,
+}
 
 /// Fetch a U-Boot build's manifest and extract the metadata for its
-/// `<board_dir>/u-boot-rockchip.bin`.
+/// `<board_dir>/u-boot-rockchip.bin`, plus the `<board_dir>/bootmenu-falcon.itb`
+/// published beside it.
 ///
 /// The sibling of [`load_profiles`]: both kinds of build carry a manifest, and
 /// both are read exactly once through this pair, so the details popup, the
 /// verification pass and the install path all see the same fields.
 pub fn load_uboot_contents(build: &UbootBuild, board_dir: &str) -> Result<UbootContents, String> {
     let bm: BuildManifest = fetch_json(&build.manifest_location)?;
+    uboot_contents(&bm, build, board_dir)
+}
+
+/// The decision [`load_uboot_contents`] makes, separated from fetching the
+/// manifest so it can be exercised directly.
+fn uboot_contents(
+    bm: &BuildManifest,
+    build: &UbootBuild,
+    board_dir: &str,
+) -> Result<UbootContents, String> {
     let details = bm.details();
-    let wanted = format!("{board_dir}/u-boot-rockchip.bin");
-    let entry = bm
-        .files
-        .iter()
-        .find(|f| f.path == wanted || f.path.ends_with(&format!("/{wanted}")));
-    match entry {
-        Some(f) => Ok((f.size, f.digest(), f.mtime.clone(), details)),
+    // A manifest may list its files either bare or under a leading directory, so
+    // match the tail rather than the whole path.
+    let find = |name: &str| {
+        let wanted = format!("{board_dir}/{name}");
+        bm.files
+            .iter()
+            .find(move |f| f.path == wanted || f.path.ends_with(&format!("/{wanted}")))
+    };
+
+    let Some(image) = find(UBOOT_IMAGE) else {
         // The build exists but ships nothing for this board. Report it rather
         // than silently flashing whatever the URL happens to return.
-        None => Err(format!(
-            "{} lists no {wanted}",
+        return Err(format!(
+            "{} lists no {board_dir}/{UBOOT_IMAGE}",
             build.manifest_location
-        )),
+        ));
+    };
+    // The boot menu is published in the same per-board directory as the image, so
+    // its location is that image's sibling. A build that ships none is still
+    // installable: the menu is only ever written on UFS.
+    let boot_menu = find(BOOT_MENU_IMAGE).map(|f| BootMenu {
+        location: sibling_of(&build.image_location, BOOT_MENU_IMAGE),
+        source: build.source.clone(),
+        size_bytes: f.size,
+        sha256: f.digest(),
+    });
+
+    Ok(UbootContents {
+        size: image.size,
+        sha256: image.digest(),
+        mtime: image.mtime.clone(),
+        details,
+        boot_menu,
+    })
+}
+
+/// Swap the last segment of `location` for `name`, naming a file in the same
+/// directory.
+fn sibling_of(location: &str, name: &str) -> String {
+    match location.rfind('/') {
+        Some(cut) => format!("{}{name}", &location[..=cut]),
+        None => name.to_string(),
     }
 }
 
@@ -371,7 +429,82 @@ fn fetch_json<T: serde::de::DeserializeOwned>(location: &str) -> Result<T, Strin
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_home_pack, parse_pack};
+    use super::*;
+
+    /// A U-Boot build directory as the image server publishes one: per-board
+    /// subdirectories holding the bootloader and the boot menu beside it.
+    const BUILD_MANIFEST: &str = r#"{
+      "build": { "builder": "uboot", "number": 570 },
+      "files": [
+        { "path": "flipper-one/idbloader.img", "size": 241664, "sha256": "aa" },
+        { "path": "flipper-one/u-boot-rockchip.bin", "size": 9961984,
+          "mtime": "2026-09-04T10:29:01Z", "sha256": "bb" },
+        { "path": "flipper-one/bootmenu-falcon.itb", "size": 40766464,
+          "mtime": "2026-09-04T10:29:03Z", "sha256": "cc" },
+        { "path": "generic/u-boot-rockchip.bin", "size": 9441280, "sha256": "dd" }
+      ]
+    }"#;
+
+    fn uboot(board_dir: &str) -> UbootBuild {
+        let base = "https://images.invalid/u-boot/u=abc/";
+        UbootBuild {
+            id: "u=abc/".into(),
+            label: "abc".into(),
+            mtime: String::new(),
+            image_location: format!("{base}{board_dir}/u-boot-rockchip.bin"),
+            manifest_location: format!("{base}manifest.json"),
+            source: Source::Server,
+            size_bytes: 0,
+            sha256: None,
+            details: None,
+            boot_menu: None,
+            loaded: false,
+        }
+    }
+
+    fn manifest() -> BuildManifest {
+        serde_json::from_str(BUILD_MANIFEST).expect("valid build manifest")
+    }
+
+    #[test]
+    fn reads_the_boot_menu_beside_the_bootloader() {
+        let build = uboot("flipper-one");
+        let c = uboot_contents(&manifest(), &build, "flipper-one").unwrap();
+        assert_eq!(c.size, 9961984);
+        assert_eq!(c.sha256.as_deref(), Some("bb"));
+
+        let menu = c.boot_menu.expect("boot menu");
+        assert_eq!(
+            menu.location,
+            "https://images.invalid/u-boot/u=abc/flipper-one/bootmenu-falcon.itb"
+        );
+        assert_eq!(menu.size_bytes, 40766464);
+        assert_eq!(menu.sha256.as_deref(), Some("cc"));
+    }
+
+    #[test]
+    fn a_build_without_a_boot_menu_still_loads() {
+        // Builds predating the boot menu ship only the bootloader, and stay
+        // installable: the menu is optional in a way the bootloader is not.
+        let build = uboot("generic");
+        let c = uboot_contents(&manifest(), &build, "generic").unwrap();
+        assert_eq!(c.size, 9441280);
+        assert!(c.boot_menu.is_none());
+    }
+
+    #[test]
+    fn a_build_without_this_board_is_an_error() {
+        let build = uboot("nanopi-m5");
+        let err = uboot_contents(&manifest(), &build, "nanopi-m5").unwrap_err();
+        assert!(err.contains("lists no nanopi-m5/u-boot-rockchip.bin"), "{err}");
+    }
+
+    #[test]
+    fn names_a_file_beside_another() {
+        assert_eq!(sibling_of("https://x.invalid/a/b/one.bin", "two.itb"), "https://x.invalid/a/b/two.itb");
+        assert_eq!(sibling_of("/mnt/sd/one.bin", "two.itb"), "/mnt/sd/two.itb");
+        assert_eq!(sibling_of("one.bin", "two.itb"), "two.itb");
+    }
 
     #[test]
     fn parses_pack_names() {
