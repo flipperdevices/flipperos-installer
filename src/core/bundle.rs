@@ -3,7 +3,7 @@
 //!
 //! Layout in the bucket:
 //! ```text
-//! <prefix>/<channel>/<build>/manifest.json      channel = release | testing | nightly
+//! <prefix>/<channel>/<build>/manifest.json      channel = release | release-candidate | nightly
 //! <prefix>/dev/<user>/<branch>/<build>/…        same per-build contents
 //! ```
 //! and inside a build directory:

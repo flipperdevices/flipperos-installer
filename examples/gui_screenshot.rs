@@ -155,7 +155,7 @@ fn main() {
     ui.set_level_title("Source".into());
     let source: [Row; 6] = [
         ("Release", "", 1, 0, true, false, false),
-        ("Testing", "", 1, 0, true, false, false),
+        ("Release candidate", "", 1, 0, true, false, false),
         ("Nightly", "", 1, 3, true, false, false),
         ("Dev", "", 1, 0, true, false, false),
         ("Local bundle", "1", 2, 0, true, false, false),

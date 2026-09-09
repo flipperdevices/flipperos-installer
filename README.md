@@ -12,9 +12,10 @@ It can:
 - **Check a UFS target's logical units** against the Flipper provisioning scheme
   and offer to **reprovision** it — writing the Configuration Descriptor over the
   kernel's UFS BSG endpoint.
-- **Browse update bundles** published per channel (`release`, `testing`,
-  `nightly`, and per-developer `dev/<user>/<branch>` builds), and verify each
-  artifact against the SHA-256 digests in the bundle's manifest.
+- **Browse update bundles** published per channel (`release`,
+  `release-candidate`, `nightly`, and per-developer `dev/<user>/<branch>`
+  builds), and verify each artifact against the SHA-256 digests in the bundle's
+  manifest.
 - **Query the image server** for available U-Boot images and exported profile
   snapshots for the board (the *custom development build* flow).
 - **Mount removable storage** (SD / USB) read-only and search it for update
@@ -182,7 +183,7 @@ build together, with a SHA-256 digest for every file. Installing from a bundle i
 the default. Bundles are published per channel:
 
 ```
-bundles/<channel>/<build>/               channel = release | testing | nightly
+bundles/<channel>/<build>/               channel = release | release-candidate | nightly
 bundles/dev/<user>/<branch>/<build>/     per-developer topic branches
 ```
 

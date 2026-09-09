@@ -19,7 +19,12 @@ use crate::core::{bundle, provision, Controller};
 
 /// Channels shown first, in this order, when the bucket lists them. Anything
 /// else the bucket publishes follows, alphabetically.
-const CHANNEL_ORDER: [&str; 4] = ["release", "testing", "nightly", bundle::DEV_CHANNEL];
+const CHANNEL_ORDER: [&str; 4] = [
+    "release",
+    "release-candidate",
+    "nightly",
+    bundle::DEV_CHANNEL,
+];
 
 /// Identifies one level of the menu tree.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -448,7 +453,7 @@ fn source(state: &AppState) -> Level {
         let is_current = matches!(&selected_channel,
             Some(sel) if sel == &name || sel.starts_with(&format!("{name}/")));
         items.push(
-            MenuItem::plain(title_case(&name), Action::Open(key))
+            MenuItem::plain(channel_label(&name), Action::Open(key))
                 .selected_if(is_current)
                 .with_icon(Icon::Network),
         );
@@ -837,16 +842,28 @@ fn ordered_channels(names: &[String]) -> Vec<String> {
 
 /// `dev/alchark/topic` → `Dev › alchark › topic`.
 fn crumb(path: &str) -> String {
-    path.trim_matches('/')
-        .split('/')
-        .map(title_case)
+    let mut segments = path.trim_matches('/').split('/');
+    let channel = segments.next().map(channel_label).unwrap_or_default();
+    std::iter::once(channel)
+        .chain(segments.map(title_case))
         .collect::<Vec<_>>()
         .join(" \u{203a} ")
 }
 
 /// The last segment of a path, for a heading tab that has to fit 256 px.
 fn crumb_title(path: &str) -> String {
-    title_case(path.trim_matches('/').rsplit('/').next().unwrap_or(path))
+    let path = path.trim_matches('/');
+    match path.split_once('/') {
+        // Below a channel the tail is a user or a branch name, not a channel.
+        Some((_, tail)) => title_case(tail.rsplit('/').next().unwrap_or(tail)),
+        None => channel_label(path),
+    }
+}
+
+/// A channel's label: `release-candidate` → `Release candidate`. Only a channel
+/// name joins words with a hyphen; a dev branch name is shown as it is.
+fn channel_label(name: &str) -> String {
+    title_case(name.replace('-', " "))
 }
 
 fn title_case(name: impl AsRef<str>) -> String {
@@ -1219,11 +1236,37 @@ mod tests {
             "nightly".to_string(),
             "dev".to_string(),
             "release".to_string(),
+            "release-candidate".to_string(),
         ];
         assert_eq!(
             ordered_channels(&names),
-            ["release", "nightly", "dev", "zzz"]
+            ["release", "release-candidate", "nightly", "dev", "zzz"]
         );
+    }
+
+    #[test]
+    fn a_hyphenated_channel_reads_as_words() {
+        let mut s = state();
+        s.catalog = Arc::new(CatalogCache {
+            channels: Listing {
+                items: vec!["release-candidate".to_string()],
+                state: LoadState::Loaded,
+            },
+            ..CatalogCache::default()
+        });
+        let level = build(&MenuKey::Source, &s);
+        assert_eq!(level.items[0].text, "Release candidate");
+        assert_eq!(
+            level.items[0].action,
+            Action::Open(MenuKey::Builds("release-candidate".into())),
+            "the label must not leak into the path"
+        );
+        assert_eq!(
+            build(&MenuKey::Builds("release-candidate".into()), &s).title,
+            "Release candidate"
+        );
+        // A dev branch name is not a slug: its hyphens stay.
+        assert_eq!(crumb("dev/alchark/fix-ufs"), "Dev \u{203a} Alchark \u{203a} Fix-ufs");
     }
 
     #[test]
