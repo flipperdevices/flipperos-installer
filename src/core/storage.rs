@@ -186,31 +186,45 @@ fn read_boot_lun_id(lu_dir: &Path) -> Option<u8> {
 /// / RAID holder. An empty result means the disk is free to repartition. Used
 /// as a safety gate before destructive operations so we never wipe a disk that
 /// backs a live mount — most importantly the removable media the snapshots are
-/// being read from, or the running system.
+/// being read from, or the running system. If a source we need cannot be read,
+/// that is reported as a reason too, so an unanswerable check blocks the wipe
+/// instead of reading as "free".
 pub fn device_in_use(disk: &str) -> Vec<String> {
     let mut reasons = Vec::new();
 
     // Mounts: `/proc/mounts` columns are `source mountpoint fstype …`.
-    if let Ok(mounts) = fs::read_to_string("/proc/mounts") {
-        for line in mounts.lines() {
-            let mut cols = line.split_whitespace();
-            if let (Some(src), Some(mnt)) = (cols.next(), cols.next()) {
-                if src == disk || is_partition_of(src, disk) {
-                    reasons.push(format!("{src} is mounted at {mnt}"));
+    // A read failure means we cannot tell whether the disk is live, so report
+    // that as a reason rather than silently returning "free" to the caller.
+    match fs::read_to_string("/proc/mounts") {
+        Ok(mounts) => {
+            for line in mounts.lines() {
+                let mut cols = line.split_whitespace();
+                if let (Some(src), Some(mnt)) = (cols.next(), cols.next()) {
+                    if src == disk || is_partition_of(src, disk) {
+                        reasons.push(format!("{src} is mounted at {mnt}"));
+                    }
                 }
             }
         }
+        Err(e) => reasons.push(format!(
+            "cannot read /proc/mounts to check for mounts ({e})"
+        )),
     }
 
     // Swap: the first column of `/proc/swaps` (past its header) is the device.
-    if let Ok(swaps) = fs::read_to_string("/proc/swaps") {
-        for line in swaps.lines().skip(1) {
-            if let Some(src) = line.split_whitespace().next() {
-                if src == disk || is_partition_of(src, disk) {
-                    reasons.push(format!("{src} is an active swap device"));
+    match fs::read_to_string("/proc/swaps") {
+        Ok(swaps) => {
+            for line in swaps.lines().skip(1) {
+                if let Some(src) = line.split_whitespace().next() {
+                    if src == disk || is_partition_of(src, disk) {
+                        reasons.push(format!("{src} is an active swap device"));
+                    }
                 }
             }
         }
+        Err(e) => reasons.push(format!(
+            "cannot read /proc/swaps to check for active swap ({e})"
+        )),
     }
 
     // Device-mapper / MD holders on the whole disk or any of its partitions.
