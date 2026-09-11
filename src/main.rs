@@ -105,6 +105,9 @@ fn run_frontends(ctrl: Arc<Controller>, choice: FrontendChoice) -> Result<(), St
     // aborting the whole tool.
     if want_gui && !gui_available() {
         eprintln!("warning: no DRM/KMS display found; skipping GUI frontend");
+        // Into the log too, for the same reason run_both records its failure:
+        // the TUI's alternate screen hides whatever stderr said beforehand.
+        ctrl.log("GUI skipped: no DRM/KMS display found");
         want_gui = false;
     }
     if want_tui && !tui_available() {
@@ -181,8 +184,14 @@ fn run_both(ctrl: Arc<Controller>) -> Result<(), String> {
         // A board whose panel is missing or busy still has a serial console, and
         // an operator watching it would rather drive the install from there than
         // be told the run is over.
+        //
+        // The reason goes into the shared log, not just stderr: the TUI is about
+        // to take the alternate screen, which wipes anything printed before it,
+        // and "the screen stayed dark and nothing said why" is a miserable way
+        // to debug a board.
         Err(e) => {
             eprintln!("warning: GUI frontend unavailable ({e}); continuing with the TUI only");
+            ctrl.log(format!("GUI unavailable: {e}"));
             return run_tui(ctrl);
         }
     };

@@ -81,25 +81,71 @@ pub(crate) struct Panel {
     debug_keys: bool,
 }
 
+/// Open the panel, preferring the Flipper One display driver but settling for
+/// any DRM device we can actually drive.
+///
+/// An explicit `--kms-device` is taken as given and never second-guessed.
+/// Otherwise `KmsSink::open(None)` goes first: it picks the card whose driver
+/// is `flipper_one_display`, which survives the card renumbering a kernel
+/// rebuild can cause. That check is strict, though, and a board running any
+/// other panel driver would find no device at all — where the LinuxKMS backend
+/// this replaced simply tried every node in `/dev/dri` until one worked. So
+/// keep that behaviour as a fallback, and report every attempt when none does.
+fn open_sink(kms_device: &str) -> Result<KmsSink, String> {
+    if !kms_device.is_empty() {
+        return KmsSink::open(Some(Path::new(kms_device)))
+            .map_err(|e| format!("{kms_device}: {e}"));
+    }
+
+    let by_driver = match KmsSink::open(None) {
+        Ok(sink) => return Ok(sink),
+        Err(e) => e,
+    };
+
+    let mut cards: Vec<std::path::PathBuf> = std::fs::read_dir("/dev/dri")
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("card"))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    cards.sort();
+
+    let mut tried = vec![format!("by driver name: {by_driver}")];
+    for card in cards {
+        match KmsSink::open(Some(&card)) {
+            Ok(sink) => {
+                eprintln!(
+                    "warning: no panel with the expected driver; falling back to {}",
+                    card.display()
+                );
+                return Ok(sink);
+            }
+            Err(e) => tried.push(format!("{}: {e}", card.display())),
+        }
+    }
+    Err(format!("no usable DRM device ({})", tried.join("; ")))
+}
+
 impl Panel {
     /// Open the display and the buttons.
-    ///
-    /// `kms_device` empty means auto-detect, which matches on the driver name
-    /// `flipper_one_display` — more robust than a `by-path` symlink, which is
-    /// only stable while the SPI address is.
     pub(crate) fn open(kms_device: &str, debug_keys: bool) -> Result<Self, String> {
-        let explicit = (!kms_device.is_empty()).then(|| Path::new(kms_device));
-        let sink = KmsSink::open(explicit).map_err(|e| format!("panel: {e}"))?;
+        let sink = open_sink(kms_device)?;
 
         let (w, h) = sink.size();
         if (w, h) != (PANEL_W, PANEL_H) {
             return Err(format!(
-                "panel reports {w}x{h}, this build is compiled for {PANEL_W}x{PANEL_H}"
+                "panel reports {w}x{h}, this build draws {PANEL_W}x{PANEL_H}"
             ));
         }
-        if debug_keys {
-            eprintln!("gui panel: {w}x{h}, {}", sink.format());
-        }
+        // Unconditional, unlike the key trace: `build()` runs before the TUI
+        // takes the terminal, so this cannot garble it, and "which node, what
+        // format" is the first thing anyone asks when the screen stays dark.
+        eprintln!("gui: panel {w}x{h} {}", sink.format());
 
         let input = match EvdevSource::open() {
             Ok(source) => Some(source),
