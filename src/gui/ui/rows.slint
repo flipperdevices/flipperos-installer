@@ -75,9 +75,17 @@ export component ListRow inherits Rectangle {
             height: 10px;
         }
         // Drill-in affordance, matching the chevron MenuRow uses on the summary.
+        //
+        // Busy9px, not HaxrCorp 4090 like the rest of this row: U+203A is the
+        // one character the UI draws that HaxrCorp does not have, and Busy9px
+        // is the only one of the three embedded fonts that does. Naming
+        // HaxrCorp here used to work only because fontconfig quietly
+        // substituted some system font for the missing glyph; with no
+        // fontconfig there is no fallback family at all, and the chevron simply
+        // vanished. See the font note at the top of main.slint.
         if root.drill : Text {
             text: "\u{203a}";
-            font-family: "HaxrCorp 4090";
+            font-family: "Busy9px";
             color: root.dim ? #999999 : #666666;
             vertical-alignment: center;
             width: 5px;
