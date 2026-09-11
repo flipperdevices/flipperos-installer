@@ -104,7 +104,7 @@ fn run_frontends(ctrl: Arc<Controller>, choice: FrontendChoice) -> Result<(), St
     // or a non-interactive terminal degrades to whatever else works instead of
     // aborting the whole tool.
     if want_gui && !gui_available() {
-        eprintln!("warning: no DRM/KMS or framebuffer display found; skipping GUI frontend");
+        eprintln!("warning: no DRM/KMS display found; skipping GUI frontend");
         want_gui = false;
     }
     if want_tui && !tui_available() {
@@ -169,20 +169,27 @@ fn run_gui(_ctrl: Arc<Controller>) -> Result<(), String> {
 
 #[cfg(all(feature = "tui", feature = "gui"))]
 fn run_both(ctrl: Arc<Controller>) -> Result<(), String> {
-    // The GUI (LinuxKMS) event loop must own the main thread; run the TUI on a
-    // worker thread. Both share the same controller.
+    // The GUI owns the main thread — its window and everything Slint hangs off
+    // it must stay on one thread — so the TUI runs on a worker. Both share the
+    // same controller.
     //
-    // Bring the GUI up *before* the TUI touches the terminal. Building the window
-    // opens the DRM/KMS panel, and on hardware without a display Slint aborts the
-    // process at that point. If the TUI had already switched the terminal into
-    // raw mode, that abort would leave the operator's serial console corrupted,
-    // so we initialize the GUI here, on the main thread, and only spawn the TUI
-    // once the screen is known to be up.
-    let window = flipperos_installer::gui::build(Arc::clone(&ctrl)).map_err(|e| format!("gui: {e}"))?;
+    // Bring the GUI up *before* the TUI touches the terminal: building it opens
+    // the DRM/KMS panel and the button devices, and whatever it has to say about
+    // a failure should reach a console that is still in cooked mode.
+    let gui = match flipperos_installer::gui::build(Arc::clone(&ctrl)) {
+        Ok(gui) => gui,
+        // A board whose panel is missing or busy still has a serial console, and
+        // an operator watching it would rather drive the install from there than
+        // be told the run is over.
+        Err(e) => {
+            eprintln!("warning: GUI frontend unavailable ({e}); continuing with the TUI only");
+            return run_tui(ctrl);
+        }
+    };
 
     let tui_ctrl = Arc::clone(&ctrl);
     let tui = std::thread::spawn(move || flipperos_installer::tui::run(tui_ctrl));
-    let gui_result = flipperos_installer::gui::run_window(window).map_err(|e| format!("gui: {e}"));
+    let gui_result = flipperos_installer::gui::run_window(gui).map_err(|e| format!("gui: {e}"));
     let _ = tui.join();
     gui_result
 }
@@ -288,7 +295,7 @@ USAGE:\n\
 \n\
 FRONTEND (default: all compiled-in frontends, concurrently):\n\
     --tui              Run only the Cursive/Crossterm serial-console UI\n\
-    --gui              Run only the Slint LinuxKMS on-device UI\n\
+    --gui              Run only the Slint DRM/KMS on-device UI\n\
     --both             Run both frontends against one shared installer state\n\
 \n\
 UPDATE BUNDLES (the default source):\n\
@@ -317,6 +324,7 @@ UFS PROVISIONING (only for UFS targets):\n\
 OPTIONS:\n\
     --server <URL>     Image server base URL (custom development builds)\n\
     --kms-device <P>   DRM/KMS device node for the Flipper One screen\n\
+                       (autodetected by driver name when not given)\n\
     --dry-run          Log destructive steps without executing them (default)\n\
     --no-dry-run       Actually perform destructive operations\n\
     --debug-keys       Log each GUI keypress to stderr (input debugging)\n\

@@ -8,12 +8,13 @@
 // exact pixel glyphs (not a fontconfig substitute). Paths are relative to this
 // file.
 //
-// NOTE: embedding does NOT free the runtime from fonts. Slint's LinuxKMS backend
-// uses the `fontique` font engine, which links libfontconfig and panics at
-// startup (fontique fontconfig backend, NoMatch) if fontconfig resolves zero
-// fonts. So the initramfs MUST ship libfontconfig/libfreetype, a fonts.conf
-// pointing at a font dir, and at least one font — shipping these three TTFs
-// there is sufficient (they satisfy the engine and match these families).
+// These three are the only fonts the binary has. Slint's font engine
+// (`fontique`) still *looks* for system fonts at startup, but we build it with
+// `fontconfig-dlopen`, so a missing libfontconfig leaves it with an empty
+// system set rather than the NoMatch panic it used to raise — the initramfs
+// needs no libfontconfig, no fonts.conf and no font directory. The flip side:
+// there is no fallback family, so a character none of these three covers will
+// not render. Keep the UI's text to what they have.
 import "../../../third_party/flipctl-fonts/HaxrCorp4090-FlipCTL/HaxrCorp4090-FlipCTL.ttf";
 import "../../../third_party/flipctl-fonts/Busy9px-FlipCTL/Busy9px-FlipCTL.ttf";
 import "../../../third_party/flipctl-fonts/Born2bSportyV2-FlipCTL/Born2bSportyV2-FlipCTL.ttf";
@@ -191,11 +192,13 @@ export component MainWindow inherits Window {
         width: 100%;
         height: 100%;
         key-pressed(event) => {
-            // Trace every key the backend delivers, before any matching, so
-            // an operator can tell "libinput delivered nothing" (no events at
-            // all) apart from "delivered the wrong text". Routed to Rust so it
-            // only prints under `--debug-keys`; unwired it is a no-op (no
-            // stderr output to garble the TUI on the shared kernel console).
+            // Trace every key that reaches the UI, before any matching, so an
+            // operator can tell "the key never arrived" from "it arrived as the
+            // wrong text". `gui/panel.rs` traces the other end of the same
+            // path — what evdev reported — so the two together say which half
+            // is at fault. Routed to Rust so it only prints under
+            // `--debug-keys`; unwired it is a no-op (no stderr output to
+            // garble the TUI on the shared kernel console).
             root.trace-key(event.text, root.screen, root.menu-index, root.cursor);
 
             // Input model:

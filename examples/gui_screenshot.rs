@@ -1,9 +1,13 @@
 //! Off-device visual test for the Slint GUI.
 //!
 //! Renders the real [`MainWindow`] through Slint's software renderer — the same
-//! renderer the on-device LinuxKMS backend uses — into a pixel buffer and writes
-//! it out as a PNG. This lets us eyeball the 256x144 layout (summary screen and
-//! each submenu, scrolled) without a Flipper One panel or a DRM device.
+//! renderer the device draws with — into a pixel buffer and writes it out as a
+//! PNG. This lets us eyeball the 256x144 layout (summary screen and each
+//! submenu, scrolled) without a Flipper One panel or a DRM device.
+//!
+//! It stands in for the on-device platform rather than using it: this one keeps
+//! the frame in RGB so the PNGs are comparable by eye, where the device renders
+//! straight to the panel's greyscale.
 //!
 //! Run with:
 //!     cargo run --example gui_screenshot --features gui

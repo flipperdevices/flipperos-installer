@@ -21,7 +21,7 @@ strip = true
 # select a single frontend, e.g. `--no-default-features --features tui`.
 default = ["tui", "gui"]
 tui = ["dep:cursive"]
-gui = ["dep:slint"]
+gui = ["dep:slint", "dep:flipper-ui"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -62,13 +62,40 @@ default-features = false
 features = ["crossterm-backend"]
 optional = true
 
-# GUI frontend for the Flipper One DRM/KMS screen. The `-noseat` backend variant
-# talks to DRM/libinput directly, which is what we want inside an initramfs where
-# there is no seatd/logind session.
+# GUI frontend for the Flipper One DRM/KMS screen. No backend: we drive the panel
+# and the buttons ourselves through `flipper-ui`, so the software renderer is
+# taken on its own. Any `backend-linuxkms*` feature would compile
+# `i-slint-backend-linuxkms`, whose `input` (libinput + libudev) and `xkbcommon`
+# dependencies are not optional and cannot be turned off by feature selection —
+# four shared libraries in the initramfs to service thirteen soldered buttons.
+#
+# `std` used to arrive implied by the backend feature and has to be named now;
+# without it `i-slint-core` builds no_std. `unsafe-single-threaded` is what
+# `flipper-ui` asks for, and Cargo unifies features, so we get it whether or not
+# it appears here: name it, because it is a constraint on our own code. Nothing
+# may hold a Slint handle off the thread that owns the window.
 [dependencies.slint]
 version = "1.8"
 default-features = false
-features = ["compat-1-2", "renderer-software", "backend-linuxkms-noseat"]
+features = ["compat-1-2", "renderer-software", "std", "unsafe-single-threaded"]
+optional = true
+
+# The panel, the buttons and the Slint glue, shared with flipctl and the Falcon
+# boot menu so all three draw the same screen the same way. `device` is the DRM
+# sink and the raw evdev source; `slint` is the software-renderer platform.
+# `screens` is deliberately absent: it compiles flipctl's own screens, and we
+# draw our own.
+#
+# This is also what takes libfontconfig off the link line. It depends on
+# `i-slint-common` with `fontconfig-dlopen`, a feature the `slint` facade does
+# not re-export, which switches fontique's binding from link-time to `dlopen`.
+# Pinned by revision rather than branch: this binary ships in an initramfs and
+# has to rebuild identically from the tag.
+[dependencies.flipper-ui]
+git = "https://github.com/flipperdevices/flipctl-slint"
+rev = "7e8fd5e428c2016f26c81167025a602f8eb22b2c"
+default-features = false
+features = ["device", "slint"]
 optional = true
 
 # Off-device visual testing: render the GUI through the same Slint software

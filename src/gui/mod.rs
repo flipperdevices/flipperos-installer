@@ -2,19 +2,30 @@
 //!
 //! Like the TUI, this is a thin view over the shared [`Controller`]. The Slint
 //! window renders the current [`AppState`] snapshot and drives navigation with
-//! the on-device buttons (delivered by libinput as key events). All selection
-//! changes and the install action call back into the controller, so the GUI and
-//! the serial-console TUI stay in lock-step.
+//! the on-device buttons (read straight from evdev — see [`panel`]). All
+//! selection changes and the install action call back into the controller, so
+//! the GUI and the serial-console TUI stay in lock-step.
 //!
-//! The `-noseat` LinuxKMS backend is used because inside an initramfs there is
-//! no seatd/logind session to broker DRM access; we run as root and open the
-//! DRM device directly.
+//! Slint is taken with the software renderer and *no backend*, so it supplies
+//! no event loop: [`run_window`] is the loop, and it owns the panel and the
+//! buttons as well. The LinuxKMS backend would have done all three, but its
+//! libinput, libudev and libxkbcommon dependencies are not optional, and this
+//! binary runs from an initramfs where every shared library has to be staged
+//! alongside it.
+//!
+//! One consequence runs through this file: `slint`'s `unsafe-single-threaded`
+//! feature is on, so no Slint handle may leave this thread. Snapshots from the
+//! controller's worker threads arrive over an [`mpsc`] channel carrying plain
+//! [`AppState`] values, and the loop is what touches the window.
 
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 
 use crate::core::menu::{self, DetailsTarget, Level, LevelKind, Nav};
 use crate::core::model::{AppState, Phase};
 use crate::core::Controller;
+
+mod panel;
 
 // The Slint UI is authored as external `.slint` files under `src/gui/ui/` (the
 // path is relative to this source file). We compile them with the `slint!`
@@ -47,24 +58,46 @@ fn entries(level: &Level) -> slint::ModelRc<MenuEntry> {
     slint::ModelRc::new(slint::VecModel::from(rows))
 }
 
-/// Build the window and wire it to `ctrl`, without starting the event loop.
+/// Everything [`run_window`] needs to drive the GUI: the window, the panel it is
+/// drawn on, and the two ways the rest of the process talks to the loop.
 ///
-/// Creating the window is what actually opens the DRM/KMS panel, so this is the
-/// step that fails (and, on hardware without a display, aborts) when there is no
-/// screen. Callers that run the GUI alongside the TUI use this to bring the GUI
-/// up on the main thread *before* the TUI takes over the terminal.
+/// None of this is `Send` — the window least of all — which is the point. It is
+/// built on the thread that will run the loop and never leaves it.
+pub struct Gui {
+    window: MainWindow,
+    /// The software-rendered surface behind `window`. Held separately because
+    /// rendering goes through the adapter, not the component.
+    surface: std::rc::Rc<slint::platform::software_renderer::MinimalSoftwareWindow>,
+    panel: panel::Panel,
+    /// Snapshots from the controller's worker threads.
+    snapshots: mpsc::Receiver<AppState>,
+    /// Set by the controller's exit hook, from whichever thread asked to quit.
+    quit: Arc<AtomicBool>,
+    cache: Arc<Mutex<AppState>>,
+    nav: Arc<Mutex<Nav>>,
+    detail_target: Arc<Mutex<Option<DetailsTarget>>>,
+}
+
+/// Build the window and wire it to `ctrl`, without starting the loop.
 ///
-/// Must be called on the main thread (the LinuxKMS backend owns it).
-pub fn build(ctrl: Arc<Controller>) -> Result<MainWindow, slint::PlatformError> {
-    // Select the seat-less LinuxKMS backend and point it at the Flipper One
-    // panel. Slint honours these environment variables at backend init. The
-    // backend name is just "linuxkms" (the seat-less behaviour comes from the
-    // compiled-in `backend-linuxkms-noseat` feature); the suffix names the
-    // renderer, so we request the software renderer explicitly.
-    std::env::set_var("SLINT_BACKEND", "linuxkms-software");
-    std::env::set_var("SLINT_KMS_DEVICE", &ctrl.config().kms_device);
+/// This is what opens the DRM/KMS panel and the button devices, so it is the
+/// step that fails when there is no screen. Callers that run the GUI alongside
+/// the TUI use it to bring the GUI up on the main thread *before* the TUI takes
+/// over the terminal, so a failure here still reaches a sane console.
+///
+/// Must be called on the thread that will call [`run_window`].
+pub fn build(ctrl: Arc<Controller>) -> Result<Gui, slint::PlatformError> {
+    // Open the panel and the buttons before the platform, so a display failure
+    // is an error from here rather than a half-initialised Slint.
+    let panel = panel::Panel::open(&ctrl.config().kms_device, ctrl.config().debug_keys)
+        .map_err(slint::PlatformError::Other)?;
+
+    // The whole platform: a window adapter and a clock. It has to be installed
+    // before any component is created, and exactly once.
+    let surface = flipper_ui::slint_render::FlipperSlintPlatform::install();
 
     let win = MainWindow::new()?;
+    win.show()?;
 
     // Input-debug trace: only wired under `--debug-keys`. Left unwired the
     // callback is a no-op, so keypresses never reach stderr / the shared console.
@@ -205,87 +238,123 @@ pub fn build(ctrl: Arc<Controller>) -> Result<MainWindow, slint::PlatformError> 
     }
 
     // Close this frontend when either frontend's Reboot action asks the
-    // installer to shut down. `invoke_from_event_loop` is callable from any
-    // thread, which is what lets the TUI (on its own thread) end the GUI loop
-    // that owns the main thread — without it, quitting the TUI would leave the
-    // process running and nothing would ever reboot.
-    ctrl.on_exit(|| {
-        let _ = slint::invoke_from_event_loop(|| {
-            let _ = slint::quit_event_loop();
-        });
-    });
+    // installer to shut down. The hook runs on whichever thread asked, which is
+    // what lets the TUI (on its own thread) end the GUI loop that owns the main
+    // thread — without it, quitting the TUI would leave the process running and
+    // nothing would ever reboot. A flag rather than a call into Slint, because
+    // nothing off this thread may touch the window.
+    let quit = Arc::new(AtomicBool::new(false));
+    {
+        let quit = Arc::clone(&quit);
+        ctrl.on_exit(move || quit.store(true, Ordering::Release));
+    }
 
-    // Subscribe: marshal every snapshot into the Slint event loop.
-    let weak = win.as_weak();
-    let detail_for_sub = Arc::clone(&detail_target);
-    let nav_for_sub = Arc::clone(&nav);
+    // Subscribe: hand every snapshot to the loop over a channel. `subscribe`
+    // delivers the current state synchronously before it returns, so the first
+    // frame the loop draws already has whatever discovery has found.
+    let (tx, snapshots) = mpsc::channel();
     ctrl.subscribe(move |snapshot| {
-        let weak = weak.clone();
-        let cache = Arc::clone(&cache);
-        let detail_target = Arc::clone(&detail_for_sub);
-        let nav = Arc::clone(&nav_for_sub);
-        let _ = slint::invoke_from_event_loop(move || {
-            if let Some(win) = weak.upgrade() {
-                *cache.lock().unwrap() = snapshot.clone();
-                let mut nav_now = nav.lock().unwrap();
-                // An install takes over the screen, so drop back to the summary.
-                if matches!(snapshot.phase, Phase::Installing) {
-                    nav_now.reset();
-                }
-                let nav_copy = nav_now.clone();
-                drop(nav_now);
-                apply(&win, &snapshot);
-                apply_nav(&win, &snapshot, &nav_copy);
-                apply_details(&win, &snapshot, &detail_target.lock().unwrap());
-                // Last, so it owns `screen`: a prompt outranks whatever level
-                // `apply_nav` just decided to show.
-                apply_prompt(&win, &snapshot, &nav_copy);
-            }
-        });
+        let _ = tx.send(snapshot);
     });
 
-    Ok(win)
+    Ok(Gui {
+        window: win,
+        surface,
+        panel,
+        snapshots,
+        quit,
+        cache,
+        nav,
+        detail_target,
+    })
 }
 
-/// Build the window, wire it to `ctrl`, and run the Slint event loop.
-///
-/// Must be called on the main thread (the LinuxKMS backend owns it).
+/// Build the window, wire it to `ctrl`, and run the loop.
 pub fn run(ctrl: Arc<Controller>) -> Result<(), slint::PlatformError> {
     run_window(build(ctrl)?)
 }
 
-/// Run the Slint event loop for an already-built window.
+/// Drive an already-built GUI until something asks it to stop.
 ///
-/// Split out from [`run`] so a caller can build the window on the main thread
-/// (bringing the screen up) before starting other frontends, then hand the
-/// window here to block on the event loop.
-pub fn run_window(window: MainWindow) -> Result<(), slint::PlatformError> {
-    window.run()
+/// Split out from [`run`] so a caller can build on the main thread (bringing the
+/// screen up) before starting other frontends, then block here.
+///
+/// Each turn drains the buttons, drains the snapshot channel, and repaints if
+/// either produced anything. The repaint is conditional twice over: `dirty`
+/// skips the work when nothing happened, and `Panel::present` skips the commit
+/// when Slint reports no damage, so an idle installer transmits nothing over
+/// SPI at all.
+pub fn run_window(gui: Gui) -> Result<(), slint::PlatformError> {
+    let Gui { window, surface, mut panel, snapshots, quit, cache, nav, detail_target } = gui;
+
+    // Nothing here calls `slint::platform::update_timers_and_animations`, and
+    // nothing repaints on a clock: this UI has no `animate` blocks and starts no
+    // Slint timers, so every frame is a reaction to a key or a snapshot. Adding
+    // an animation to the .slint would need both that call and a redraw while
+    // `window.has_active_animations()`, or it would start and then stall.
+    //
+    // The first turn always draws: nothing has been on the panel yet.
+    let mut dirty = true;
+    while !quit.load(Ordering::Acquire) {
+        if panel.pump_keys(window.window()) {
+            dirty = true;
+        }
+
+        for snapshot in snapshots.try_iter() {
+            dirty = true;
+            apply_snapshot(&window, &snapshot, &cache, &nav, &detail_target);
+        }
+
+        // Checked again here: a key or a snapshot may have been the Reboot that
+        // ends the run, and there is no point painting a frame nobody sees.
+        if quit.load(Ordering::Acquire) {
+            break;
+        }
+
+        if dirty {
+            dirty = false;
+            surface.request_redraw();
+            panel.present(&surface).map_err(slint::PlatformError::Other)?;
+        }
+
+        panel.wait();
+    }
+    Ok(())
 }
 
-/// Best-effort check for whether the LinuxKMS backend has a device to draw on.
-///
-/// The GUI cannot be started safely without one: Slint opens the panel lazily
-/// while creating the window and `.unwrap()`s the failure, and our release build
-/// is `panic = "abort"`, so a missing screen would abort the whole process
-/// instead of returning an error we could recover from. Callers use this to skip
-/// the GUI when there is nothing to render on.
-///
-/// This mirrors the device discovery in Slint's software LinuxKMS display, which
-/// tries a DRM/KMS node under `/dev/dri` first and then falls back to a legacy
-/// `/dev/fb*` framebuffer (or only the framebuffer when `SLINT_BACKEND_LINUXFB`
-/// is set). It is a presence check, not a full modeset probe, so a device that
-/// exists but can't be driven (e.g. DRM master held by a compositor) can still
-/// fail later — but the common "no display at all" case is caught here.
-pub fn display_available() -> bool {
-    let has_framebuffer =
-        || (0..10).any(|n| std::path::Path::new(&format!("/dev/fb{n}")).exists());
-
-    if std::env::var_os("SLINT_BACKEND_LINUXFB").is_some() {
-        return has_framebuffer();
+/// Apply one snapshot to the window, in the order the screens depend on.
+fn apply_snapshot(
+    win: &MainWindow,
+    snapshot: &AppState,
+    cache: &Mutex<AppState>,
+    nav: &Mutex<Nav>,
+    detail_target: &Mutex<Option<DetailsTarget>>,
+) {
+    *cache.lock().unwrap() = snapshot.clone();
+    let mut nav_now = nav.lock().unwrap();
+    // An install takes over the screen, so drop back to the summary.
+    if matches!(snapshot.phase, Phase::Installing) {
+        nav_now.reset();
     }
+    let nav_copy = nav_now.clone();
+    drop(nav_now);
+    apply(win, snapshot);
+    apply_nav(win, snapshot, &nav_copy);
+    apply_details(win, snapshot, &detail_target.lock().unwrap());
+    // Last, so it owns `screen`: a prompt outranks whatever level `apply_nav`
+    // just decided to show.
+    apply_prompt(win, snapshot, &nav_copy);
+}
 
-    let has_drm_card = std::fs::read_dir("/dev/dri")
+/// Best-effort check for whether there is a display to draw on.
+///
+/// Callers use this to choose frontends before committing to one, so it has to
+/// be cheap and side-effect free: opening the panel for real acquires DRM master
+/// and waits for it, which is [`build`]'s job, not this one's. A node that
+/// exists but cannot be driven still fails there — but the common "no display at
+/// all" case is caught here, and the failure is a returned error either way.
+pub fn display_available() -> bool {
+    std::fs::read_dir("/dev/dri")
         .map(|entries| {
             entries.flatten().any(|e| {
                 e.file_name()
@@ -293,9 +362,7 @@ pub fn display_available() -> bool {
                     .starts_with("card")
             })
         })
-        .unwrap_or(false);
-
-    has_drm_card || has_framebuffer()
+        .unwrap_or(false)
 }
 
 /// Wrap each line of `text` to at most `width` characters, so a popup can scroll

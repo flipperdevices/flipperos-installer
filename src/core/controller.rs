@@ -54,7 +54,9 @@ pub struct Config {
     /// Reprovision a mismatched UFS target without asking. For unattended and
     /// factory runs, where there is nobody to answer the prompt.
     pub ufs_reprovision: bool,
-    /// DRM/KMS device node for the on-device screen.
+    /// DRM/KMS device node for the on-device screen. Empty means auto-detect,
+    /// which matches on the panel's driver name and so survives the card
+    /// renumbering a kernel rebuild can cause.
     pub kms_device: String,
     /// When true, the GUI logs each keypress to stderr (input debugging). Off by
     /// default so nothing garbles the TUI on a shared serial/kernel console.
@@ -79,7 +81,7 @@ impl Default for Config {
             ufs_check: true,
             ufs_scheme: None,
             ufs_reprovision: false,
-            kms_device: "/dev/dri/by-path/platform-2acf0000.spi-cs-0-card".to_string(),
+            kms_device: String::new(),
             debug_keys: false,
         }
     }

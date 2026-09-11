@@ -21,8 +21,8 @@ It can:
 - **Mount removable storage** (SD / USB) read-only and search it for update
   bundles, offline U-Boot images and profile snapshots.
 - Present a **TUI** (Cursive + Crossterm) for serial-console operation.
-- Present a **GUI** (Slint + LinuxKMS) on the Flipper One 256×144 DRM screen,
-  driven by the on-device buttons (a Linux input event device).
+- Present a **GUI** (Slint's software renderer, straight onto DRM/KMS) on the
+  Flipper One 256×144 screen, driven by the on-device buttons (read from evdev).
 - **Run the installation**: `blkdiscard`, write a fresh GPT, `mkfs.btrfs` with a
   subvolume skeleton, `btrfs receive` the selected profile snapshots, and
   install a kernel for each.
@@ -47,7 +47,7 @@ Both frontends are thin views over a single shared installer state:
                               │ actions      │ snapshots
                               │              v
    on-device          ┌───────┴──────────────┴───────┐
-   buttons ──────────>│ GUI (slint / linuxkms)       │
+   buttons ──────────>│ GUI (slint / drm-kms)        │
                       └──────────────────────────────┘
 ```
 
@@ -103,34 +103,42 @@ cargo build
 rustup target add aarch64-unknown-linux-gnu
 cargo build --release --target aarch64-unknown-linux-gnu
 
-# Slim, TUI-only variant (no GUI shared-library dependencies):
+# Slim, TUI-only variant (drops the renderer and the panel code):
 cargo build --release --no-default-features --features tui \
     --target aarch64-unknown-linux-gnu
 ```
 
-The binary links dynamically against the system C library and, for the GUI,
-against `libinput`, `libudev`, `libxkbcommon`, `libfontconfig` and `libfreetype`
-(the last two pulled in by Slint for font discovery/rendering), all located via
-`pkg-config`. These shared libraries must therefore be present in the initramfs
-alongside the binary (the TUI-only build needs none of them). The `drm` crate
-talks to the kernel directly via ioctls (pregenerated bindings), so no `libdrm`
-is needed. Install the build tools and dev packages (Debian/Ubuntu):
+The binary links dynamically against the system C library and nothing else —
+`libc`, `libm` and `libgcc_s` — with or without the GUI, so the initramfs needs
+no shared libraries beyond the C runtime and no `-dev` packages are needed to
+build it. Everything the screen and the buttons need is in-process: `drm` talks
+to the kernel through ioctls with pregenerated bindings (no `libdrm`), the
+buttons are read straight from `/dev/input/event*`, and glyphs are rasterised by
+the pure-Rust `skrifa`.
 
-```sh
-sudo apt install pkg-config libinput-dev libudev-dev libxkbcommon-dev \
-    libfontconfig-dev libfreetype-dev
-```
+Getting there took saying no to two things. Slint's LinuxKMS backend is not
+used, because its `libinput`, `libudev` and `libxkbcommon` dependencies are not
+optional — we take the software renderer on its own and drive DRM and evdev
+through [`flipper-ui`](https://github.com/flipperdevices/flipctl-slint), shared
+with flipctl and the Falcon boot menu. And `libfontconfig` (which drags in
+freetype, expat, png, brotli and bz2) is switched from link-time to `dlopen` by
+a direct dependency on `i-slint-common` with its `fontconfig-dlopen` feature;
+that library arrives through `fontique`, not through any backend, so no amount
+of backend selection would have removed it.
 
 The GUI's text is rendered with the compiled-in **HaxrCorp 4090 (FlipCTL)** pixel
 font (vendored as the `third_party/flipctl-fonts` submodule and embedded by the
-Slint compiler), so no system fonts are required on the device.
+Slint compiler), so no system fonts are required on the device, and no
+`fonts.conf` or font directory has to be staged into the initramfs. The flip
+side is that there is no fallback: a character outside the three FlipCTL fonts
+has nothing to render with.
 
 Cargo feature flags:
 
 | Feature | Frontend                          |
 |---------|-----------------------------------|
 | `tui`   | Cursive/Crossterm (serial)        |
-| `gui`   | Slint/LinuxKMS (on-device screen) |
+| `gui`   | Slint/DRM-KMS (on-device screen)  |
 
 ## Running
 
@@ -141,9 +149,10 @@ sudo ./flipperos-installer
 # Serial console only:
 sudo ./flipperos-installer --tui
 
-# On-device screen only, real install:
-sudo ./flipperos-installer --gui --no-dry-run \
-    --kms-device /dev/dri/by-path/platform-2acf0000.spi-cs-0-card
+# On-device screen only, real install. The panel is found by its driver name,
+# so --kms-device is only needed to override that:
+sudo ./flipperos-installer --gui --no-dry-run
+sudo ./flipperos-installer --gui --no-dry-run --kms-device /dev/dri/card0
 
 # Install from a bundle sitting on a USB stick, streaming rather than staging:
 sudo ./flipperos-installer --no-dry-run --fetch stream \
