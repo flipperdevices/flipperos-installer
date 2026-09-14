@@ -1161,7 +1161,7 @@ dependencies = [
 [[package]]
 name = "flipper-tokens"
 version = "0.1.0"
-source = "git+https://github.com/flipperdevices/flipctl-slint?rev=7e8fd5e428c2016f26c81167025a602f8eb22b2c#7e8fd5e428c2016f26c81167025a602f8eb22b2c"
+source = "git+https://github.com/flipperdevices/flipctl-slint?rev=1523bb93a5121f9d48aa3c60eec140089ee195c4#1523bb93a5121f9d48aa3c60eec140089ee195c4"
 dependencies = [
  "toml 0.8.23",
 ]
@@ -1169,9 +1169,10 @@ dependencies = [
 [[package]]
 name = "flipper-ui"
 version = "0.1.0"
-source = "git+https://github.com/flipperdevices/flipctl-slint?rev=7e8fd5e428c2016f26c81167025a602f8eb22b2c#7e8fd5e428c2016f26c81167025a602f8eb22b2c"
+source = "git+https://github.com/flipperdevices/flipctl-slint?rev=1523bb93a5121f9d48aa3c60eec140089ee195c4#1523bb93a5121f9d48aa3c60eec140089ee195c4"
 dependencies = [
  "drm",
+ "drm-ffi",
  "flipper-tokens",
  "i-slint-common",
  "libc",

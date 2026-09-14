@@ -93,7 +93,7 @@ optional = true
 # has to rebuild identically from the tag.
 [dependencies.flipper-ui]
 git = "https://github.com/flipperdevices/flipctl-slint"
-rev = "7e8fd5e428c2016f26c81167025a602f8eb22b2c"
+rev = "1523bb93a5121f9d48aa3c60eec140089ee195c4"
 default-features = false
 features = ["device", "slint"]
 optional = true
