@@ -2,7 +2,7 @@
 //!
 //! Like the TUI, this is a thin view over the shared [`Controller`]. The Slint
 //! window renders the current [`AppState`] snapshot and drives navigation with
-//! the on-device buttons (read straight from evdev — see [`panel`]). All
+//! the on-device buttons (read straight from evdev — see the `panel` module). All
 //! selection changes and the install action call back into the controller, so
 //! the GUI and the serial-console TUI stay in lock-step.
 //!

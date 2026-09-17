@@ -5,7 +5,7 @@
 //! into their own event loop, so a change made in one frontend (e.g. selecting a
 //! device via the serial console) is immediately reflected in the other (the
 //! on-device screen). All mutation goes through methods on `Controller`, which
-//! lock the state, apply the change and then [`Controller::notify`] subscribers.
+//! lock the state, apply the change and then notify subscribers.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -301,7 +301,7 @@ fn refresh(siv: &mut Cursive) {
 }
 
 fn clear_layout(ll: &mut LinearLayout) {
-    while ll.len() > 0 {
+    while !ll.is_empty() {
         ll.remove_child(0);
     }
 }
@@ -739,9 +739,8 @@ fn render_status(state: &AppState) -> String {
 fn progress_bar(progress: f32) -> String {
     let width = 24usize;
     let filled = (progress.clamp(0.0, 1.0) * width as f32).round() as usize;
-    let bar: String = std::iter::repeat('#')
-        .take(filled)
-        .chain(std::iter::repeat('-').take(width - filled))
+    let bar: String = std::iter::repeat_n('#', filled)
+        .chain(std::iter::repeat_n('-', width - filled))
         .collect();
     format!("[{bar}] {:.0}%", progress * 100.0)
 }

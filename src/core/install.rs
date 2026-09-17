@@ -1,6 +1,6 @@
 //! The installer engine: partition, format, receive snapshots, install kernels.
 //!
-//! Every destructive step goes through [`Step::exec`], which honours
+//! Every destructive step goes through `exec`, which honours
 //! [`Config::dry_run`]: in dry-run mode commands are logged but not executed, so
 //! the whole flow can be exercised safely on a development host.
 //!

@@ -539,12 +539,9 @@ fn short(hash: &str) -> String {
 /// list rather than a rootfs build's.
 pub(crate) fn parse_pack(fname: &str) -> Option<(String, String, bool)> {
     let stem = fname.strip_suffix(".zst")?;
-    let (rest, is_inc) = if let Some(r) = stem.strip_suffix("_stock_inc_pack") {
-        (r, true)
-    } else if let Some(r) = stem.strip_suffix("_stock_pack") {
-        (r, false)
-    } else {
-        return None;
+    let (rest, is_inc) = match stem.strip_suffix("_stock_inc_pack") {
+        Some(r) => (r, true),
+        None => (stem.strip_suffix("_stock_pack")?, false),
     };
     // `rest` is `<Profile>_<build>`; strip the trailing `_<digits>`.
     let idx = rest.rfind('_')?;

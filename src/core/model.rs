@@ -662,9 +662,10 @@ pub struct Selection {
 }
 
 /// High-level state machine of the installer.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Phase {
     /// Probing hardware and sources.
+    #[default]
     Discovering,
     /// Idle, waiting for the operator to make selections.
     Ready,
@@ -676,12 +677,6 @@ pub enum Phase {
     Done,
     /// Installation aborted with an error.
     Failed(String),
-}
-
-impl Default for Phase {
-    fn default() -> Self {
-        Phase::Discovering
-    }
 }
 
 impl Phase {
