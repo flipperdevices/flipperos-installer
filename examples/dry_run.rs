@@ -86,6 +86,22 @@ fn main() {
             .map(|b| format!("{} ({})", b.label, b.image_location))
             .unwrap_or_else(|| "(none)".to_string())
     );
+    // Both only ever reach a UFS target, so they are printed even when this host
+    // has none: what they show is which build the selection resolved to.
+    println!(
+        "  menu    : {}",
+        state
+            .selected_boot_menu()
+            .map(|m| m.location)
+            .unwrap_or_else(|| "(none)".to_string())
+    );
+    println!(
+        "  recovery: {}",
+        state
+            .selected_recovery()
+            .map(|r| r.location)
+            .unwrap_or_else(|| "(none)".to_string())
+    );
     println!(
         "  rootfs  : {}",
         state
