@@ -18,7 +18,9 @@ pub type Result<T> = std::result::Result<T, String>;
 pub const ARCHIVE_SUFFIX: &str = ".tar.zst";
 
 /// Open an archive for sequential reading.
-fn entries(archive: &str) -> Result<tar::Archive<zstd::stream::read::Decoder<'static, io::BufReader<fs::File>>>> {
+fn entries(
+    archive: &str,
+) -> Result<tar::Archive<zstd::stream::read::Decoder<'static, io::BufReader<fs::File>>>> {
     let file = fs::File::open(archive).map_err(|e| format!("open {archive}: {e}"))?;
     let decoder =
         zstd::stream::read::Decoder::new(file).map_err(|e| format!("zstd {archive}: {e}"))?;
@@ -61,9 +63,7 @@ fn inner_path(path: &Path) -> Option<PathBuf> {
 /// listing candidate bundles found on removable media.
 pub fn read_manifest(archive: &str) -> Result<Vec<u8>> {
     let mut ar = entries(archive)?;
-    let iter = ar
-        .entries()
-        .map_err(|e| format!("read {archive}: {e}"))?;
+    let iter = ar.entries().map_err(|e| format!("read {archive}: {e}"))?;
     for entry in iter {
         let mut entry = entry.map_err(|e| format!("read {archive}: {e}"))?;
         let path = entry
@@ -109,8 +109,7 @@ pub fn unpack(archive: &str, dest: &str, on_progress: &mut dyn FnMut(u64)) -> Re
         };
         let out_path = Path::new(dest).join(&rel);
         if let Some(parent) = out_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("create {}: {e}", parent.display()))?;
+            fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
         }
         let mut out = fs::File::create(&out_path)
             .map_err(|e| format!("create {}: {e}", out_path.display()))?;
@@ -167,7 +166,10 @@ mod tests {
             let mut builder = tar::Builder::new(&mut tar_bytes);
             let members: [(&str, &[u8]); 4] = [
                 ("bundle-1/manifest.json", br#"{"schema":1}"#),
-                ("bundle-1/profile-packs/Desktop_9_stock_inc_pack.zst", b"inc"),
+                (
+                    "bundle-1/profile-packs/Desktop_9_stock_inc_pack.zst",
+                    b"inc",
+                ),
                 ("bundle-1/profile-packs/Minimal_9_stock_pack.zst", b"full"),
                 ("bundle-1/u-boot/flipper-one/u-boot-rockchip.bin", b"uboot"),
             ];
@@ -221,7 +223,9 @@ mod tests {
             fs::read(dest.join("profile-packs/Desktop_9_stock_inc_pack.zst")).unwrap(),
             b"inc"
         );
-        assert!(dest.join("u-boot/flipper-one/u-boot-rockchip.bin").is_file());
+        assert!(dest
+            .join("u-boot/flipper-one/u-boot-rockchip.bin")
+            .is_file());
         // Progress reported the uncompressed total.
         assert_eq!(seen, (br#"{"schema":1}"#.len() + 3 + 4 + 5) as u64);
         let _ = fs::remove_dir_all(&dir);
@@ -248,7 +252,9 @@ mod tests {
             header.set_size(1);
             header.set_mode(0o644);
             header.set_cksum();
-            builder.append_data(&mut header, "x/other.txt", &b"z"[..]).unwrap();
+            builder
+                .append_data(&mut header, "x/other.txt", &b"z"[..])
+                .unwrap();
             builder.finish().unwrap();
         }
         let path = dir.join("bad.tar.zst");
@@ -260,7 +266,10 @@ mod tests {
 
     #[test]
     fn refuses_paths_that_escape() {
-        assert_eq!(inner_path(Path::new("b/a.txt")).unwrap(), Path::new("a.txt"));
+        assert_eq!(
+            inner_path(Path::new("b/a.txt")).unwrap(),
+            Path::new("a.txt")
+        );
         assert_eq!(inner_path(Path::new("b/")), None);
         assert_eq!(inner_path(Path::new("b/../../etc/passwd")), None);
         assert_eq!(inner_path(Path::new("/etc/passwd")), None);

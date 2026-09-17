@@ -20,9 +20,7 @@ use cursive::style::Effect;
 use cursive::traits::{Nameable, Resizable, Scrollable};
 use cursive::utils::markup::StyledString;
 use cursive::view::ScrollStrategy;
-use cursive::views::{
-    Button, Dialog, LinearLayout, OnEventView, Panel, SelectView, TextView,
-};
+use cursive::views::{Button, Dialog, LinearLayout, OnEventView, Panel, SelectView, TextView};
 use cursive::Cursive;
 
 use crate::core::menu::{self, DetailsTarget, Level, Marker, Nav};
@@ -313,7 +311,12 @@ fn fill_status(ll: &mut LinearLayout) {
     clear_layout(ll);
     ll.add_child(TextView::new("").with_name("status"));
     ll.add_child(TextView::new("\nActivity:"));
-    ll.add_child(TextView::new("").with_name("log").scrollable().full_height());
+    ll.add_child(
+        TextView::new("")
+            .with_name("log")
+            .scrollable()
+            .full_height(),
+    );
 }
 
 // --- level rendering -------------------------------------------------------
@@ -476,7 +479,11 @@ fn sync_prompt(siv: &mut Cursive, state: &AppState) {
 
 /// Progress-bar + phase header line shown at the top of the install pane.
 fn install_status(state: &AppState) -> String {
-    format!("Phase : {}\n{}", state.phase.label(), progress_bar(state.progress))
+    format!(
+        "Phase : {}\n{}",
+        state.phase.label(),
+        progress_bar(state.progress)
+    )
 }
 
 /// Fill the details pane with the install view: progress header + a log that
@@ -497,7 +504,10 @@ fn fill_install(ll: &mut LinearLayout) {
 /// Switch the details pane to the install view (closing any open level), once,
 /// when installation starts.
 fn ensure_install_pane(siv: &mut Cursive) {
-    if siv.call_on_name("inst_bar", |_: &mut TextView| ()).is_some() {
+    if siv
+        .call_on_name("inst_bar", |_: &mut TextView| ())
+        .is_some()
+    {
         return; // already showing it
     }
     if nav(siv).depth() > 0 {
@@ -547,18 +557,30 @@ fn render(siv: &mut Cursive, state: &AppState) {
     // Once installation starts, the details pane becomes a dedicated install
     // view: a progress bar plus the auto-scrolling activity log. It stays up
     // through Done/Failed so the outcome (and any error) remain visible.
-    if matches!(state.phase, Phase::Installing | Phase::Done | Phase::Failed(_)) {
+    if matches!(
+        state.phase,
+        Phase::Installing | Phase::Done | Phase::Failed(_)
+    ) {
         ensure_install_pane(siv);
-        siv.call_on_name("inst_bar", |v: &mut TextView| v.set_content(install_status(state)));
-        siv.call_on_name("inst_log", |v: &mut TextView| v.set_content(tail.join("\n")));
+        siv.call_on_name("inst_bar", |v: &mut TextView| {
+            v.set_content(install_status(state))
+        });
+        siv.call_on_name("inst_log", |v: &mut TextView| {
+            v.set_content(tail.join("\n"))
+        });
         return;
     }
 
     // Not installing: restore the status pane if the install view was showing.
-    if siv.call_on_name("inst_bar", |_: &mut TextView| ()).is_some() {
+    if siv
+        .call_on_name("inst_bar", |_: &mut TextView| ())
+        .is_some()
+    {
         siv.call_on_name("detail", |ll: &mut LinearLayout| fill_status(ll));
     }
-    siv.call_on_name("status", |v: &mut TextView| v.set_content(render_status(state)));
+    siv.call_on_name("status", |v: &mut TextView| {
+        v.set_content(render_status(state))
+    });
     siv.call_on_name("log", |v: &mut TextView| v.set_content(tail.join("\n")));
 
     // Rebuild the open level's list only when what it renders changed. The
@@ -601,7 +623,9 @@ fn render(siv: &mut Cursive, state: &AppState) {
     }
 
     // Keep an open details popup in sync as its sourcestamps arrive.
-    let target = siv.user_data::<TuiData>().and_then(|d| d.detail.borrow().clone());
+    let target = siv
+        .user_data::<TuiData>()
+        .and_then(|d| d.detail.borrow().clone());
     if let Some(target) = target {
         let (_, text) = menu::details_text(state, &target);
         siv.call_on_name("details", |v: &mut TextView| v.set_content(text));
@@ -679,9 +703,7 @@ fn render_status(state: &AppState) -> String {
         .selected_uboot()
         .map(|b| b.summary())
         .unwrap_or_else(|| "—".to_string());
-    let boot_menu = state
-        .boot_menu_summary()
-        .unwrap_or_else(|| "—".to_string());
+    let boot_menu = state.boot_menu_summary().unwrap_or_else(|| "—".to_string());
     let build = state
         .selected_build()
         .map(|b| b.summary())
@@ -690,7 +712,12 @@ fn render_status(state: &AppState) -> String {
     profiles.extend(state.selection.profiles.iter().cloned());
     let bar = progress_bar(state.progress);
     let source = match &state.bundle {
-        Some(b) => format!("{} {} ({})", b.channel, b.version, b.reference.source.label()),
+        Some(b) => format!(
+            "{} {} ({})",
+            b.channel,
+            b.version,
+            b.reference.source.label()
+        ),
         None => match &state.bundle_error {
             Some(e) => format!("unavailable — {e}"),
             None => state.source_label(),

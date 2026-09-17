@@ -234,10 +234,7 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
     let state = ctrl.snapshot();
     let cfg = ctrl.config();
 
-    let device = state
-        .target()
-        .cloned()
-        .ok_or("no target device selected")?;
+    let device = state.target().cloned().ok_or("no target device selected")?;
     let mut uboot = state
         .selected_uboot()
         .cloned()
@@ -401,7 +398,11 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
     // 1. Wipe.
     ticker.begin(ctrl, &format!("blkdiscard {}", device.path));
     wait_for_exclusive_access(cfg, ctrl, &device.path);
-    exec(cfg, ctrl, Command::new("blkdiscard").arg("-f").arg(&device.path))?;
+    exec(
+        cfg,
+        ctrl,
+        Command::new("blkdiscard").arg("-f").arg(&device.path),
+    )?;
 
     // 2. Partition.
     ticker.begin(ctrl, "writing GPT");
@@ -583,7 +584,13 @@ fn deploy_profile(
     receive_pack(cfg, ctrl, &stock_dir, pack, &what, policy, &mut on_progress)?;
 
     ticker.begin(ctrl, &format!("snapshotting {}", profile.root_subvol()));
-    make_writable_snapshot(cfg, ctrl, mnt, &profile.stock_subvol(), &profile.root_subvol())?;
+    make_writable_snapshot(
+        cfg,
+        ctrl,
+        mnt,
+        &profile.stock_subvol(),
+        &profile.root_subvol(),
+    )?;
 
     ticker.begin(ctrl, &format!("installing kernel for {}", profile.name));
     install_kernel(
@@ -751,7 +758,12 @@ fn refuse_unless_dry_run(cfg: &Config, ctrl: &Controller, reason: String) -> Res
 /// (`/dev/mmcblk0`, 3 -> `/dev/mmcblk0p3`; `/dev/sda`, 3 -> `/dev/sda3`).
 fn partition_path(disk: &str, index: u32) -> String {
     let name = disk.trim_start_matches("/dev/");
-    if name.chars().last().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+    if name
+        .chars()
+        .last()
+        .map(|c| c.is_ascii_digit())
+        .unwrap_or(false)
+    {
         format!("{disk}p{index}")
     } else {
         format!("{disk}{index}")
@@ -772,8 +784,9 @@ fn write_gpt(
     // the device's *native* sector size (512 on eMMC/SD, 4096 on UFS). The
     // crate only knows 512 and 4096, so anything else is an error rather than a
     // silent fall-back to a wrong size.
-    let lb_size = gpt::disk::LogicalBlockSize::try_from(sector_size)
-        .map_err(|_| format!("{disk}: unsupported logical block size {sector_size} (must be 512 or 4096)"))?;
+    let lb_size = gpt::disk::LogicalBlockSize::try_from(sector_size).map_err(|_| {
+        format!("{disk}: unsupported logical block size {sector_size} (must be 512 or 4096)")
+    })?;
     let s = sector_size;
     let loader_first = LOADER_START / s;
     let metadata_first = METADATA_START / s;
@@ -874,7 +887,9 @@ fn write_gpt(
         .update_partitions(parts)
         .map_err(|e| format!("set partitions on {disk}: {e}"))?;
 
-    let dev = gdisk.write().map_err(|e| format!("write GPT to {disk}: {e}"))?;
+    let dev = gdisk
+        .write()
+        .map_err(|e| format!("write GPT to {disk}: {e}"))?;
     dev.sync_all().map_err(|e| format!("sync {disk}: {e}"))?;
     drop(dev);
 
@@ -1113,7 +1128,10 @@ fn activate_boot_lu(cfg: &Config, ctrl: &Controller, disk: &str, id: u8) -> Resu
             ufs::boot_lu_name(id)
         ));
     }
-    ctrl.log(format!("active UFS boot LU switched to {}", ufs::boot_lu_name(id)));
+    ctrl.log(format!(
+        "active UFS boot LU switched to {}",
+        ufs::boot_lu_name(id)
+    ));
     Ok(())
 }
 
@@ -1156,7 +1174,12 @@ fn receive_pack(
     let mut recv = Command::new("btrfs");
     recv.arg("receive").arg(target);
     pump_reader_into(ctrl, decoder, recv, &pack.location)?;
-    apply_verdict(ctrl, what, fetch::verify(sha, pack.sha256.as_deref()), policy)
+    apply_verdict(
+        ctrl,
+        what,
+        fetch::verify(sha, pack.sha256.as_deref()),
+        policy,
+    )
 }
 
 fn make_writable_snapshot(
@@ -1301,7 +1324,9 @@ fn install_kernel(
             .arg(&root),
     )?;
 
-    ctrl.log(format!("installing kernels for {profile_name} (chroot {root})"));
+    ctrl.log(format!(
+        "installing kernels for {profile_name} (chroot {root})"
+    ));
     // Feed the embedded script to `sh` on stdin (`-s`) rather than staging a
     // temp file, which avoids needing a writable/executable scratch path.
     // Positional args after `-s` become $1/$2/$3 inside the script.
@@ -1343,7 +1368,9 @@ fn release_own_mounts(cfg: &Config, ctrl: &Controller) {
         if mountpoints_under(mnt).is_empty() {
             continue;
         }
-        ctrl.log(format!("clearing stale mount at {mnt} from an earlier attempt"));
+        ctrl.log(format!(
+            "clearing stale mount at {mnt} from an earlier attempt"
+        ));
         if let Err(e) = umount_recursive(cfg, ctrl, mnt) {
             ctrl.log(format!("warning: could not clear {mnt}: {e}"));
         }
@@ -1407,7 +1434,10 @@ const O_EXCL: i32 = 0o200;
 /// Try to open `disk` with an exclusive claim, the same way the wipe will.
 fn claim_exclusively(disk: &str) -> io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
-    OpenOptions::new().read(true).custom_flags(O_EXCL).open(disk)
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(O_EXCL)
+        .open(disk)
 }
 
 /// Recursively unmount `target` and everything mounted beneath it, deepest
@@ -1535,14 +1565,20 @@ fn drain_child(ctrl: &Controller, child: &mut std::process::Child) {
     std::thread::scope(|s| {
         if let Some(out) = stdout {
             s.spawn(|| {
-                for line in BufReader::new(out).lines().map_while(std::result::Result::ok) {
+                for line in BufReader::new(out)
+                    .lines()
+                    .map_while(std::result::Result::ok)
+                {
                     ctrl.log(line);
                 }
             });
         }
         if let Some(err) = stderr {
             s.spawn(|| {
-                for line in BufReader::new(err).lines().map_while(std::result::Result::ok) {
+                for line in BufReader::new(err)
+                    .lines()
+                    .map_while(std::result::Result::ok)
+                {
                     ctrl.log(line);
                 }
             });
@@ -1584,7 +1620,9 @@ fn write_source_to_offset(
         ));
         return Ok(true);
     }
-    ctrl.log(format!("writing {location} -> {device} @ offset {offset} B"));
+    ctrl.log(format!(
+        "writing {location} -> {device} @ offset {offset} B"
+    ));
 
     let mut sha = fetch::Sha256::new();
     let mut reader = fetch::Digesting {
@@ -1599,8 +1637,7 @@ fn write_source_to_offset(
         .map_err(|e| format!("seek {device} to {offset}: {e}"))?;
     let written = io::copy(&mut reader, &mut file)
         .map_err(|e| format!("write {location} to {device}: {e}"))?;
-    file.sync_all()
-        .map_err(|e| format!("sync {device}: {e}"))?;
+    file.sync_all().map_err(|e| format!("sync {device}: {e}"))?;
     ctrl.log(format!("wrote {written} bytes to {device}"));
     drop(reader);
     let verdict = fetch::verify(sha, expect);
@@ -1635,14 +1672,20 @@ fn pump_reader_into(
         use std::io::{BufRead, BufReader};
         if let Some(out) = stdout {
             s.spawn(|| {
-                for line in BufReader::new(out).lines().map_while(std::result::Result::ok) {
+                for line in BufReader::new(out)
+                    .lines()
+                    .map_while(std::result::Result::ok)
+                {
                     ctrl.log(line);
                 }
             });
         }
         if let Some(err) = stderr {
             s.spawn(|| {
-                for line in BufReader::new(err).lines().map_while(std::result::Result::ok) {
+                for line in BufReader::new(err)
+                    .lines()
+                    .map_while(std::result::Result::ok)
+                {
                     ctrl.log(line);
                 }
             });

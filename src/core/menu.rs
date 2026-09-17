@@ -61,7 +61,10 @@ pub enum Action {
     PickSnapshot(String),
     PickBundle(String),
     PickFetch(FetchMode),
-    ToggleProfile { name: String, on: bool },
+    ToggleProfile {
+        name: String,
+        on: bool,
+    },
     ToggleAllProfiles(bool),
     StartInstall,
     /// Offer to rewrite a UFS target's logical units to the Flipper scheme.
@@ -416,16 +419,13 @@ fn root(state: &AppState) -> Level {
     };
 
     let mut items = vec![
-        MenuItem::plain("Source", Action::Open(MenuKey::Source))
-            .with_detail(state.source_label()),
+        MenuItem::plain("Source", Action::Open(MenuKey::Source)).with_detail(state.source_label()),
         MenuItem::plain("Device", Action::Open(MenuKey::Device))
             .with_detail(device.clone().unwrap_or_else(|| "(select)".to_string())),
-        MenuItem::plain("Profiles", Action::Open(MenuKey::Profiles))
-            .with_detail(profiles_value),
+        MenuItem::plain("Profiles", Action::Open(MenuKey::Profiles)).with_detail(profiles_value),
         MenuItem::plain("Fetch", Action::Open(MenuKey::Fetch))
             .with_detail(state.selection.fetch.label()),
-        MenuItem::plain("Install", Action::StartInstall)
-            .with_detail(state.install_status_label()),
+        MenuItem::plain("Install", Action::StartInstall).with_detail(state.install_status_label()),
     ];
     // Dim a value that is still a placeholder, and the Install row until it can
     // actually run (but not while a run is in progress).
@@ -434,7 +434,12 @@ fn root(state: &AppState) -> Level {
     items[4].dim = !state.can_install() && !matches!(state.phase, Phase::Installing);
 
     debug_assert_eq!(items.len(), 5, "the summary screen fits exactly five rows");
-    let mut level = level_of(MenuKey::Root, "FlipperOS Installation", LevelKind::Menu, items);
+    let mut level = level_of(
+        MenuKey::Root,
+        "FlipperOS Installation",
+        LevelKind::Menu,
+        items,
+    );
     level.can_refresh = true;
     level
 }
@@ -776,7 +781,12 @@ fn device(state: &AppState) -> Level {
         items.push(item);
     }
 
-    let mut level = level_of(MenuKey::Device, "Target device", LevelKind::SinglePick, items);
+    let mut level = level_of(
+        MenuKey::Device,
+        "Target device",
+        LevelKind::SinglePick,
+        items,
+    );
     if level.items.is_empty() {
         level.items = vec![MenuItem::inert("(no targets found)")];
     }
@@ -803,15 +813,12 @@ fn profiles(state: &AppState) -> Level {
                     .iter()
                     .all(|p| state.selection.profiles.iter().any(|n| n == &p.name));
                 items.push(
-                    MenuItem::plain(
-                        "(all extra profiles)",
-                        Action::ToggleAllProfiles(!all_on),
-                    )
-                    .with_marker(if all_on {
-                        Marker::Checked
-                    } else {
-                        Marker::Unchecked
-                    }),
+                    MenuItem::plain("(all extra profiles)", Action::ToggleAllProfiles(!all_on))
+                        .with_marker(if all_on {
+                            Marker::Checked
+                        } else {
+                            Marker::Unchecked
+                        }),
                 );
             }
             for p in extras {
@@ -824,7 +831,11 @@ fn profiles(state: &AppState) -> Level {
                             on: !on,
                         },
                     )
-                    .with_marker(if on { Marker::Checked } else { Marker::Unchecked })
+                    .with_marker(if on {
+                        Marker::Checked
+                    } else {
+                        Marker::Unchecked
+                    })
                     .with_detail(pack_size(p)),
                 );
             }
@@ -844,9 +855,12 @@ fn pack_size(p: &ProfilePack) -> String {
 fn fetch(state: &AppState) -> Level {
     let current = state.selection.fetch;
     let items = vec![
-        MenuItem::plain("Download & verify", Action::PickFetch(FetchMode::VerifyFirst))
-            .with_detail("check before writing")
-            .selected_if(current == FetchMode::VerifyFirst),
+        MenuItem::plain(
+            "Download & verify",
+            Action::PickFetch(FetchMode::VerifyFirst),
+        )
+        .with_detail("check before writing")
+        .selected_if(current == FetchMode::VerifyFirst),
         MenuItem::plain("Stream", Action::PickFetch(FetchMode::Stream))
             .with_detail("check while writing")
             .selected_if(current == FetchMode::Stream),
@@ -1135,7 +1149,10 @@ mod tests {
 
         let custom = build(&MenuKey::Custom, &s);
         let labels: Vec<&str> = custom.items.iter().map(|i| i.text.as_str()).collect();
-        assert_eq!(labels, ["U-Boot build", "Boot menu build", "Snapshot build"]);
+        assert_eq!(
+            labels,
+            ["U-Boot build", "Boot menu build", "Snapshot build"]
+        );
         assert_eq!(custom.items[1].detail, "bootmenu d31d718");
 
         let level = build(&MenuKey::BootMenu, &s);
@@ -1146,7 +1163,10 @@ mod tests {
             level.items[0].on_focus,
             Some(LoadRequest::BootMenuContents("m".into()))
         );
-        assert_eq!(level.details_at(0), Some(DetailsTarget::BootMenu("m".into())));
+        assert_eq!(
+            level.details_at(0),
+            Some(DetailsTarget::BootMenu("m".into()))
+        );
 
         // An origin publishing no listing still opens the level, just empty.
         s.boot_menu_builds.clear();
@@ -1240,7 +1260,11 @@ mod tests {
         s.catalog = Arc::new(catalog);
         let level = build(&MenuKey::Builds("nightly".into()), &s);
         assert!(!level.loading, "a failure must not look like progress");
-        assert!(level.items[0].text.contains("failed"), "{:?}", level.items[0]);
+        assert!(
+            level.items[0].text.contains("failed"),
+            "{:?}",
+            level.items[0]
+        );
     }
 
     #[test]
@@ -1363,7 +1387,10 @@ mod tests {
             "Release candidate"
         );
         // A dev branch name is not a slug: its hyphens stay.
-        assert_eq!(crumb("dev/alchark/fix-ufs"), "Dev \u{203a} Alchark \u{203a} Fix-ufs");
+        assert_eq!(
+            crumb("dev/alchark/fix-ufs"),
+            "Dev \u{203a} Alchark \u{203a} Fix-ufs"
+        );
     }
 
     #[test]
@@ -1411,7 +1438,10 @@ mod tests {
         let level = build(&MenuKey::Profiles, &s);
         assert_eq!(level.kind, LevelKind::MultiPick);
         let labels: Vec<&str> = level.items.iter().map(|i| i.text.as_str()).collect();
-        assert_eq!(labels, ["Minimal (always)", "(all extra profiles)", "Desktop"]);
+        assert_eq!(
+            labels,
+            ["Minimal (always)", "(all extra profiles)", "Desktop"]
+        );
         // Minimal cannot be toggled off.
         assert_eq!(level.items[0].action, Action::Inert);
         assert_eq!(level.items[0].marker, Marker::Checked);
@@ -1435,10 +1465,7 @@ mod tests {
         assert!(level.items[0].selected);
         assert_eq!(level.items[0].marker, Marker::None);
         assert_eq!(level.preferred_cursor, Some(0));
-        assert_eq!(
-            level.items[1].action,
-            Action::PickFetch(FetchMode::Stream)
-        );
+        assert_eq!(level.items[1].action, Action::PickFetch(FetchMode::Stream));
     }
 
     #[test]

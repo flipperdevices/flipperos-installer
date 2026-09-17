@@ -153,4 +153,3 @@ mod tests {
         assert_eq!(varlog.nodatacow, vec!["journal".to_string()]);
     }
 }
-

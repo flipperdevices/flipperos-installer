@@ -822,7 +822,13 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            ["Minimal", "Desktop", "No-Graphics", "Router", "TV-Media-Box"]
+            [
+                "Minimal",
+                "Desktop",
+                "No-Graphics",
+                "Router",
+                "TV-Media-Box"
+            ]
         );
 
         // The profile build number comes from the pack filename (the rootfs
@@ -900,8 +906,7 @@ mod tests {
             .retain(|f| !f.path.starts_with("u-boot/generic/"));
         let repo = repo();
         let reference = remote_ref(&repo, "nightly", "x");
-        let err =
-            resolve(&reference, &reference.location, &manifest, "unknown-board").unwrap_err();
+        let err = resolve(&reference, &reference.location, &manifest, "unknown-board").unwrap_err();
         assert!(err.contains("ships no u-boot/generic/"), "{err}");
     }
 

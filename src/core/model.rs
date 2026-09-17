@@ -220,7 +220,12 @@ impl UbootBuild {
     }
 
     pub fn summary(&self) -> String {
-        format!("{} ({}, {})", self.display_name(), human_time(&self.mtime), self.source.label())
+        format!(
+            "{} ({}, {})",
+            self.display_name(),
+            human_time(&self.mtime),
+            self.source.label()
+        )
     }
 
     /// Multi-line details for the info popup, or a loading placeholder.
@@ -274,7 +279,12 @@ impl FalconBuild {
     }
 
     pub fn summary(&self) -> String {
-        format!("{} ({}, {})", self.display_name(), human_time(&self.mtime), self.source.label())
+        format!(
+            "{} ({}, {})",
+            self.display_name(),
+            human_time(&self.mtime),
+            self.source.label()
+        )
     }
 
     /// Multi-line details for the info popup, or a loading placeholder.
@@ -395,7 +405,12 @@ impl SnapshotBuild {
     }
 
     pub fn summary(&self) -> String {
-        format!("{} ({}, {})", self.display_name(), human_time(&self.mtime), self.source.label())
+        format!(
+            "{} ({}, {})",
+            self.display_name(),
+            human_time(&self.mtime),
+            self.source.label()
+        )
     }
 
     /// Multi-line details for the info popup, or a loading placeholder.
@@ -434,7 +449,11 @@ impl BundleLocation {
             BundleLocation::Remote { base } => base,
             BundleLocation::Dir { root } => root,
         };
-        format!("{}/{}", base.trim_end_matches('/'), rel.trim_start_matches('/'))
+        format!(
+            "{}/{}",
+            base.trim_end_matches('/'),
+            rel.trim_start_matches('/')
+        )
     }
 
     /// Location of the bundle's `manifest.json`.
@@ -1060,6 +1079,11 @@ mod tests {
             loaded: false,
         };
         assert!(build.image().is_none());
-        assert!(FalconBuild { loaded: true, ..build }.image().is_some());
+        assert!(FalconBuild {
+            loaded: true,
+            ..build
+        }
+        .image()
+        .is_some());
     }
 }

@@ -225,9 +225,7 @@ fn parse_args() -> Result<Option<Args>, String> {
             "--dry-run" => config.dry_run = true,
             "--no-dry-run" => config.dry_run = false,
             "--server" => {
-                config.server_url = iter
-                    .next()
-                    .ok_or("--server requires a URL argument")?;
+                config.server_url = iter.next().ok_or("--server requires a URL argument")?;
             }
             "--bundle-bucket" => {
                 config.bundle_bucket = iter
@@ -235,9 +233,8 @@ fn parse_args() -> Result<Option<Args>, String> {
                     .ok_or("--bundle-bucket requires a bucket name")?;
             }
             "--bundle-url" => {
-                config.bundle_base_url = iter
-                    .next()
-                    .ok_or("--bundle-url requires a URL argument")?;
+                config.bundle_base_url =
+                    iter.next().ok_or("--bundle-url requires a URL argument")?;
             }
             "--bundle-list-url" => {
                 config.bundle_list_url =
@@ -270,16 +267,12 @@ fn parse_args() -> Result<Option<Args>, String> {
                 };
             }
             "--cache-dir" => {
-                config.cache_dir = iter
-                    .next()
-                    .ok_or("--cache-dir requires a path argument")?;
+                config.cache_dir = iter.next().ok_or("--cache-dir requires a path argument")?;
             }
             "--keep-cache" => config.keep_cache = true,
             "--no-automount" => config.automount = false,
             "--kms-device" => {
-                config.kms_device = iter
-                    .next()
-                    .ok_or("--kms-device requires a path argument")?;
+                config.kms_device = iter.next().ok_or("--kms-device requires a path argument")?;
             }
             "--debug-keys" => config.debug_keys = true,
             "--no-ufs-check" => config.ufs_check = false,

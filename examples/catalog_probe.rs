@@ -12,7 +12,10 @@ fn main() {
     };
 
     let types = catalog::supported_device_types(&origin);
-    println!("== Supported device types (latest U-Boot manifest): {} ==", types.len());
+    println!(
+        "== Supported device types (latest U-Boot manifest): {} ==",
+        types.len()
+    );
     println!("  {}", types.join(", "));
 
     let uboot = catalog::uboot_builds(&origin, "flipper-one", 5);

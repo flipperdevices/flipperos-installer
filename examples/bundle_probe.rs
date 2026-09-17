@@ -119,12 +119,22 @@ fn print_bundle(b: &flipperos_installer::core::model::SelectedBundle) {
     println!("  build   : {}", b.build.display_name());
     println!("  archive : {}", b.archive);
     println!("  boards  : {}", b.device_types.join(", "));
-    println!("  u-boot  : {} ({})", b.uboot.image_location, human_bytes(b.uboot.size_bytes));
-    println!("            sha256 {}", b.uboot.sha256.as_deref().unwrap_or("(none)"));
+    println!(
+        "  u-boot  : {} ({})",
+        b.uboot.image_location,
+        human_bytes(b.uboot.size_bytes)
+    );
+    println!(
+        "            sha256 {}",
+        b.uboot.sha256.as_deref().unwrap_or("(none)")
+    );
     match &b.boot_menu {
         Some(m) => {
             println!("  menu    : {} ({})", m.location, human_bytes(m.size_bytes));
-            println!("            sha256 {}", m.sha256.as_deref().unwrap_or("(none)"));
+            println!(
+                "            sha256 {}",
+                m.sha256.as_deref().unwrap_or("(none)")
+            );
         }
         None => println!("  menu    : (none)"),
     }
@@ -143,11 +153,7 @@ fn print_bundle(b: &flipperos_installer::core::model::SelectedBundle) {
         }
     }
     match &b.build.home_pack {
-        Some(h) => println!(
-            "  /home   : {} ({})",
-            h.location,
-            human_bytes(h.size_bytes)
-        ),
+        Some(h) => println!("  /home   : {} ({})", h.location, human_bytes(h.size_bytes)),
         None => println!("  /home   : (no seed)"),
     }
 }

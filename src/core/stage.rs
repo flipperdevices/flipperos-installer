@@ -322,13 +322,7 @@ pub(crate) fn unpack_bundle(
     ensure_space(&cfg.cache_dir, estimate, "unpack the bundle archive")?;
 
     let (base, span) = ticker.step_span();
-    let mut on_progress = receive_progress(
-        ctrl,
-        format!("unpacking {path}"),
-        base,
-        span,
-        estimate,
-    );
+    let mut on_progress = receive_progress(ctrl, format!("unpacking {path}"), base, span, estimate);
     let written = crate::core::bundle::unpack(reference, &mut on_progress)?;
     ctrl.log(format!(
         "unpacked {} into {}",
@@ -421,10 +415,9 @@ pub(crate) fn run(
             fetch::verify(sha, a.sha256.as_deref()),
             OnMismatch::Fail,
         )?;
-        staged.map.push((
-            a.location.clone(),
-            dest.to_string_lossy().into_owned(),
-        ));
+        staged
+            .map
+            .push((a.location.clone(), dest.to_string_lossy().into_owned()));
     }
 
     ctrl.log("all artifacts verified; starting the install".to_string());
@@ -551,7 +544,12 @@ mod tests {
         let labels: Vec<&str> = p.iter().map(|a| a.label.as_str()).collect();
         assert_eq!(
             labels,
-            ["u-boot image", "/home seed", "Minimal (full)", "Desktop (incremental)"]
+            [
+                "u-boot image",
+                "/home seed",
+                "Minimal (full)",
+                "Desktop (incremental)"
+            ]
         );
         // Router was not selected, so it is never fetched.
         assert!(!p.iter().any(|a| a.label.starts_with("Router")));
@@ -572,7 +570,12 @@ mod tests {
         let labels: Vec<&str> = p.iter().map(|a| a.label.as_str()).collect();
         assert_eq!(
             labels,
-            ["u-boot image", "boot menu image", "/home seed", "Minimal (full)"]
+            [
+                "u-boot image",
+                "boot menu image",
+                "/home seed",
+                "Minimal (full)"
+            ]
         );
         assert_eq!(p[1].rel, "bootmenu-falcon.itb");
         assert_eq!(p[1].size, 99);
@@ -608,12 +611,27 @@ mod tests {
         staged.localise_build(&mut b);
 
         assert_eq!(u.image_location, "/run/cache/u-boot-rockchip.bin");
-        assert_eq!(u.source, Source::Local { root: "/run/cache".into() });
+        assert_eq!(
+            u.source,
+            Source::Local {
+                root: "/run/cache".into()
+            }
+        );
         assert_eq!(menu.location, "/run/cache/bootmenu-falcon.itb");
-        assert_eq!(menu.source, Source::Local { root: "/run/cache".into() });
+        assert_eq!(
+            menu.source,
+            Source::Local {
+                root: "/run/cache".into()
+            }
+        );
         let minimal = b.profiles[0].full.as_ref().unwrap();
         assert_eq!(minimal.location, "/run/cache/Minimal_9_stock_pack.zst");
-        assert_eq!(minimal.source, Source::Local { root: "/run/cache".into() });
+        assert_eq!(
+            minimal.source,
+            Source::Local {
+                root: "/run/cache".into()
+            }
+        );
         // Not staged (not in the map): left pointing at the server.
         let desktop = b.profiles[1].incremental.as_ref().unwrap();
         assert!(desktop.location.starts_with("https://"));
@@ -682,8 +700,18 @@ mod tests {
         let ctrl = controller(&cache);
 
         let plan = vec![
-            local_artifact(&src, "u-boot-rockchip.bin", b"loader bytes", Some(digest(b"loader bytes"))),
-            local_artifact(&src, "Minimal_9_stock_pack.zst", b"pack bytes", Some(digest(b"pack bytes"))),
+            local_artifact(
+                &src,
+                "u-boot-rockchip.bin",
+                b"loader bytes",
+                Some(digest(b"loader bytes")),
+            ),
+            local_artifact(
+                &src,
+                "Minimal_9_stock_pack.zst",
+                b"pack bytes",
+                Some(digest(b"pack bytes")),
+            ),
             // No digest published: staged anyway, with a warning.
             local_artifact(&src, "home_9_pack.zst", b"seed", None),
         ];
@@ -747,12 +775,24 @@ mod tests {
             automount: false,
             ..Config::default()
         });
-        let plan = vec![local_artifact(&src, "pack.zst", b"bytes", Some(digest(b"bytes")))];
+        let plan = vec![local_artifact(
+            &src,
+            "pack.zst",
+            b"bytes",
+            Some(digest(b"bytes")),
+        )];
 
         let mut ticker = Ticker::new(1);
         run(ctrl.config(), &ctrl, &plan, &mut ticker).expect("dry run succeeds");
-        assert!(!cache.path("pack.zst").exists(), "a dry run must not transfer");
-        assert!(ctrl.snapshot().log.join("\n").contains("[dry-run] would verify 1 artifact"));
+        assert!(
+            !cache.path("pack.zst").exists(),
+            "a dry run must not transfer"
+        );
+        assert!(ctrl
+            .snapshot()
+            .log
+            .join("\n")
+            .contains("[dry-run] would verify 1 artifact"));
     }
 
     #[test]
@@ -767,7 +807,9 @@ mod tests {
         // such mount present the guard is a no-op, which is what this asserts.
         if let Some(full) = b.profiles[0].full.as_mut() {
             full.location = "/mnt/sd/profile-packs/Minimal_9_stock_pack.zst".into();
-            full.source = Source::Local { root: "/mnt/sd".into() };
+            full.source = Source::Local {
+                root: "/mnt/sd".into(),
+            };
         }
         assert!(guard_not_on_target(&uboot(), None, &b, &[], disk).is_ok());
     }

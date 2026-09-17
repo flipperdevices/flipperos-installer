@@ -30,7 +30,9 @@ fn main() {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--bundle" => config.bundle_paths.push(args.next().expect("--bundle <path>")),
+            "--bundle" => config
+                .bundle_paths
+                .push(args.next().expect("--bundle <path>")),
             "--custom" => config.mode = InstallMode::Custom,
             "--stream" => config.fetch = FetchMode::Stream,
             "--profile" => profiles.push(args.next().expect("--profile <name>")),

@@ -108,7 +108,9 @@ fn open_sink(kms_device: &str) -> Result<KmsSink, String> {
                 .flatten()
                 .map(|e| e.path())
                 .filter(|p| {
-                    p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("card"))
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("card"))
                 })
                 .collect()
         })
@@ -155,7 +157,12 @@ impl Panel {
             }
         };
 
-        Ok(Self { sink, input, frame: Vec::new(), debug_keys })
+        Ok(Self {
+            sink,
+            input,
+            frame: Vec::new(),
+            debug_keys,
+        })
     }
 
     /// Drain every pending button event into `window`.
@@ -214,13 +221,21 @@ impl Panel {
         }
         let mut fds: Vec<libc::pollfd> = borrowed
             .iter()
-            .map(|fd| libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 })
+            .map(|fd| libc::pollfd {
+                fd: fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            })
             .collect();
         // Errors are deliberately ignored: EINTR and anything else just mean
         // this turn waited less than it meant to, and the loop copes with that
         // by design. Failing the UI over a poll(2) return code would not.
         unsafe {
-            libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, TICK.as_millis() as libc::c_int)
+            libc::poll(
+                fds.as_mut_ptr(),
+                fds.len() as libc::nfds_t,
+                TICK.as_millis() as libc::c_int,
+            )
         };
     }
 }
@@ -236,12 +251,18 @@ mod tests {
     fn navigation_keys_carry_slints_own_characters() {
         use slint::platform::Key as K;
 
-        assert_eq!(key_text(FlipperKey::Up).unwrap(), SharedString::from(char::from(K::UpArrow)));
+        assert_eq!(
+            key_text(FlipperKey::Up).unwrap(),
+            SharedString::from(char::from(K::UpArrow))
+        );
         assert_eq!(
             key_text(FlipperKey::Down).unwrap(),
             SharedString::from(char::from(K::DownArrow))
         );
-        assert_eq!(key_text(FlipperKey::Ok).unwrap(), SharedString::from(char::from(K::Return)));
+        assert_eq!(
+            key_text(FlipperKey::Ok).unwrap(),
+            SharedString::from(char::from(K::Return))
+        );
         assert_eq!(
             key_text(FlipperKey::Back).unwrap(),
             SharedString::from(char::from(K::Backspace))

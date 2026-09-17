@@ -103,9 +103,7 @@ pub fn build(ctrl: Arc<Controller>) -> Result<Gui, slint::PlatformError> {
     // callback is a no-op, so keypresses never reach stderr / the shared console.
     if ctrl.config().debug_keys {
         win.on_trace_key(|text, screen, menu, cursor| {
-            eprintln!(
-                "gui key: text=<{text}> screen={screen} menu={menu} cursor={cursor}"
-            );
+            eprintln!("gui key: text=<{text}> screen={screen} menu={menu} cursor={cursor}");
         });
     }
 
@@ -200,12 +198,7 @@ pub fn build(ctrl: Arc<Controller>) -> Result<Gui, slint::PlatformError> {
             let state = cache.lock().unwrap().clone();
             let nav_now = nav.lock().unwrap().clone();
             let level = menu::level(&nav_now, &state);
-            menu::on_visible(
-                &ctrl,
-                &level,
-                first.max(0) as usize,
-                count.max(0) as usize,
-            );
+            menu::on_visible(&ctrl, &level, first.max(0) as usize, count.max(0) as usize);
         });
     }
     {
@@ -285,7 +278,16 @@ pub fn run(ctrl: Arc<Controller>) -> Result<(), slint::PlatformError> {
 /// when Slint reports no damage, so an idle installer transmits nothing over
 /// SPI at all.
 pub fn run_window(gui: Gui) -> Result<(), slint::PlatformError> {
-    let Gui { window, surface, mut panel, snapshots, quit, cache, nav, detail_target } = gui;
+    let Gui {
+        window,
+        surface,
+        mut panel,
+        snapshots,
+        quit,
+        cache,
+        nav,
+        detail_target,
+    } = gui;
 
     // Nothing here calls `slint::platform::update_timers_and_animations`, and
     // nothing repaints on a clock: this UI has no `animate` blocks and starts no
@@ -314,7 +316,9 @@ pub fn run_window(gui: Gui) -> Result<(), slint::PlatformError> {
         if dirty {
             dirty = false;
             surface.request_redraw();
-            panel.present(&surface).map_err(slint::PlatformError::Other)?;
+            panel
+                .present(&surface)
+                .map_err(slint::PlatformError::Other)?;
         }
 
         panel.wait();
@@ -356,11 +360,9 @@ fn apply_snapshot(
 pub fn display_available() -> bool {
     std::fs::read_dir("/dev/dri")
         .map(|entries| {
-            entries.flatten().any(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with("card")
-            })
+            entries
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().starts_with("card"))
         })
         .unwrap_or(false)
 }
@@ -414,7 +416,10 @@ fn apply_details(win: &MainWindow, state: &AppState, target: &Option<DetailsTarg
         None => (String::new(), String::new()),
     };
     win.set_details_title(title.into());
-    let lines: Vec<SharedString> = wrap_lines(&text, 40).into_iter().map(SharedString::from).collect();
+    let lines: Vec<SharedString> = wrap_lines(&text, 40)
+        .into_iter()
+        .map(SharedString::from)
+        .collect();
     win.set_details_model(ModelRc::new(VecModel::from(lines)));
 }
 
@@ -496,7 +501,11 @@ fn apply(win: &MainWindow, state: &AppState) {
     // Header: "Device type: <model> [<id>]". The model is the device-tree human
     // string; the bracketed id is the device type we mapped it to.
     win.set_device_type_text(
-        format!("Device type: {} [{}]", state.board.model, state.board.board_id).into(),
+        format!(
+            "Device type: {} [{}]",
+            state.board.model, state.board.board_id
+        )
+        .into(),
     );
     win.set_progress(state.progress);
     win.set_can_install(state.can_install());

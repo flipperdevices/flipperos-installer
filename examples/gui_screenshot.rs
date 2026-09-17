@@ -49,15 +49,17 @@ type Row<'a> = (&'a str, &'a str, i32, i32, bool, bool, bool);
 fn rows(items: &[Row]) -> ModelRc<MenuEntry> {
     let v: Vec<MenuEntry> = items
         .iter()
-        .map(|(text, detail, icon, marker, drill, dim, action)| MenuEntry {
-            text: SharedString::from(*text),
-            detail: SharedString::from(*detail),
-            icon: *icon,
-            marker: *marker,
-            drill: *drill,
-            dim: *dim,
-            action: *action,
-        })
+        .map(
+            |(text, detail, icon, marker, drill, dim, action)| MenuEntry {
+                text: SharedString::from(*text),
+                detail: SharedString::from(*detail),
+                icon: *icon,
+                marker: *marker,
+                drill: *drill,
+                dim: *dim,
+                action: *action,
+            },
+        )
         .collect();
     ModelRc::new(VecModel::from(v))
 }
@@ -221,7 +223,15 @@ fn main() {
     ui.set_level_title("Fetch mode".into());
     ui.set_level_can_refresh(false);
     let fetch: [Row; 2] = [
-        ("Download & verify", "check before writing", 0, 3, false, false, false),
+        (
+            "Download & verify",
+            "check before writing",
+            0,
+            3,
+            false,
+            false,
+            false,
+        ),
         ("Stream", "check while writing", 0, 0, false, false, false),
     ];
     ui.set_level_items(rows(&fetch));
@@ -254,9 +264,33 @@ fn main() {
     ui.set_level_can_refresh(false);
     ui.set_level_can_details(true);
     let targets: [Row; 3] = [
-        ("/dev/sda [ufs] BWUFS256", "237.9 GiB", 0, 3, false, false, false),
-        ("! /dev/sdb [usb] SanDisk", "29.7 GiB", 2, 0, false, true, false),
-        ("Reprovision UFS\u{2026}", "unprovisioned", 0, 0, false, false, false),
+        (
+            "/dev/sda [ufs] BWUFS256",
+            "237.9 GiB",
+            0,
+            3,
+            false,
+            false,
+            false,
+        ),
+        (
+            "! /dev/sdb [usb] SanDisk",
+            "29.7 GiB",
+            2,
+            0,
+            false,
+            true,
+            false,
+        ),
+        (
+            "Reprovision UFS\u{2026}",
+            "unprovisioned",
+            0,
+            0,
+            false,
+            false,
+            false,
+        ),
     ];
     ui.set_level_items(rows(&targets));
     ui.set_cursor(2);
@@ -337,7 +371,12 @@ fn shoot(window: &Rc<MinimalSoftwareWindow>, name: &str) {
             big.push(p.blue);
         }
     }
-    write_png(&format!("target/screenshots/{name}@{SCALE}x.png"), out_w, out_h, &big);
+    write_png(
+        &format!("target/screenshots/{name}@{SCALE}x.png"),
+        out_w,
+        out_h,
+        &big,
+    );
     println!("  {name}.png ({W}x{H}) + @{SCALE}x");
 }
 

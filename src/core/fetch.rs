@@ -244,9 +244,9 @@ impl Verdict {
             Verdict::Unpublished => Some(format!(
                 "no sha256 published for {what}; verification skipped"
             )),
-            Verdict::Mismatch(got, want) => {
-                Some(format!("sha256 mismatch for {what}: got {got}, want {want}"))
-            }
+            Verdict::Mismatch(got, want) => Some(format!(
+                "sha256 mismatch for {what}: got {got}, want {want}"
+            )),
         }
     }
 }
@@ -311,7 +311,9 @@ mod tests {
         sha.update(b"abc");
         let v = verify(sha, Some("00"));
         assert!(matches!(v, Verdict::Mismatch(_, _)));
-        let msg = v.message("Minimal (full)").expect("a mismatch has a message");
+        let msg = v
+            .message("Minimal (full)")
+            .expect("a mismatch has a message");
         assert!(msg.contains("Minimal (full)"), "{msg}");
         assert!(msg.contains("ba7816bf"), "{msg}");
 

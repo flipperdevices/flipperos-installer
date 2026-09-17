@@ -630,11 +630,8 @@ impl Controller {
     fn load_local(&self) {
         self.begin_listing(|c| &mut c.local.state);
         let media = removable::media_roots();
-        let items = bundle::discover_local(
-            &self.config.bundle_paths,
-            &media,
-            &self.config.cache_dir,
-        );
+        let items =
+            bundle::discover_local(&self.config.bundle_paths, &media, &self.config.cache_dir);
         if !items.is_empty() {
             self.log(format!("{} local bundle(s) found", items.len()));
         }

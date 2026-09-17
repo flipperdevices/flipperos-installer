@@ -154,7 +154,14 @@ pub fn uboot_builds(origin: &Origin, board_dir: &str, limit: usize) -> Vec<Uboot
 /// (capped). The image size and digest are loaded lazily via
 /// [`load_boot_menu_contents`].
 pub fn boot_menu_builds(origin: &Origin, board_dir: &str, limit: usize) -> Vec<FalconBuild> {
-    falcon_builds(origin, BOOT_MENU_DIR, BOOT_MENU_IMAGE, "bootmenu", board_dir, limit)
+    falcon_builds(
+        origin,
+        BOOT_MENU_DIR,
+        BOOT_MENU_IMAGE,
+        "bootmenu",
+        board_dir,
+        limit,
+    )
 }
 
 /// The shared body of the Falcon image listings: same two-level layout as
@@ -611,7 +618,10 @@ mod tests {
         // Every Falcon build directory starts with the bootloader revisions it was
         // built against, so the label has to come off the segment that is its own.
         let dir = "u=36d78f6__rk=96f5243__bootmenu=d31d718__menu=fb7251d/";
-        assert_eq!(revision_label(dir, "bootmenu", "falcon"), "bootmenu d31d718");
+        assert_eq!(
+            revision_label(dir, "bootmenu", "falcon"),
+            "bootmenu d31d718"
+        );
         assert_eq!(revision_label("u=36d78f6/", "bootmenu", "falcon"), "falcon");
     }
 
@@ -647,34 +657,58 @@ mod tests {
     fn a_build_without_this_board_is_an_error() {
         let build = uboot("nanopi-m5");
         let err = uboot_contents(&manifest(), &build, "nanopi-m5").unwrap_err();
-        assert!(err.contains("lists no nanopi-m5/u-boot-rockchip.bin"), "{err}");
+        assert!(
+            err.contains("lists no nanopi-m5/u-boot-rockchip.bin"),
+            "{err}"
+        );
     }
 
     #[test]
     fn names_a_file_beside_another() {
-        assert_eq!(sibling_of("https://x.invalid/a/b/one.bin", "two.itb"), "https://x.invalid/a/b/two.itb");
+        assert_eq!(
+            sibling_of("https://x.invalid/a/b/one.bin", "two.itb"),
+            "https://x.invalid/a/b/two.itb"
+        );
         assert_eq!(sibling_of("/mnt/sd/one.bin", "two.itb"), "/mnt/sd/two.itb");
         assert_eq!(sibling_of("one.bin", "two.itb"), "two.itb");
     }
 
     #[test]
     fn parses_pack_names() {
-        assert_eq!(parse_pack("Minimal_688_stock_pack.zst"), Some(("Minimal".to_string(), "688".to_string(), false)));
-        assert_eq!(parse_pack("Desktop_688_stock_inc_pack.zst"), Some(("Desktop".to_string(), "688".to_string(), true)));
-        assert_eq!(parse_pack("TV-Media-Box_688_stock_inc_pack.zst"), Some(("TV-Media-Box".to_string(), "688".to_string(), true)));
-        assert_eq!(parse_pack("No-Graphics_688_stock_pack.zst"), Some(("No-Graphics".to_string(), "688".to_string(), false)));
+        assert_eq!(
+            parse_pack("Minimal_688_stock_pack.zst"),
+            Some(("Minimal".to_string(), "688".to_string(), false))
+        );
+        assert_eq!(
+            parse_pack("Desktop_688_stock_inc_pack.zst"),
+            Some(("Desktop".to_string(), "688".to_string(), true))
+        );
+        assert_eq!(
+            parse_pack("TV-Media-Box_688_stock_inc_pack.zst"),
+            Some(("TV-Media-Box".to_string(), "688".to_string(), true))
+        );
+        assert_eq!(
+            parse_pack("No-Graphics_688_stock_pack.zst"),
+            Some(("No-Graphics".to_string(), "688".to_string(), false))
+        );
         assert_eq!(parse_pack("debian-rootfs.img.zst"), None);
         assert_eq!(parse_pack("debian-rootfs.img.bmap"), None);
     }
 
     #[test]
     fn parses_home_pack_names() {
-        assert_eq!(parse_home_pack("home_688_pack.zst"), Some("688".to_string()));
+        assert_eq!(
+            parse_home_pack("home_688_pack.zst"),
+            Some("688".to_string())
+        );
         // Not a home seed: profile packs, missing build number, wrong suffix.
         assert_eq!(parse_home_pack("home_pack.zst"), None);
         assert_eq!(parse_home_pack("home_688_stock_pack.zst"), None);
         assert_eq!(parse_home_pack("Minimal_688_stock_pack.zst"), None);
         // A profile literally named "home" still parses as a profile, not a seed.
-        assert_eq!(parse_pack("home_688_stock_pack.zst"), Some(("home".to_string(), "688".to_string(), false)));
+        assert_eq!(
+            parse_pack("home_688_stock_pack.zst"),
+            Some(("home".to_string(), "688".to_string(), false))
+        );
     }
 }
