@@ -11,7 +11,8 @@
 //!      boot ROM is switched over to it once the image verifies; everywhere else
 //!      it goes to the reserved boot area at the start of the loader partition.
 //!      On UFS the Falcon boot menu then goes to that reserved area instead, the
-//!      bootloader having no need of it.
+//!      bootloader having no need of it, and the Falcon recovery system goes to
+//!      the logical unit provisioned for it.
 //!   4. `mkfs.btrfs` on the root partition and create the subvolume skeleton.
 //!   5. If the build ships a `/home` seed, `btrfs receive` it to a transient
 //!      base and snapshot a writable `@home` from it so /home starts populated.
@@ -57,6 +58,13 @@ const LOADER_CAPACITY: u64 = METADATA_START - LOADER_START;
 const LOADER_PART_INDEX: u32 = 1;
 /// The Btrfs root is the third partition.
 const ROOT_PART_INDEX: u32 = 3;
+
+/// The logical unit the Falcon recovery image is written to, as numbered by the
+/// provisioning scheme in `config/flipperos-ufs.toml` (`id = 3`, `name =
+/// "recovery"`). A device provisioned differently either has no such LU, which
+/// [`install_recovery`] warns about, or has one too small for the image, which
+/// [`guard_recovery_fits`] refuses before anything is erased.
+const RECOVERY_LU_ID: u32 = 3;
 
 /// Dedicated top-level directory that holds the read-only `*_stock` golden
 /// bases. The build scripts nest every received stock snapshot under it (see
@@ -252,13 +260,14 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
     if build.minimal().is_none() {
         return Err("snapshot build has no Minimal profile".to_string());
     }
-    // The boot menu goes to the loader partition, and only a UFS target has one to
-    // spare — everywhere else U-Boot itself occupies it. Resolving it only for UFS
-    // is what keeps it out of the staging plan too, so a non-UFS run never fetches
-    // an image it has nowhere to put.
-    let mut boot_menu = match device.kind {
-        StorageKind::Ufs => state.selected_boot_menu(),
-        _ => None,
+    // The boot menu goes to the loader partition and the recovery system to a
+    // logical unit of its own, and only a UFS target has either to spare —
+    // everywhere else U-Boot occupies the partition and there are no logical units
+    // at all. Resolving them only for UFS is what keeps them out of the staging
+    // plan too, so a non-UFS run never fetches an image it has nowhere to put.
+    let (mut boot_menu, mut recovery) = match device.kind {
+        StorageKind::Ufs => (state.selected_boot_menu(), state.selected_recovery()),
+        _ => (None, None),
     };
     // Extra profiles the user opted into, in build order.
     let extras: Vec<ProfilePack> = build
@@ -311,7 +320,22 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
     let boot_lu = ufs_boot_lu_plan(ctrl, &device);
     guard_ufs_boot_lu(cfg, ctrl, &device, &uboot, boot_lu.as_ref())?;
     guard_boot_menu_fits(cfg, ctrl, boot_menu.as_ref())?;
-    stage::guard_not_on_target(&uboot, boot_menu.as_ref(), &build, &extras, &device.path)?;
+    // Where the recovery image goes, decided before anything is written for the
+    // same reason the boot LU is: `install_recovery` writes this very node.
+    let recovery_lu = ufs_recovery_lu(&device);
+    let recovery_capacity = recovery_lu.as_deref().and_then(ufs::block_size_bytes);
+    guard_recovery_fits(
+        cfg,
+        ctrl,
+        recovery.as_ref(),
+        recovery_lu.as_deref(),
+        recovery_capacity,
+    )?;
+    let falcon = stage::FalconImages {
+        boot_menu: boot_menu.as_ref(),
+        recovery: recovery.as_ref(),
+    };
+    stage::guard_not_on_target(&uboot, falcon, &build, &extras, &device.path)?;
 
     // Resolve the Btrfs layout: prefer one shipped with the images, else the
     // built-in default.
@@ -327,7 +351,7 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
     // artifacts are checked before that point at all.
     let fetch_mode = state.selection.fetch;
     let policy = OnMismatch::for_mode(fetch_mode);
-    let plan = stage::plan(&uboot, boot_menu.as_ref(), &build, &extras);
+    let plan = stage::plan(&uboot, falcon, &build, &extras);
 
     // A locally supplied `*.tar.zst` is unpacked into the scratch dir first; the
     // bundle already describes its files at the paths they will occupy.
@@ -338,9 +362,10 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
         .filter(|r| r.archive.is_some());
 
     // 4 fixed steps, then receive + snapshot + kernel per deployed profile, plus
-    // one receive step for the shared /home seed when the build ships one, one for
-    // the boot menu when the target takes one, one staging step per artifact when
-    // verifying up front, and one for unpacking a local archive.
+    // one receive step for the shared /home seed when the build ships one, one
+    // each for the boot menu and the recovery image when the target takes them,
+    // one staging step per artifact when verifying up front, and one for
+    // unpacking a local archive.
     let deployed = 1 + extras.len();
     let verify_steps = match fetch_mode {
         FetchMode::VerifyFirst => plan.len() as u32,
@@ -348,6 +373,9 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
     };
     let total_steps = 4
         + boot_menu.is_some() as u32
+        // Both halves, because a device without the logical unit is installed
+        // without the recovery system rather than refused.
+        + (recovery.is_some() && recovery_lu.is_some()) as u32
         + pending_archive.is_some() as u32
         + verify_steps
         + deployed as u32 * 3
@@ -368,6 +396,9 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
             staged.localise_uboot(&mut uboot);
             if let Some(menu) = boot_menu.as_mut() {
                 staged.localise_image(menu);
+            }
+            if let Some(image) = recovery.as_mut() {
+                staged.localise_image(image);
             }
             staged.localise_build(&mut build);
             Some(staged)
@@ -421,6 +452,17 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
     // 3a. Boot menu, onto the loader partition the bootloader left free. A no-op
     // unless the target is UFS and a menu was resolved for it.
     install_boot_menu(cfg, ctrl, &device, boot_menu.as_ref(), policy, &mut ticker)?;
+
+    // 3b. Recovery system, onto the logical unit provisioned for it — outside the
+    // Btrfs volume, so it survives anything done to the main LU.
+    install_recovery(
+        cfg,
+        ctrl,
+        recovery.as_ref(),
+        recovery_lu.as_deref(),
+        policy,
+        &mut ticker,
+    )?;
 
     // 4. Filesystem + subvolumes.
     ticker.begin(ctrl, &format!("mkfs.btrfs {root_part}"));
@@ -739,6 +781,67 @@ fn guard_boot_menu_fits(
     Ok(())
 }
 
+/// The block node of the recovery logical unit on a UFS target, if it has one.
+/// `None` for any other kind of device, which has no logical units at all.
+fn ufs_recovery_lu(device: &StorageDevice) -> Option<String> {
+    if device.kind != StorageKind::Ufs {
+        return None;
+    }
+    storage::find_ufs_data_lu(&device.path, RECOVERY_LU_ID)
+}
+
+/// Refuse a recovery image the recovery logical unit cannot hold.
+///
+/// Checked before the first destructive command, like its neighbours: finding out
+/// at the write step would mean failing with the target already wiped. Unlike the
+/// loader partition, whose size this installer fixes itself, the logical unit's
+/// capacity comes from how the device was provisioned, so the caller reads it off
+/// the device and passes it in — `None` when it could not be read.
+fn guard_recovery_fits(
+    cfg: &Config,
+    ctrl: &Controller,
+    recovery: Option<&FalconImage>,
+    lu: Option<&str>,
+    capacity: Option<u64>,
+) -> Result<()> {
+    let Some(image) = recovery else {
+        return Ok(());
+    };
+    // A device with no recovery LU is not refused: the rest of the installation is
+    // perfectly good without one, and `install_recovery` says so when it gets there.
+    let Some(node) = lu else {
+        return Ok(());
+    };
+    match (image.size_bytes, capacity) {
+        // A manifest that publishes no size leaves nothing to compare against.
+        (0, _) => ctrl.log(format!(
+            "warning: the manifest gives no recovery image size, so {node} cannot be \
+             checked for room up front"
+        )),
+        (_, None) => ctrl.log(format!(
+            "warning: cannot read the size of {node}; it will not be checked for room"
+        )),
+        (size, Some(capacity)) if size > capacity => {
+            return refuse_unless_dry_run(
+                cfg,
+                ctrl,
+                format!(
+                    "UFS recovery LU ({node}) is only {}, too small for a {} recovery image; \
+                     reprovision the device to the Flipper scheme first",
+                    human_bytes(capacity),
+                    human_bytes(size)
+                ),
+            )
+        }
+        (size, Some(capacity)) => ctrl.log(format!(
+            "UFS recovery LU ({node}): {} for a {} recovery image",
+            human_bytes(capacity),
+            human_bytes(size)
+        )),
+    }
+    Ok(())
+}
+
 /// Report a guard's verdict: a real run refuses, a dry run only says it would.
 ///
 /// Dry runs write nothing, so refusing one would keep the operator from
@@ -1025,6 +1128,48 @@ fn install_boot_menu(
         &loader,
         0,
         menu.sha256.as_deref(),
+        policy,
+    )?;
+    Ok(())
+}
+
+/// Write the Falcon recovery system onto its logical unit, from its start.
+///
+/// The LU sits outside the Btrfs volume, which is the point of it: an
+/// installation that will not boot, or a volume damaged beyond repair, still
+/// leaves the operator something to boot into. That also means this write is not
+/// what the rest of the run depends on, so a device without the LU is reported
+/// and installed anyway.
+fn install_recovery(
+    cfg: &Config,
+    ctrl: &Controller,
+    recovery: Option<&FalconImage>,
+    lu: Option<&str>,
+    policy: OnMismatch,
+    ticker: &mut Ticker,
+) -> Result<()> {
+    let Some(image) = recovery else {
+        return Ok(());
+    };
+    let Some(node) = lu else {
+        ctrl.log(format!(
+            "warning: the target has no recovery logical unit (LU {RECOVERY_LU_ID}), so the \
+             recovery system is not installed; reprovision the device to the Flipper scheme \
+             to get one"
+        ));
+        return Ok(());
+    };
+    ticker.begin(ctrl, "installing recovery");
+    wait_for_device(cfg, ctrl, node)?;
+    write_source_to_offset(
+        cfg,
+        ctrl,
+        "recovery image",
+        &image.location,
+        &image.source,
+        node,
+        0,
+        image.sha256.as_deref(),
         policy,
     )?;
     Ok(())
@@ -1771,6 +1916,55 @@ mod tests {
 
         // A manifest that publishes no size leaves nothing to compare against.
         guard_boot_menu_fits(&cfg, &ctrl, Some(&boot_menu_of(0))).unwrap();
+    }
+
+    /// A recovery image of `size` bytes.
+    fn recovery_of(size: u64) -> FalconImage {
+        FalconImage {
+            location: "https://example.invalid/recovery-falcon.itb".into(),
+            source: Source::Server,
+            size_bytes: size,
+            sha256: None,
+        }
+    }
+
+    #[test]
+    fn a_recovery_image_too_big_for_its_logical_unit_is_refused() {
+        let ctrl = Controller::new(Config {
+            automount: false,
+            ..Config::default()
+        });
+        let cfg = Config {
+            dry_run: false,
+            automount: false,
+            ..Config::default()
+        };
+        const LU: u64 = 128 * 1024 * 1024;
+        let node = Some("/dev/sdd");
+
+        // The largest image that still fits, and the first one that does not.
+        guard_recovery_fits(&cfg, &ctrl, Some(&recovery_of(LU)), node, Some(LU)).unwrap();
+        let err = guard_recovery_fits(&cfg, &ctrl, Some(&recovery_of(LU + 1)), node, Some(LU))
+            .unwrap_err();
+        assert!(err.contains("too small for a"), "{err}");
+
+        // A dry run writes nothing, so it only says a real run would refuse.
+        let dry = Config {
+            automount: false,
+            ..Config::default()
+        };
+        assert!(dry.dry_run);
+        guard_recovery_fits(&dry, &ctrl, Some(&recovery_of(LU + 1)), node, Some(LU)).unwrap();
+
+        // Nothing to compare against: no published size, or an unreadable LU.
+        guard_recovery_fits(&cfg, &ctrl, Some(&recovery_of(0)), node, Some(LU)).unwrap();
+        guard_recovery_fits(&cfg, &ctrl, Some(&recovery_of(LU + 1)), node, None).unwrap();
+
+        // A device with no recovery LU is installed without one rather than
+        // refused — the rest of the installation is unaffected by its absence.
+        guard_recovery_fits(&cfg, &ctrl, Some(&recovery_of(LU + 1)), None, None).unwrap();
+        // And nothing to install means nothing to check.
+        guard_recovery_fits(&cfg, &ctrl, None, node, Some(0)).unwrap();
     }
 
     #[test]

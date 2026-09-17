@@ -138,6 +138,16 @@ fn print_bundle(b: &flipperos_installer::core::model::SelectedBundle) {
         }
         None => println!("  menu    : (none)"),
     }
+    match &b.recovery {
+        Some(r) => {
+            println!("  recovery: {} ({})", r.location, human_bytes(r.size_bytes));
+            println!(
+                "            sha256 {}",
+                r.sha256.as_deref().unwrap_or("(none)")
+            );
+        }
+        None => println!("  recovery: (none)"),
+    }
     println!("  profiles: {}", b.build.profiles.len());
     for p in &b.build.profiles {
         for (kind, pack) in [("full", &p.full), ("inc", &p.incremental)] {

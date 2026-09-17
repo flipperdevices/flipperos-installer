@@ -198,7 +198,8 @@ bundles/dev/<user>/<branch>/<build>/     per-developer topic branches
 
 and each build directory holds a `manifest.json`, the flashable
 `u-boot/<board>/u-boot-rockchip.bin` for every supported board, the matching
-`boot-menu/<board>/bootmenu-falcon.itb` (see [The boot menu](#the-boot-menu)),
+`boot-menu/<board>/bootmenu-falcon.itb` (see [The boot menu](#the-boot-menu)) and
+`recovery/<board>/recovery-falcon.itb` (see [The recovery system](#the-recovery-system)),
 the `profile-packs/` (the same `<Profile>_<build>_stock[_inc]_pack.zst` and
 `home_<build>_pack.zst` files the image server publishes), MCU firmware the
 installer ignores, and a `*.tar.zst` of the whole tree.
@@ -222,12 +223,12 @@ lists and the operator's profile selection call for.
 The **Fetch** row chooses when artifacts are checked:
 
 - `verify first` (the default) downloads exactly what the run needs — the U-Boot
-  image, the boot menu on a UFS target, the Minimal full pack, each selected
-  incremental and the `/home` seed —
+  image, the boot menu and recovery system on a UFS target, the Minimal full
+  pack, each selected incremental and the `/home` seed —
   into `--cache-dir`, compares each against its manifest digest, and only then
   starts partitioning. A bad or truncated artifact therefore cannot leave a wiped
-  device behind. The space needed (~0.9–1.4 GiB, the higher end of it on UFS,
-  which also stages the boot menu) is checked up front.
+  device behind. The space needed (~0.9–1.5 GiB, the higher end of it on UFS,
+  which also stages the two Falcon images) is checked up front.
 - `stream` writes as it downloads, hashing on the way through. The verdict
   necessarily arrives after the bytes have landed, so a mismatch is reported as a
   warning that says the target must not be booted.
@@ -247,6 +248,9 @@ The *custom development build* flow reads the image server's two-level catalog
 - **Boot menu:** `/falcon-bootmenu/manifest.json` lists build directories; each
   build's `manifest.json` contains `<board>/bootmenu-falcon.itb` (see
   [The boot menu](#the-boot-menu)).
+- **Recovery:** `/falcon-recovery/manifest.json`, the same shape again, with
+  `<board>/recovery-falcon.itb` (see
+  [The recovery system](#the-recovery-system)).
 - **Snapshots (rootfs):** `/rootfs/manifest.json` lists build directories; each
   build's `manifest.json` contains per-profile packs
   `<Profile>_<build>_stock_pack.zst` (full) and `<Profile>_<build>_stock_inc_pack.zst`
@@ -276,7 +280,7 @@ against the scheme in [config/flipperos-ufs.toml](config/flipperos-ufs.toml):
 | 0  | main system — GPT, loader partition (the boot menu), Btrfs | Normal | all remaining |
 | 1  | U-Boot, flagged **Boot LU A** | Enhanced1 | 16 MiB |
 | 2  | U-Boot, flagged **Boot LU B** | Enhanced1 | 16 MiB |
-| 3  | recovery — kernel + initrd for on-device rescue | Enhanced1 | 128 MiB |
+| 3  | recovery — the Falcon recovery system, see [The recovery system](#the-recovery-system) | Enhanced1 | 128 MiB |
 
 If the layout differs in a way that matters — which units exist, their size,
 memory type or boot flag, whether the boot feature is on, or whether the boot ROM
@@ -403,6 +407,34 @@ The loader partition runs from 32 KiB to 60 MiB, so it holds 58.6 MiB. The image
 is ~19 MiB today and grows with the menu, so an install that would not fit is
 refused **before** anything is erased, rather than failing with the target already
 wiped. That check is what will eventually ask for a larger partition.
+
+## The recovery system
+
+`recovery-falcon.itb` is a second Falcon-mode FIT: a kernel plus an initramfs for
+on-device rescue. It is written raw to the **start of UFS logical unit 3**, the
+one [the provisioning scheme](config/flipperos-ufs.toml) reserves for it, and
+**only when the target is UFS** — no other kind of device has a logical unit to
+put it in.
+
+Keeping it on its own LU is the point of it. It sits outside the GPT and outside
+the Btrfs volume, so an installation that will not boot, or a volume damaged
+beyond repair, still leaves something to boot into.
+
+Where it comes from:
+
+- bundle: `recovery/<board>/recovery-falcon.itb`;
+- custom development build: `<board>/recovery-falcon.itb` from the
+  `falcon-recovery/` build the operator picked.
+
+Unlike the boot menu there is no fallback to a U-Boot build's own copy: builds
+from before the split do publish one, but nothing has ever installed it.
+
+The image is ~45 MiB against a 128 MiB logical unit. That unit's size comes from
+how the device was provisioned rather than from anything this installer controls,
+so it is read off the device and checked **before** anything is erased. A device
+with no LU 3 at all is installed without a recovery system, with a warning — the
+rest of the installation is unaffected by its absence, so refusing would help
+nobody.
 
 ## Btrfs layout
 

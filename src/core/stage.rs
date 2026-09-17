@@ -47,15 +47,24 @@ pub struct Artifact {
     pub rel: String,
 }
 
+/// The Falcon images a run writes outside the filesystem. A named struct rather
+/// than two arguments of the same type, which nothing would stop a caller
+/// transposing.
+#[derive(Clone, Copy, Default)]
+pub struct FalconImages<'a> {
+    pub boot_menu: Option<&'a FalconImage>,
+    pub recovery: Option<&'a FalconImage>,
+}
+
 /// Everything the run will read, in install order.
 ///
-/// A boot menu passed here is staged. Deciding whether it is wanted at all is
-/// [`crate::core::install::run`]'s job: it passes `None` for a target that has no
-/// loader partition to spare, so nothing here has to know what kind of device is
-/// being installed onto.
+/// An image passed here is staged. Deciding whether it is wanted at all is
+/// [`crate::core::install::run`]'s job: it passes `None` for a target that has
+/// nowhere to put it, so nothing here has to know what kind of device is being
+/// installed onto.
 pub fn plan(
     uboot: &UbootBuild,
-    boot_menu: Option<&FalconImage>,
+    falcon: FalconImages,
     build: &SnapshotBuild,
     extras: &[ProfilePack],
 ) -> Vec<Artifact> {
@@ -68,8 +77,11 @@ pub fn plan(
         size: uboot.size_bytes,
         rel: "u-boot-rockchip.bin".to_string(),
     });
-    if let Some(menu) = boot_menu {
+    if let Some(menu) = falcon.boot_menu {
         out.push(image_artifact("boot menu image", menu));
+    }
+    if let Some(recovery) = falcon.recovery {
+        out.push(image_artifact("recovery image", recovery));
     }
     if let Some(home) = &build.home_pack {
         out.push(pack_artifact("/home seed", home));
@@ -204,13 +216,13 @@ impl Drop for Staged {
 /// warning.
 pub fn guard_not_on_target(
     uboot: &UbootBuild,
-    boot_menu: Option<&FalconImage>,
+    falcon: FalconImages,
     build: &SnapshotBuild,
     extras: &[ProfilePack],
     disk: &str,
 ) -> Result<()> {
     let mounts = crate::core::removable::mounts_on(disk);
-    check_not_on_mounts(&plan(uboot, boot_menu, build, extras), &mounts, disk)
+    check_not_on_mounts(&plan(uboot, falcon, build, extras), &mounts, disk)
 }
 
 /// The decision [`guard_not_on_target`] makes, separated from reading
@@ -535,11 +547,21 @@ mod tests {
         }
     }
 
+    /// The recovery image a UFS run would install.
+    fn recovery() -> FalconImage {
+        FalconImage {
+            location: "https://example.invalid/r/flipper-one/recovery-falcon.itb".into(),
+            source: Source::Server,
+            size_bytes: 55,
+            sha256: Some("ff".into()),
+        }
+    }
+
     #[test]
     fn plans_only_what_is_needed_in_install_order() {
         let b = build();
         let extras = vec![b.profiles[1].clone()];
-        let p = plan(&uboot(), None, &b, &extras);
+        let p = plan(&uboot(), FalconImages::default(), &b, &extras);
 
         let labels: Vec<&str> = p.iter().map(|a| a.label.as_str()).collect();
         assert_eq!(
@@ -558,14 +580,24 @@ mod tests {
         assert_eq!(p[2].rel, "Minimal_9_stock_pack.zst");
         assert_eq!(p[0].rel, "u-boot-rockchip.bin");
         // An unpublished digest is carried through as `None`, not invented.
-        let all = plan(&uboot(), None, &b, &b.profiles[1..]);
+        let all = plan(&uboot(), FalconImages::default(), &b, &b.profiles[1..]);
         assert!(all.iter().any(|a| a.sha256.is_none()));
     }
 
     #[test]
-    fn plans_the_boot_menu_right_after_the_bootloader() {
+    fn plans_the_falcon_images_right_after_the_bootloader() {
         let b = build();
-        let p = plan(&uboot(), Some(&boot_menu()), &b, &[]);
+        let menu = boot_menu();
+        let rec = recovery();
+        let p = plan(
+            &uboot(),
+            FalconImages {
+                boot_menu: Some(&menu),
+                recovery: Some(&rec),
+            },
+            &b,
+            &[],
+        );
 
         let labels: Vec<&str> = p.iter().map(|a| a.label.as_str()).collect();
         assert_eq!(
@@ -573,6 +605,7 @@ mod tests {
             [
                 "u-boot image",
                 "boot menu image",
+                "recovery image",
                 "/home seed",
                 "Minimal (full)"
             ]
@@ -580,6 +613,10 @@ mod tests {
         assert_eq!(p[1].rel, "bootmenu-falcon.itb");
         assert_eq!(p[1].size, 99);
         assert_eq!(p[1].sha256.as_deref(), Some("ee"));
+        // Distinct staged names, so the two images cannot collide in the cache.
+        assert_eq!(p[2].rel, "recovery-falcon.itb");
+        assert_eq!(p[2].size, 55);
+        assert_eq!(p[2].sha256.as_deref(), Some("ff"));
     }
 
     #[test]
@@ -802,7 +839,7 @@ mod tests {
         let mut b = build();
         let disk = "/dev/definitely-not-a-real-disk";
         // Nothing is mounted from that disk, so a remote bundle is fine.
-        assert!(guard_not_on_target(&uboot(), None, &b, &[], disk).is_ok());
+        assert!(guard_not_on_target(&uboot(), FalconImages::default(), &b, &[], disk).is_ok());
         // A local pack under a mountpoint of the target would be caught; with no
         // such mount present the guard is a no-op, which is what this asserts.
         if let Some(full) = b.profiles[0].full.as_mut() {
@@ -811,7 +848,7 @@ mod tests {
                 root: "/mnt/sd".into(),
             };
         }
-        assert!(guard_not_on_target(&uboot(), None, &b, &[], disk).is_ok());
+        assert!(guard_not_on_target(&uboot(), FalconImages::default(), &b, &[], disk).is_ok());
     }
 
     #[test]

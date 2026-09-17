@@ -10,6 +10,7 @@
 //! ```text
 //! u-boot/<board>/u-boot-rockchip.bin
 //! boot-menu/<board>/bootmenu-falcon.itb        UFS targets only
+//! recovery/<board>/recovery-falcon.itb         UFS targets only
 //! profile-packs/<Profile>_<build>_stock[_inc]_pack.zst
 //! profile-packs/home_<build>_pack.zst
 //! mcu/…                                        not installed by this tool
@@ -41,6 +42,10 @@ const UBOOT_IMAGE: &str = "u-boot-rockchip.bin";
 const BOOT_MENU_DIR: &str = "boot-menu";
 /// The Falcon-mode boot menu FIT inside a bundle's per-board boot-menu directory.
 const BOOT_MENU_IMAGE: &str = "bootmenu-falcon.itb";
+/// Directory inside a bundle that holds the per-board recovery images.
+const RECOVERY_DIR: &str = "recovery";
+/// The Falcon-mode recovery FIT inside a bundle's per-board recovery directory.
+const RECOVERY_IMAGE: &str = "recovery-falcon.itb";
 /// Directory inside a bundle that holds the profile packs and the `/home` seed.
 const PACKS_DIR: &str = "profile-packs";
 /// Channel that holds per-developer topic branches rather than build dirs.
@@ -385,6 +390,19 @@ pub fn resolve(
             size_bytes: f.size,
             sha256: f.digest(),
         });
+    // The Falcon recovery image, on the same terms: optional, per board, and
+    // written only on UFS — the one kind of target with a logical unit for it.
+    let recovery_rel = format!("{RECOVERY_DIR}/{board_dir}/{RECOVERY_IMAGE}");
+    let recovery = manifest
+        .files
+        .iter()
+        .find(|f| f.path == recovery_rel)
+        .map(|f| FalconImage {
+            location: location.join(&recovery_rel),
+            source: source.clone(),
+            size_bytes: f.size,
+            sha256: f.digest(),
+        });
 
     let uboot = UbootBuild {
         id: reference.id.clone(),
@@ -484,6 +502,7 @@ pub fn resolve(
         device_types: manifest.device_types(),
         uboot,
         boot_menu,
+        recovery,
         build,
     })
 }
@@ -809,6 +828,20 @@ mod tests {
             menu.sha256.as_deref(),
             Some("495f4fa9ee07deed190d353910671816b359e649c332917383eafacbeef83ead")
         );
+        // As does the recovery image, from its own directory.
+        let recovery = bundle.recovery.as_ref().expect("recovery image");
+        assert!(
+            recovery
+                .location
+                .ends_with("/recovery/flipper-one/recovery-falcon.itb"),
+            "{}",
+            recovery.location
+        );
+        assert_eq!(recovery.size_bytes, 44997120);
+        assert_eq!(
+            recovery.sha256.as_deref(),
+            Some("cbb7aaf5cba24724cccbf47a9bef2687006900cf26125795613ea116af9292f2")
+        );
         // Nothing further to fetch for either build.
         assert!(bundle.uboot.loaded);
         assert!(bundle.build.loaded);
@@ -911,29 +944,35 @@ mod tests {
     }
 
     #[test]
-    fn a_bundle_without_a_boot_menu_still_resolves() {
-        // Bundles predating the Falcon boot menu ship no `boot-menu/` tree. They
-        // are still installable — the menu is optional, unlike the bootloader.
-        let mut manifest = parse(MANIFEST);
-        manifest.files.retain(|f| !f.path.starts_with("boot-menu/"));
-        let repo = repo();
-        let reference = remote_ref(&repo, "nightly", "x");
-        let bundle = resolve(&reference, &reference.location, &manifest, "flipper-one").unwrap();
-        assert!(bundle.boot_menu.is_none());
-    }
-
-    #[test]
-    fn a_board_without_a_boot_menu_takes_none_of_anothers() {
-        // The lookup is pinned to the resolved board directory, so a board that
-        // ships a bootloader but no menu must not pick up a neighbour's.
+    fn a_bundle_without_the_falcon_images_still_resolves() {
+        // Bundles predating the Falcon images ship no `boot-menu/` or `recovery/`
+        // tree. They are still installable — both are optional in a way the
+        // bootloader is not.
         let mut manifest = parse(MANIFEST);
         manifest
             .files
-            .retain(|f| !f.path.starts_with("boot-menu/flipper-one/"));
+            .retain(|f| !f.path.starts_with("boot-menu/") && !f.path.starts_with("recovery/"));
         let repo = repo();
         let reference = remote_ref(&repo, "nightly", "x");
         let bundle = resolve(&reference, &reference.location, &manifest, "flipper-one").unwrap();
         assert!(bundle.boot_menu.is_none());
+        assert!(bundle.recovery.is_none());
+    }
+
+    #[test]
+    fn a_board_without_a_falcon_image_takes_none_of_anothers() {
+        // Each lookup is pinned to the resolved board directory, so a board that
+        // ships a bootloader but no Falcon image must not pick up a neighbour's.
+        let mut manifest = parse(MANIFEST);
+        manifest.files.retain(|f| {
+            !f.path.starts_with("boot-menu/flipper-one/")
+                && !f.path.starts_with("recovery/flipper-one/")
+        });
+        let repo = repo();
+        let reference = remote_ref(&repo, "nightly", "x");
+        let bundle = resolve(&reference, &reference.location, &manifest, "flipper-one").unwrap();
+        assert!(bundle.boot_menu.is_none());
+        assert!(bundle.recovery.is_none());
     }
 
     #[test]

@@ -514,6 +514,9 @@ pub struct SelectedBundle {
     pub uboot: UbootBuild,
     /// The Falcon boot menu for [`Self::board_dir`], if the bundle ships one.
     pub boot_menu: Option<FalconImage>,
+    /// The Falcon recovery image for [`Self::board_dir`], if the bundle ships
+    /// one.
+    pub recovery: Option<FalconImage>,
     pub build: SnapshotBuild,
 }
 
@@ -644,6 +647,8 @@ pub struct Selection {
     pub uboot: Option<String>,
     /// Selected Falcon boot menu build id. [`InstallMode::Custom`] only.
     pub boot_menu: Option<String>,
+    /// Selected Falcon recovery build id. [`InstallMode::Custom`] only.
+    pub recovery: Option<String>,
     /// Selected snapshot build id. [`InstallMode::Custom`] only.
     pub snapshot_build: Option<String>,
     /// Extra profile names to deploy (Minimal is always deployed implicitly).
@@ -737,6 +742,8 @@ pub struct AppState {
     pub uboot_builds: Vec<UbootBuild>,
     /// Available Falcon boot menu builds, newest first.
     pub boot_menu_builds: Vec<FalconBuild>,
+    /// Available Falcon recovery builds, newest first.
+    pub recovery_builds: Vec<FalconBuild>,
     /// Available snapshot builds, newest first.
     pub snapshot_builds: Vec<SnapshotBuild>,
     pub selection: Selection,
@@ -853,6 +860,43 @@ impl AppState {
             }
         }
         let image = self.selected_boot_menu()?;
+        Some(format!(
+            "{} ({})",
+            human_bytes(image.size_bytes),
+            image.source.label()
+        ))
+    }
+
+    /// The Falcon recovery image this run would write: the one a bundle pins, or
+    /// the one hand-picked from the image server.
+    ///
+    /// No fallback to the U-Boot build, unlike [`Self::selected_boot_menu`]: the
+    /// builds that carry a recovery image of their own were never installed from,
+    /// so there is no behaviour to preserve.
+    pub fn selected_recovery(&self) -> Option<FalconImage> {
+        match self.selection.mode {
+            InstallMode::Bundle => self.bundle.as_ref()?.recovery.clone(),
+            InstallMode::Custom => self
+                .recovery_builds
+                .iter()
+                .find(|b| Some(b.id.as_str()) == self.selection.recovery.as_deref())
+                .and_then(|b| b.image()),
+        }
+    }
+
+    /// Value for the recovery status line, the counterpart of
+    /// [`Self::boot_menu_summary`].
+    pub fn recovery_summary(&self) -> Option<String> {
+        if self.selection.mode == InstallMode::Custom {
+            if let Some(id) = self.selection.recovery.as_deref() {
+                return self
+                    .recovery_builds
+                    .iter()
+                    .find(|b| b.id == id)
+                    .map(|b| b.summary());
+            }
+        }
+        let image = self.selected_recovery()?;
         Some(format!(
             "{} ({})",
             human_bytes(image.size_bytes),
@@ -1060,6 +1104,44 @@ mod tests {
         // A U-Boot build carrying none either leaves the loader partition empty.
         state.uboot_builds = vec![uboot_carrying(None)];
         assert!(state.selected_boot_menu().is_none());
+    }
+
+    #[test]
+    fn the_recovery_image_comes_only_from_its_own_listing() {
+        // No fallback to the U-Boot build, unlike the boot menu: a build carrying
+        // `recovery-falcon.itb` of its own was never installed from, so picking it
+        // up now would start writing an image this installer has never written.
+        let listed = FalconBuild {
+            id: "r".into(),
+            label: "r".into(),
+            mtime: String::new(),
+            image_location: "https://i.invalid/falcon-recovery/r/flipper-one/recovery-falcon.itb"
+                .into(),
+            manifest_location: "https://i.invalid/falcon-recovery/r/manifest.json".into(),
+            source: Source::Server,
+            size_bytes: 45,
+            sha256: None,
+            details: None,
+            loaded: true,
+        };
+        let mut state = AppState {
+            uboot_builds: vec![uboot_carrying(Some(falcon_image("u/menu.itb", 40)))],
+            recovery_builds: vec![listed.clone()],
+            selection: Selection {
+                mode: InstallMode::Custom,
+                uboot: Some("u".to_string()),
+                recovery: Some("r".to_string()),
+                ..Selection::default()
+            },
+            ..AppState::default()
+        };
+        let picked = state.selected_recovery().expect("a recovery image");
+        assert_eq!(picked.location, listed.image_location);
+        assert_eq!(picked.size_bytes, 45);
+
+        state.recovery_builds.clear();
+        state.selection.recovery = None;
+        assert!(state.selected_recovery().is_none());
     }
 
     #[test]

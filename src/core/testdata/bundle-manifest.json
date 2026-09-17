@@ -91,6 +91,34 @@
       "item": "falcon-bootmenu"
     },
     {
+      "path": "recovery/evb/recovery-falcon.itb",
+      "size": 44768768,
+      "mtime": "2026-08-11T15:29:11Z",
+      "sha256": "8fc088ddd8b4a6d63e361cc08dfc45feda5b4af2a088fb664dc70ea6ed4443b9",
+      "item": "recovery"
+    },
+    {
+      "path": "recovery/flipper-one/recovery-falcon.itb",
+      "size": 44997120,
+      "mtime": "2026-08-11T15:29:14Z",
+      "sha256": "cbb7aaf5cba24724cccbf47a9bef2687006900cf26125795613ea116af9292f2",
+      "item": "recovery"
+    },
+    {
+      "path": "recovery/generic/recovery-falcon.itb",
+      "size": 44748288,
+      "mtime": "2026-08-11T15:29:07Z",
+      "sha256": "8d96f3208206d18705b3b01ef5bc2fe2aa9f6e84eff8df0e5148130a5887128a",
+      "item": "recovery"
+    },
+    {
+      "path": "recovery/nanopi-m5/recovery-falcon.itb",
+      "size": 44766208,
+      "mtime": "2026-08-11T15:29:15Z",
+      "sha256": "172fd4d1208ed495a13a3ac7c0d2b7f52d9db4ab39ae6a01f9dd0b2c6f4e7a35",
+      "item": "recovery"
+    },
+    {
       "path": "mcu/flipperone-mcu-firmware.uf2",
       "size": 843264,
       "mtime": "2026-08-11T17:45:28Z",

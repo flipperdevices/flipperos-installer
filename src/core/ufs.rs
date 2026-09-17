@@ -730,7 +730,7 @@ fn scsi_target_dirs(host: u32) -> Vec<PathBuf> {
 const SCSI_TARGET_PREFIX: &str = "target";
 
 /// The LUN out of a `host:channel:target:lun` sysfs directory name.
-fn lun_of(dir_name: &str) -> Option<u32> {
+pub(crate) fn lun_of(dir_name: &str) -> Option<u32> {
     dir_name.rsplit(':').next()?.parse().ok()
 }
 

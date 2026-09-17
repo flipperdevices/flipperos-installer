@@ -7,6 +7,9 @@
 //!   `<base>/falcon-bootmenu/manifest.json`   -> list of boot menu build dirs
 //!   `<base>/falcon-bootmenu/<dir>/manifest.json`
 //!                                            -> `<board>/bootmenu-falcon.itb`
+//!   `<base>/falcon-recovery/manifest.json`   -> list of recovery build dirs
+//!   `<base>/falcon-recovery/<dir>/manifest.json`
+//!                                            -> `<board>/recovery-falcon.itb`
 //!   `<base>/rootfs/manifest.json`            -> list of rootfs build dirs
 //!   `<base>/rootfs/<dir>/manifest.json`      -> `<Profile>_<build>_stock[_inc]_pack.zst`
 //!
@@ -30,6 +33,10 @@ const UBOOT_IMAGE: &str = "u-boot-rockchip.bin";
 const BOOT_MENU_DIR: &str = "falcon-bootmenu";
 /// The Falcon-mode boot menu FIT inside a build's per-board directory.
 const BOOT_MENU_IMAGE: &str = "bootmenu-falcon.itb";
+/// Top-level directory listing the Falcon recovery builds.
+const RECOVERY_DIR: &str = "falcon-recovery";
+/// The Falcon-mode recovery FIT inside a build's per-board directory.
+const RECOVERY_IMAGE: &str = "recovery-falcon.itb";
 
 /// A place to read the catalog from.
 #[derive(Clone, Debug)]
@@ -164,6 +171,20 @@ pub fn boot_menu_builds(origin: &Origin, board_dir: &str, limit: usize) -> Vec<F
     )
 }
 
+/// List the available Falcon recovery builds for `board_dir`, newest first
+/// (capped). The image size and digest are loaded lazily via
+/// [`load_recovery_contents`].
+pub fn recovery_builds(origin: &Origin, board_dir: &str, limit: usize) -> Vec<FalconBuild> {
+    falcon_builds(
+        origin,
+        RECOVERY_DIR,
+        RECOVERY_IMAGE,
+        "recovery",
+        board_dir,
+        limit,
+    )
+}
+
 /// The shared body of the Falcon image listings: same two-level layout as
 /// [`uboot_builds`], differing only in which directory is listed, which file is
 /// taken from it, and which revision names the build.
@@ -200,6 +221,16 @@ pub fn load_boot_menu_contents(
 ) -> Result<FalconContents, String> {
     let bm: BuildManifest = fetch_json(&build.manifest_location)?;
     falcon_contents(&bm, &build.manifest_location, board_dir, BOOT_MENU_IMAGE)
+}
+
+/// Fetch a Falcon recovery build's manifest and extract the metadata for its
+/// `<board_dir>/recovery-falcon.itb`.
+pub fn load_recovery_contents(
+    build: &FalconBuild,
+    board_dir: &str,
+) -> Result<FalconContents, String> {
+    let bm: BuildManifest = fetch_json(&build.manifest_location)?;
+    falcon_contents(&bm, &build.manifest_location, board_dir, RECOVERY_IMAGE)
 }
 
 /// Parsed contents of a Falcon image build manifest: the image's size and digest,
@@ -613,6 +644,34 @@ mod tests {
         assert!(err.contains("lists no sige5/bootmenu-falcon.itb"), "{err}");
     }
 
+    /// A `falcon-recovery` build directory. Same shape as the boot menu's, with
+    /// its own image name — which is the whole difference between the two.
+    const RECOVERY_MANIFEST: &str = r#"{
+      "build": { "builder": "falcon-recovery", "number": 1 },
+      "files": [
+        { "path": "flipper-one/recovery-falcon.itb", "size": 44997120,
+          "mtime": "2026-09-16T18:25:41Z", "sha256": "dd" },
+        { "path": "generic/recovery-falcon.itb", "size": 44748288, "sha256": "ee" }
+      ]
+    }"#;
+
+    #[test]
+    fn reads_a_recovery_build_for_this_board() {
+        let bm: BuildManifest =
+            serde_json::from_str(RECOVERY_MANIFEST).expect("valid build manifest");
+        let c = falcon_contents(&bm, "r.json", "flipper-one", RECOVERY_IMAGE).unwrap();
+        assert_eq!(c.size, 44997120);
+        assert_eq!(c.sha256.as_deref(), Some("dd"));
+
+        // A recovery build is not a boot menu build: asking it for the other
+        // image must not fall through to the one it does ship.
+        let err = falcon_contents(&bm, "r.json", "flipper-one", BOOT_MENU_IMAGE).unwrap_err();
+        assert!(
+            err.contains("lists no flipper-one/bootmenu-falcon.itb"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn labels_a_build_after_its_own_revision() {
         // Every Falcon build directory starts with the bootloader revisions it was
@@ -623,6 +682,12 @@ mod tests {
             "bootmenu d31d718"
         );
         assert_eq!(revision_label("u=36d78f6/", "bootmenu", "falcon"), "falcon");
+        // `menu=` must not answer for `bootmenu=`, nor the other way round.
+        assert_eq!(revision_label(dir, "menu", "falcon"), "menu fb7251d");
+        assert_eq!(
+            revision_label("u=36d78f6__recovery=610760a/", "recovery", "falcon"),
+            "recovery 610760a"
+        );
     }
 
     #[test]

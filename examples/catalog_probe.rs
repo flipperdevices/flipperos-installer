@@ -49,6 +49,20 @@ fn main() {
         }
     }
 
+    let recoveries = catalog::recovery_builds(&origin, "flipper-one", 5);
+    println!(
+        "\n== Recovery builds (newest first): {} ==",
+        recoveries.len()
+    );
+    for b in &recoveries {
+        println!("  {}  [{}]", b.summary(), b.mtime);
+        println!("      -> {}", b.image_location);
+        match catalog::load_recovery_contents(b, "flipper-one") {
+            Ok(c) => println!("      image {} B", c.size),
+            Err(e) => println!("      manifest error: {e}"),
+        }
+    }
+
     let snaps = catalog::snapshot_builds(&origin, 5);
     println!("\n== Snapshot builds (newest first): {} ==", snaps.len());
     for b in &snaps {

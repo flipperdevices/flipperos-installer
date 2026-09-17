@@ -170,6 +170,32 @@ pub fn find_ufs_boot_lu(disk: &str, boot_lun_id: u8) -> Option<String> {
     None
 }
 
+/// Given a whole-disk UFS device node, find the block node of the data logical
+/// unit numbered `lun` on the *same physical device*, if present.
+///
+/// The sibling of [`find_ufs_boot_lu`], and it walks the same set of directories,
+/// but a data LU is identified by its LUN rather than by a descriptor flag: the
+/// Flipper provisioning scheme in `config/flipperos-ufs.toml` is what says which
+/// number means what. A node that *is* the target disk is skipped, so asking for
+/// a LUN the device does not have can never hand back the LU being installed to.
+pub fn find_ufs_data_lu(disk: &str, lun: u32) -> Option<String> {
+    let name = disk.trim_start_matches("/dev/");
+    let scsi_dev = fs::canonicalize(Path::new(SYS_BLOCK).join(name).join("device")).ok()?;
+    let target_dir = scsi_dev.parent()?;
+
+    for entry in fs::read_dir(target_dir).ok()?.flatten() {
+        if ufs::lun_of(&entry.file_name().to_string_lossy()) != Some(lun) {
+            continue;
+        }
+        if let Some(node) = ufs::lu_block_node(&entry.path()) {
+            if node != disk {
+                return Some(node);
+            }
+        }
+    }
+    None
+}
+
 /// Read a UFS LU's `unit_descriptor/boot_lun_id` (`bBootLunID`). The kernel
 /// prints single-byte descriptor fields as `0x%02X`, so accept a `0x` prefix as
 /// well as a plain decimal value.

@@ -432,30 +432,36 @@ impl Controller {
         self.log("querying image catalog…");
         let mut uboot_builds: Vec<UbootBuild> = Vec::new();
         let mut boot_menu_builds: Vec<FalconBuild> = Vec::new();
+        let mut recovery_builds: Vec<FalconBuild> = Vec::new();
         let mut snapshot_builds: Vec<SnapshotBuild> = Vec::new();
         for origin in &origins {
             uboot_builds.extend(catalog::uboot_builds(origin, &board_dir, LIMIT));
             boot_menu_builds.extend(catalog::boot_menu_builds(origin, &board_dir, LIMIT));
+            recovery_builds.extend(catalog::recovery_builds(origin, &board_dir, LIMIT));
             snapshot_builds.extend(catalog::snapshot_builds(origin, LIMIT));
         }
         // Newest first across all origins, then cap.
         uboot_builds.sort_by(|a, b| b.mtime.cmp(&a.mtime));
         boot_menu_builds.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+        recovery_builds.sort_by(|a, b| b.mtime.cmp(&a.mtime));
         snapshot_builds.sort_by(|a, b| b.mtime.cmp(&a.mtime));
         uboot_builds.truncate(LIMIT);
         boot_menu_builds.truncate(LIMIT);
+        recovery_builds.truncate(LIMIT);
         snapshot_builds.truncate(LIMIT);
 
         self.log(format!(
-            "catalog: {} u-boot build(s), {} boot menu build(s), {} snapshot build(s)",
+            "catalog: {} u-boot, {} boot menu, {} recovery, {} snapshot build(s)",
             uboot_builds.len(),
             boot_menu_builds.len(),
+            recovery_builds.len(),
             snapshot_builds.len()
         ));
 
         self.update(|s| {
             s.uboot_builds = uboot_builds;
             s.boot_menu_builds = boot_menu_builds;
+            s.recovery_builds = recovery_builds;
             s.snapshot_builds = snapshot_builds;
             if s.selection.uboot.is_none() {
                 if let Some(b) = s.uboot_builds.first() {
@@ -467,6 +473,11 @@ impl Controller {
             if s.selection.boot_menu.is_none() {
                 if let Some(b) = s.boot_menu_builds.first() {
                     s.selection.boot_menu = Some(b.id.clone());
+                }
+            }
+            if s.selection.recovery.is_none() {
+                if let Some(b) = s.recovery_builds.first() {
+                    s.selection.recovery = Some(b.id.clone());
                 }
             }
             if s.selection.snapshot_build.is_none() {
@@ -487,6 +498,9 @@ impl Controller {
         }
         if let Some(id) = selection.boot_menu {
             self.load_boot_menu_contents(&id);
+        }
+        if let Some(id) = selection.recovery {
+            self.load_recovery_contents(&id);
         }
     }
 
@@ -511,6 +525,7 @@ impl Controller {
                 LoadRequest::Bundle(id) => this.load_bundle(id),
                 LoadRequest::UbootContents(id) => this.load_uboot_contents(id),
                 LoadRequest::BootMenuContents(id) => this.load_boot_menu_contents(id),
+                LoadRequest::RecoveryContents(id) => this.load_recovery_contents(id),
                 LoadRequest::SnapshotProfiles(id) => {
                     // One request reads everything the rootfs manifest offers:
                     // the packs to install and the metadata the popup shows.
@@ -799,6 +814,32 @@ impl Controller {
         }
     }
 
+    /// Fetch a Falcon recovery build's manifest, the counterpart of
+    /// [`Self::load_boot_menu_contents`].
+    fn load_recovery_contents(&self, id: &str) {
+        let (build, board_dir) = {
+            let s = self.state.lock().unwrap();
+            match s.recovery_builds.iter().find(|b| b.id == id) {
+                Some(b) if !b.loaded => (b.clone(), self.board_dir(&s)),
+                _ => return,
+            }
+        };
+        match catalog::load_recovery_contents(&build, &board_dir) {
+            Ok(c) => self.update(|s| {
+                if let Some(b) = s.recovery_builds.iter_mut().find(|b| b.id == id) {
+                    b.size_bytes = c.size;
+                    b.sha256 = c.sha256;
+                    if !c.mtime.is_empty() {
+                        b.mtime = c.mtime;
+                    }
+                    b.details = Some(c.details);
+                    b.loaded = true;
+                }
+            }),
+            Err(e) => self.log(format!("recovery manifest: {e}")),
+        }
+    }
+
     /// Fetch the snapshot build's manifest details for the popup. Blocking, so
     /// call it from a worker thread; a no-op if already loaded or unknown.
     fn load_snapshot_details(&self, id: &str) {
@@ -1079,6 +1120,18 @@ impl Controller {
         let this = Arc::clone(self);
         let id = id.to_string();
         std::thread::spawn(move || this.load_boot_menu_contents(&id));
+    }
+
+    /// Pick a Falcon recovery build by hand, the counterpart of
+    /// [`Self::select_boot_menu`].
+    pub fn select_recovery(self: &Arc<Self>, id: &str) {
+        self.update(|s| {
+            s.selection.mode = InstallMode::Custom;
+            s.selection.recovery = Some(id.to_string());
+        });
+        let this = Arc::clone(self);
+        let id = id.to_string();
+        std::thread::spawn(move || this.load_recovery_contents(&id));
     }
 
     /// Pick a snapshot build by hand, resetting the extra-profile selection, and
