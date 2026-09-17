@@ -39,9 +39,11 @@ pub enum MenuKey {
     Dirs(String),
     /// Bundles found on removable media or given on the command line.
     Local,
-    /// The legacy free-form flow: pick a U-Boot build and a rootfs build.
+    /// The legacy free-form flow: pick a U-Boot build, a boot menu build and a
+    /// rootfs build.
     Custom,
     Uboot,
+    BootMenu,
     Snapshot,
     Device,
     Profiles,
@@ -55,6 +57,7 @@ pub enum Action {
     Open(MenuKey),
     PickDevice(String),
     PickUboot(String),
+    PickBootMenu(String),
     PickSnapshot(String),
     PickBundle(String),
     PickFetch(FetchMode),
@@ -78,6 +81,8 @@ pub enum LoadRequest {
     Bundle(String),
     /// A legacy U-Boot build's manifest (size, digest, details).
     UbootContents(String),
+    /// A legacy boot menu build's manifest (size, digest, details).
+    BootMenuContents(String),
     /// A legacy rootfs build's profile packs.
     SnapshotProfiles(String),
 }
@@ -86,6 +91,7 @@ pub enum LoadRequest {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DetailsTarget {
     Uboot(String),
+    BootMenu(String),
     Snapshot(String),
     /// The selected bundle, whose manifest is already loaded.
     Bundle(String),
@@ -372,6 +378,7 @@ fn build(key: &MenuKey, state: &AppState) -> Level {
         MenuKey::Local => local(state),
         MenuKey::Custom => custom(state),
         MenuKey::Uboot => uboot(state),
+        MenuKey::BootMenu => boot_menu(state),
         MenuKey::Snapshot => snapshot(state),
         MenuKey::Device => device(state),
         MenuKey::Profiles => profiles(state),
@@ -607,6 +614,12 @@ fn custom(state: &AppState) -> Level {
         .find(|b| Some(b.id.as_str()) == state.selection.uboot.as_deref())
         .map(|b| b.display_name())
         .unwrap_or_else(|| "(select)".to_string());
+    let boot_menu = state
+        .boot_menu_builds
+        .iter()
+        .find(|b| Some(b.id.as_str()) == state.selection.boot_menu.as_deref())
+        .map(|b| b.display_name())
+        .unwrap_or_else(|| "(select)".to_string());
     let snapshot = state
         .snapshot_builds
         .iter()
@@ -616,6 +629,7 @@ fn custom(state: &AppState) -> Level {
 
     let items = vec![
         MenuItem::plain("U-Boot build", Action::Open(MenuKey::Uboot)).with_detail(uboot),
+        MenuItem::plain("Boot menu build", Action::Open(MenuKey::BootMenu)).with_detail(boot_menu),
         MenuItem::plain("Snapshot build", Action::Open(MenuKey::Snapshot)).with_detail(snapshot),
     ];
     let mut level = level_of(
@@ -644,6 +658,34 @@ fn uboot(state: &AppState) -> Level {
         .collect();
     let mut level = level_of(MenuKey::Uboot, "U-Boot build", LevelKind::SinglePick, items);
     level.crumb = "Source \u{203a} Custom \u{203a} U-Boot build".to_string();
+    level.can_refresh = true;
+    if level.items.is_empty() {
+        level.items = vec![MenuItem::inert("(none found)")];
+    }
+    level
+}
+
+fn boot_menu(state: &AppState) -> Level {
+    let items: Vec<MenuItem> = state
+        .boot_menu_builds
+        .iter()
+        .map(|b| {
+            let mut item = MenuItem::plain(b.display_name(), Action::PickBootMenu(b.id.clone()))
+                .with_detail(human_time(&b.mtime))
+                .with_icon(Icon::for_source(&b.source))
+                .selected_if(Some(b.id.as_str()) == state.selection.boot_menu.as_deref());
+            item.on_focus = Some(LoadRequest::BootMenuContents(b.id.clone()));
+            item.details = Some(DetailsTarget::BootMenu(b.id.clone()));
+            item
+        })
+        .collect();
+    let mut level = level_of(
+        MenuKey::BootMenu,
+        "Boot menu build",
+        LevelKind::SinglePick,
+        items,
+    );
+    level.crumb = "Source \u{203a} Custom \u{203a} Boot menu build".to_string();
     level.can_refresh = true;
     if level.items.is_empty() {
         level.items = vec![MenuItem::inert("(none found)")];
@@ -893,6 +935,10 @@ pub fn activate(ctrl: &Arc<Controller>, level: &Level, index: usize) -> Move {
             ctrl.select_uboot(id);
             Move::Pop
         }
+        Action::PickBootMenu(id) => {
+            ctrl.select_boot_menu(id);
+            Move::Pop
+        }
         Action::PickSnapshot(id) => {
             ctrl.select_snapshot_build(id);
             Move::Pop
@@ -990,6 +1036,15 @@ pub fn details_text(state: &AppState, target: &DetailsTarget) -> (String, String
                     .unwrap_or_else(|| "(gone)".to_string()),
             )
         }
+        DetailsTarget::BootMenu(id) => {
+            let build = state.boot_menu_builds.iter().find(|b| &b.id == id);
+            (
+                "Boot menu details".to_string(),
+                build
+                    .map(|b| b.details_text())
+                    .unwrap_or_else(|| "(gone)".to_string()),
+            )
+        }
         DetailsTarget::Snapshot(id) => {
             let build = state.snapshot_builds.iter().find(|b| &b.id == id);
             (
@@ -1056,6 +1111,48 @@ mod tests {
                 archive: None,
             })
             .collect()
+    }
+
+    #[test]
+    fn the_custom_flow_offers_a_boot_menu_of_its_own() {
+        // The boot menu is built separately from the bootloader, so it is picked
+        // separately too.
+        let mut s = state();
+        s.boot_menu_builds = vec![FalconBuild {
+            id: "m".into(),
+            label: "bootmenu d31d718".into(),
+            mtime: "2026-09-16T18:25:35Z".into(),
+            image_location: "https://i.invalid/falcon-bootmenu/m/flipper-one/bootmenu-falcon.itb"
+                .into(),
+            manifest_location: "https://i.invalid/falcon-bootmenu/m/manifest.json".into(),
+            source: Source::Server,
+            size_bytes: 19_450_880,
+            sha256: None,
+            details: None,
+            loaded: true,
+        }];
+        s.selection.boot_menu = Some("m".into());
+
+        let custom = build(&MenuKey::Custom, &s);
+        let labels: Vec<&str> = custom.items.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(labels, ["U-Boot build", "Boot menu build", "Snapshot build"]);
+        assert_eq!(custom.items[1].detail, "bootmenu d31d718");
+
+        let level = build(&MenuKey::BootMenu, &s);
+        assert_eq!(level.kind, LevelKind::SinglePick);
+        assert!(level.items[0].selected);
+        assert_eq!(level.items[0].action, Action::PickBootMenu("m".into()));
+        assert_eq!(
+            level.items[0].on_focus,
+            Some(LoadRequest::BootMenuContents("m".into()))
+        );
+        assert_eq!(level.details_at(0), Some(DetailsTarget::BootMenu("m".into())));
+
+        // An origin publishing no listing still opens the level, just empty.
+        s.boot_menu_builds.clear();
+        let empty = build(&MenuKey::BootMenu, &s);
+        assert_eq!(empty.items.len(), 1);
+        assert_eq!(empty.items[0].action, Action::Inert);
     }
 
     #[test]

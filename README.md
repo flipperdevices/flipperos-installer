@@ -242,18 +242,19 @@ The *custom development build* flow reads the image server's two-level catalog
 (default base `https://dl-linux-images.flipp.dev`, override with `--server`):
 
 - **U-Boot:** `/u-boot/manifest.json` lists build directories; each build's
-  `manifest.json` contains `<board>/u-boot-rockchip.bin` and, beside it,
-  `<board>/bootmenu-falcon.itb`. The installer flashes
-  `<board>/u-boot-rockchip.bin` for the detected board (`flipper-one`, else
-  `generic`), and takes the boot menu from the same directory.
+  `manifest.json` contains `<board>/u-boot-rockchip.bin`. The installer flashes
+  the one for the detected board (`flipper-one`, else `generic`).
+- **Boot menu:** `/falcon-bootmenu/manifest.json` lists build directories; each
+  build's `manifest.json` contains `<board>/bootmenu-falcon.itb` (see
+  [The boot menu](#the-boot-menu)).
 - **Snapshots (rootfs):** `/rootfs/manifest.json` lists build directories; each
   build's `manifest.json` contains per-profile packs
   `<Profile>_<build>_stock_pack.zst` (full) and `<Profile>_<build>_stock_inc_pack.zst`
   (incremental delta vs. Minimal).
 
-Both lists are presented **newest first**, and the operator picks one U-Boot build
-and one snapshot build — any combination, which is what makes this the *custom*
-flow rather than the default one.
+Every list is presented **newest first**, and the operator picks one build from
+each — any combination, which is what makes this the *custom* flow rather than the
+default one.
 
 Either way — bundle or custom pair — **Minimal is always deployed** (from its full
 pack); any extra profiles the operator selects are received from their
@@ -384,16 +385,22 @@ Where it comes from:
 
 - bundle: `boot-menu/<board>/bootmenu-falcon.itb`, for the same board directory
   the bootloader is taken from;
-- custom development build: `<board>/bootmenu-falcon.itb`, published beside
-  `<board>/u-boot-rockchip.bin` in the U-Boot build directory.
+- custom development build: `<board>/bootmenu-falcon.itb` from the
+  `falcon-bootmenu/` build the operator picked, which is a build of its own
+  because the image server builds the menu separately from the bootloader.
 
-It is verified against its manifest digest exactly like the bootloader, and it is
-staged with the other artifacts under `verify first`. A build that ships no boot
-menu is still installable: the loader partition is left empty, with a warning, and
-the board boots through full U-Boot as it did before.
+A U-Boot build from before that split carries `<board>/bootmenu-falcon.itb` in its
+own directory, and the installer still reads it — but only when no
+`falcon-bootmenu/` listing is reachable at all, which is what keeps an older
+removable-media mirror working.
+
+The image is verified against its manifest digest exactly like the bootloader, and
+it is staged with the other artifacts under `verify first`. A source that offers no
+boot menu is still installable: the loader partition is left empty, with a warning,
+and the board boots through full U-Boot as it did before.
 
 The loader partition runs from 32 KiB to 60 MiB, so it holds 58.6 MiB. The image
-is ~39 MiB today and grows with the menu, so an install that would not fit is
+is ~19 MiB today and grows with the menu, so an install that would not fit is
 refused **before** anything is erased, rather than failing with the target already
 wiped. That check is what will eventually ask for a larger partition.
 

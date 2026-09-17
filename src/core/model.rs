@@ -172,10 +172,12 @@ pub struct UbootBuild {
     pub sha256: Option<String>,
     /// Build + source details from the manifest; `None` until fetched.
     pub details: Option<BuildDetails>,
-    /// The Falcon boot menu shipped with this build, if it ships one. `None`
-    /// until the manifest has been read, and after that for a build predating
-    /// the boot menu.
-    pub boot_menu: Option<BootMenu>,
+    /// The Falcon boot menu this build carries in its own directory, if it
+    /// carries one. `None` until the manifest has been read, and after that for
+    /// every build that predates the boot menu or postdates the split that moved
+    /// it into a listing of its own — see [`FalconBuild`]. Only a fallback now,
+    /// for an origin that publishes no such listing.
+    pub boot_menu: Option<FalconImage>,
     /// Whether this build's manifest has been read (filling [`Self::size_bytes`],
     /// [`Self::sha256`], [`Self::details`] and [`Self::boot_menu`]). Mirrors
     /// [`SnapshotBuild::loaded`]: both kinds of build carry a manifest and are
@@ -183,15 +185,17 @@ pub struct UbootBuild {
     pub loaded: bool,
 }
 
-/// The Falcon-mode boot menu FIT image (`bootmenu-falcon.itb`) that ships
-/// alongside a U-Boot build: a kernel plus an initramfs that draws the graphical
-/// boot menu.
+/// A Falcon-mode FIT image — a kernel plus an initramfs that U-Boot starts
+/// without going through a full boot — written raw to a fixed place on the
+/// target.
 ///
-/// It is written to the start of the loader partition, and only on UFS, where
-/// the boot ROM reads U-Boot from a boot LU and leaves that partition free.
-/// Everywhere else U-Boot itself occupies it.
+/// Two of them exist: the boot menu (`bootmenu-falcon.itb`), which goes to the
+/// start of the loader partition, and the recovery system
+/// (`recovery-falcon.itb`), which goes to its own logical unit. Both are UFS-only
+/// for the same reason: the boot ROM reads U-Boot from a boot LU there, leaving
+/// the loader partition free, and only a UFS device has the spare logical unit.
 #[derive(Clone, Debug)]
-pub struct BootMenu {
+pub struct FalconImage {
     /// URL (server) or path (media) of the `.itb`.
     pub location: String,
     pub source: Source,
@@ -222,6 +226,75 @@ impl UbootBuild {
     /// Multi-line details for the info popup, or a loading placeholder.
     pub fn details_text(&self) -> String {
         format_details(self.details.as_ref())
+    }
+}
+
+/// One build directory of a Falcon image listing (`falcon-bootmenu/`,
+/// `falcon-recovery/`), holding one image per board.
+///
+/// The image server builds these separately from the bootloader, so they are
+/// picked separately too — the counterpart of [`UbootBuild`] for everything that
+/// is not the bootloader itself.
+#[derive(Clone, Debug)]
+pub struct FalconBuild {
+    /// Stable id: the build's directory segment on the server.
+    pub id: String,
+    /// Short human label (revision + date).
+    pub label: String,
+    /// Modification time (ISO-8601), used for newest-first sorting.
+    pub mtime: String,
+    /// URL (server) or path (media) of this board's `.itb`.
+    pub image_location: String,
+    /// Location of this build's `manifest.json`, for lazily loading contents.
+    pub manifest_location: String,
+    pub source: Source,
+    /// Size of the image in bytes; 0 until the manifest has been read.
+    pub size_bytes: u64,
+    /// SHA-256 the manifest publishes for the image, if it publishes one.
+    pub sha256: Option<String>,
+    /// Build + source details from the manifest; `None` until fetched.
+    pub details: Option<BuildDetails>,
+    /// Whether this build's manifest has been read.
+    pub loaded: bool,
+}
+
+impl FalconBuild {
+    /// Build number from the (lazily fetched) manifest, if known.
+    pub fn build_number(&self) -> Option<u64> {
+        self.details.as_ref().and_then(|d| d.build.number)
+    }
+
+    /// Identifier shown in the lists: the manifest build number once fetched,
+    /// otherwise the human label as a placeholder/fallback.
+    pub fn display_name(&self) -> String {
+        match self.build_number() {
+            Some(n) => format!("#{n}"),
+            None => self.label.clone(),
+        }
+    }
+
+    pub fn summary(&self) -> String {
+        format!("{} ({}, {})", self.display_name(), human_time(&self.mtime), self.source.label())
+    }
+
+    /// Multi-line details for the info popup, or a loading placeholder.
+    pub fn details_text(&self) -> String {
+        format_details(self.details.as_ref())
+    }
+
+    /// The image this build offers for the board it was listed for. `None` until
+    /// the manifest has been read, since neither the size nor the digest the
+    /// install verifies against is known before that.
+    pub fn image(&self) -> Option<FalconImage> {
+        if !self.loaded {
+            return None;
+        }
+        Some(FalconImage {
+            location: self.image_location.clone(),
+            source: self.source.clone(),
+            size_bytes: self.size_bytes,
+            sha256: self.sha256.clone(),
+        })
     }
 }
 
@@ -420,6 +493,8 @@ pub struct SelectedBundle {
     /// Board ids this bundle ships U-Boot images for.
     pub device_types: Vec<String>,
     pub uboot: UbootBuild,
+    /// The Falcon boot menu for [`Self::board_dir`], if the bundle ships one.
+    pub boot_menu: Option<FalconImage>,
     pub build: SnapshotBuild,
 }
 
@@ -548,6 +623,8 @@ pub struct Selection {
     pub target_device: Option<String>,
     /// Selected U-Boot build id. [`InstallMode::Custom`] only.
     pub uboot: Option<String>,
+    /// Selected Falcon boot menu build id. [`InstallMode::Custom`] only.
+    pub boot_menu: Option<String>,
     /// Selected snapshot build id. [`InstallMode::Custom`] only.
     pub snapshot_build: Option<String>,
     /// Extra profile names to deploy (Minimal is always deployed implicitly).
@@ -639,6 +716,8 @@ pub struct AppState {
     pub devices: Vec<StorageDevice>,
     /// Available U-Boot builds, newest first.
     pub uboot_builds: Vec<UbootBuild>,
+    /// Available Falcon boot menu builds, newest first.
+    pub boot_menu_builds: Vec<FalconBuild>,
     /// Available snapshot builds, newest first.
     pub snapshot_builds: Vec<SnapshotBuild>,
     pub selection: Selection,
@@ -718,6 +797,48 @@ impl AppState {
                 self.uboot_builds.iter().find(|b| b.id == id)
             }
         }
+    }
+
+    /// The Falcon boot menu image this run would write: the one a bundle pins, or
+    /// the one hand-picked from the image server.
+    ///
+    /// Falls back to the menu the selected U-Boot build carries in its own
+    /// directory, which is how an origin publishing no `falcon-bootmenu/` listing
+    /// — an older removable-media mirror, or a U-Boot build from before the split
+    /// — still yields a menu.
+    pub fn selected_boot_menu(&self) -> Option<FalconImage> {
+        match self.selection.mode {
+            InstallMode::Bundle => self.bundle.as_ref()?.boot_menu.clone(),
+            InstallMode::Custom => match self.selection.boot_menu.as_deref() {
+                Some(id) => self
+                    .boot_menu_builds
+                    .iter()
+                    .find(|b| b.id == id)
+                    .and_then(|b| b.image()),
+                None => self.selected_uboot()?.boot_menu.clone(),
+            },
+        }
+    }
+
+    /// Value for the boot menu status line: the hand-picked build if there is
+    /// one, else what the image a bundle or a U-Boot build supplied says about
+    /// itself — there being no build to name in that case.
+    pub fn boot_menu_summary(&self) -> Option<String> {
+        if self.selection.mode == InstallMode::Custom {
+            if let Some(id) = self.selection.boot_menu.as_deref() {
+                return self
+                    .boot_menu_builds
+                    .iter()
+                    .find(|b| b.id == id)
+                    .map(|b| b.summary());
+            }
+        }
+        let image = self.selected_boot_menu()?;
+        Some(format!(
+            "{} ({})",
+            human_bytes(image.size_bytes),
+            image.source.label()
+        ))
     }
 
     /// The currently selected snapshot build: the one a bundle pins, or the one
@@ -853,5 +974,92 @@ mod tests {
             };
             assert!(!state.can_reboot(), "{}", state.phase.label());
         }
+    }
+
+    fn falcon_image(location: &str, size: u64) -> FalconImage {
+        FalconImage {
+            location: location.to_string(),
+            source: Source::Server,
+            size_bytes: size,
+            sha256: None,
+        }
+    }
+
+    fn uboot_carrying(menu: Option<FalconImage>) -> UbootBuild {
+        UbootBuild {
+            id: "u".into(),
+            label: "u".into(),
+            mtime: String::new(),
+            image_location: "https://i.invalid/u/flipper-one/u-boot-rockchip.bin".into(),
+            manifest_location: "https://i.invalid/u/manifest.json".into(),
+            source: Source::Server,
+            size_bytes: 10,
+            sha256: None,
+            details: None,
+            boot_menu: menu,
+            loaded: true,
+        }
+    }
+
+    #[test]
+    fn the_boot_menu_listing_wins_over_the_one_inside_a_uboot_build() {
+        let in_tree = falcon_image("https://i.invalid/u/flipper-one/bootmenu-falcon.itb", 40);
+        let listed = FalconBuild {
+            id: "m".into(),
+            label: "m".into(),
+            mtime: String::new(),
+            image_location: "https://i.invalid/falcon-bootmenu/m/flipper-one/bootmenu-falcon.itb"
+                .into(),
+            manifest_location: "https://i.invalid/falcon-bootmenu/m/manifest.json".into(),
+            source: Source::Server,
+            size_bytes: 19,
+            sha256: None,
+            details: None,
+            loaded: true,
+        };
+        let mut state = AppState {
+            uboot_builds: vec![uboot_carrying(Some(in_tree))],
+            boot_menu_builds: vec![listed.clone()],
+            selection: Selection {
+                mode: InstallMode::Custom,
+                uboot: Some("u".to_string()),
+                boot_menu: Some("m".to_string()),
+                ..Selection::default()
+            },
+            ..AppState::default()
+        };
+        let picked = state.selected_boot_menu().expect("a menu");
+        assert_eq!(picked.location, listed.image_location);
+        assert_eq!(picked.size_bytes, 19);
+
+        // With no listing to pick from, the menu the U-Boot build carries is what
+        // an origin publishing none still yields.
+        state.boot_menu_builds.clear();
+        state.selection.boot_menu = None;
+        assert_eq!(state.selected_boot_menu().expect("a menu").size_bytes, 40);
+
+        // A U-Boot build carrying none either leaves the loader partition empty.
+        state.uboot_builds = vec![uboot_carrying(None)];
+        assert!(state.selected_boot_menu().is_none());
+    }
+
+    #[test]
+    fn a_boot_menu_build_offers_nothing_until_its_manifest_is_read() {
+        // The size and digest the install verifies against arrive with the
+        // manifest, so an unloaded build must not be installed from.
+        let build = FalconBuild {
+            id: "m".into(),
+            label: "m".into(),
+            mtime: String::new(),
+            image_location: "https://i.invalid/m/flipper-one/bootmenu-falcon.itb".into(),
+            manifest_location: "https://i.invalid/m/manifest.json".into(),
+            source: Source::Server,
+            size_bytes: 0,
+            sha256: None,
+            details: None,
+            loaded: false,
+        };
+        assert!(build.image().is_none());
+        assert!(FalconBuild { loaded: true, ..build }.image().is_some());
     }
 }

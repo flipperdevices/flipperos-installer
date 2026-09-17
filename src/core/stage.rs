@@ -21,7 +21,7 @@ use crate::core::controller::{Config, Controller};
 use crate::core::fetch;
 use crate::core::install::{apply_verdict, receive_progress, OnMismatch, Ticker};
 use crate::core::model::{
-    human_bytes, BundleRef, PackFile, ProfilePack, SnapshotBuild, Source, UbootBuild,
+    human_bytes, BundleRef, FalconImage, PackFile, ProfilePack, SnapshotBuild, Source, UbootBuild,
 };
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -49,11 +49,16 @@ pub struct Artifact {
 
 /// Everything the run will read, in install order.
 ///
-/// The boot menu is staged whenever the U-Boot build carries one. Deciding
-/// whether it is wanted at all is [`crate::core::install::run`]'s job: it clears
-/// the field for a target that has no loader partition to spare, so nothing here
-/// has to know what kind of device is being installed onto.
-pub fn plan(uboot: &UbootBuild, build: &SnapshotBuild, extras: &[ProfilePack]) -> Vec<Artifact> {
+/// A boot menu passed here is staged. Deciding whether it is wanted at all is
+/// [`crate::core::install::run`]'s job: it passes `None` for a target that has no
+/// loader partition to spare, so nothing here has to know what kind of device is
+/// being installed onto.
+pub fn plan(
+    uboot: &UbootBuild,
+    boot_menu: Option<&FalconImage>,
+    build: &SnapshotBuild,
+    extras: &[ProfilePack],
+) -> Vec<Artifact> {
     let mut out = Vec::new();
     out.push(Artifact {
         label: "u-boot image".to_string(),
@@ -63,15 +68,8 @@ pub fn plan(uboot: &UbootBuild, build: &SnapshotBuild, extras: &[ProfilePack]) -
         size: uboot.size_bytes,
         rel: "u-boot-rockchip.bin".to_string(),
     });
-    if let Some(menu) = &uboot.boot_menu {
-        out.push(Artifact {
-            label: "boot menu image".to_string(),
-            location: menu.location.clone(),
-            source: menu.source.clone(),
-            sha256: menu.sha256.clone(),
-            size: menu.size_bytes,
-            rel: file_name(&menu.location),
-        });
+    if let Some(menu) = boot_menu {
+        out.push(image_artifact("boot menu image", menu));
     }
     if let Some(home) = &build.home_pack {
         out.push(pack_artifact("/home seed", home));
@@ -85,6 +83,17 @@ pub fn plan(uboot: &UbootBuild, build: &SnapshotBuild, extras: &[ProfilePack]) -
         }
     }
     out
+}
+
+fn image_artifact(label: &str, image: &FalconImage) -> Artifact {
+    Artifact {
+        label: label.to_string(),
+        location: image.location.clone(),
+        source: image.source.clone(),
+        sha256: image.sha256.clone(),
+        size: image.size_bytes,
+        rel: file_name(&image.location),
+    }
 }
 
 fn pack_artifact(label: &str, pack: &PackFile) -> Artifact {
@@ -135,18 +144,19 @@ impl Staged {
         }
     }
 
-    /// Point a U-Boot build at its staged image, and its boot menu at the staged
-    /// copy of that.
+    /// Point a U-Boot build at its staged image.
     pub fn localise_uboot(&self, uboot: &mut UbootBuild) {
         if let Some(path) = self.staged_path(&uboot.image_location) {
             uboot.image_location = path.to_string();
             uboot.source = self.local_source();
         }
-        if let Some(menu) = uboot.boot_menu.as_mut() {
-            if let Some(path) = self.staged_path(&menu.location) {
-                menu.location = path.to_string();
-                menu.source = self.local_source();
-            }
+    }
+
+    /// Point a Falcon image at its staged copy.
+    pub fn localise_image(&self, image: &mut FalconImage) {
+        if let Some(path) = self.staged_path(&image.location) {
+            image.location = path.to_string();
+            image.source = self.local_source();
         }
     }
 
@@ -194,12 +204,13 @@ impl Drop for Staged {
 /// warning.
 pub fn guard_not_on_target(
     uboot: &UbootBuild,
+    boot_menu: Option<&FalconImage>,
     build: &SnapshotBuild,
     extras: &[ProfilePack],
     disk: &str,
 ) -> Result<()> {
     let mounts = crate::core::removable::mounts_on(disk);
-    check_not_on_mounts(&plan(uboot, build, extras), &mounts, disk)
+    check_not_on_mounts(&plan(uboot, boot_menu, build, extras), &mounts, disk)
 }
 
 /// The decision [`guard_not_on_target`] makes, separated from reading
@@ -461,7 +472,6 @@ fn copy(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::model::BootMenu;
 
     fn pack(name: &str, size: u64, sha: Option<&str>) -> PackFile {
         PackFile {
@@ -522,16 +532,13 @@ mod tests {
         }
     }
 
-    /// The same build, carrying the boot menu a UFS run would install.
-    fn uboot_with_boot_menu() -> UbootBuild {
-        UbootBuild {
-            boot_menu: Some(BootMenu {
-                location: "https://example.invalid/u/flipper-one/bootmenu-falcon.itb".into(),
-                source: Source::Server,
-                size_bytes: 99,
-                sha256: Some("ee".into()),
-            }),
-            ..uboot()
+    /// The boot menu a UFS run would install.
+    fn boot_menu() -> FalconImage {
+        FalconImage {
+            location: "https://example.invalid/m/flipper-one/bootmenu-falcon.itb".into(),
+            source: Source::Server,
+            size_bytes: 99,
+            sha256: Some("ee".into()),
         }
     }
 
@@ -539,7 +546,7 @@ mod tests {
     fn plans_only_what_is_needed_in_install_order() {
         let b = build();
         let extras = vec![b.profiles[1].clone()];
-        let p = plan(&uboot(), &b, &extras);
+        let p = plan(&uboot(), None, &b, &extras);
 
         let labels: Vec<&str> = p.iter().map(|a| a.label.as_str()).collect();
         assert_eq!(
@@ -553,14 +560,14 @@ mod tests {
         assert_eq!(p[2].rel, "Minimal_9_stock_pack.zst");
         assert_eq!(p[0].rel, "u-boot-rockchip.bin");
         // An unpublished digest is carried through as `None`, not invented.
-        let all = plan(&uboot(), &b, &b.profiles[1..]);
+        let all = plan(&uboot(), None, &b, &b.profiles[1..]);
         assert!(all.iter().any(|a| a.sha256.is_none()));
     }
 
     #[test]
     fn plans_the_boot_menu_right_after_the_bootloader() {
         let b = build();
-        let p = plan(&uboot_with_boot_menu(), &b, &[]);
+        let p = plan(&uboot(), Some(&boot_menu()), &b, &[]);
 
         let labels: Vec<&str> = p.iter().map(|a| a.label.as_str()).collect();
         assert_eq!(
@@ -575,8 +582,8 @@ mod tests {
     #[test]
     fn localise_rewrites_only_staged_artifacts() {
         let mut b = build();
-        let mut u = uboot_with_boot_menu();
-        let menu_location = u.boot_menu.as_ref().unwrap().location.clone();
+        let mut u = uboot();
+        let mut menu = boot_menu();
         let staged = Staged {
             dir: PathBuf::from("/run/cache"),
             map: vec![
@@ -585,7 +592,7 @@ mod tests {
                     "/run/cache/u-boot-rockchip.bin".to_string(),
                 ),
                 (
-                    menu_location,
+                    menu.location.clone(),
                     "/run/cache/bootmenu-falcon.itb".to_string(),
                 ),
                 (
@@ -597,11 +604,11 @@ mod tests {
             keep: true,
         };
         staged.localise_uboot(&mut u);
+        staged.localise_image(&mut menu);
         staged.localise_build(&mut b);
 
         assert_eq!(u.image_location, "/run/cache/u-boot-rockchip.bin");
         assert_eq!(u.source, Source::Local { root: "/run/cache".into() });
-        let menu = u.boot_menu.as_ref().unwrap();
         assert_eq!(menu.location, "/run/cache/bootmenu-falcon.itb");
         assert_eq!(menu.source, Source::Local { root: "/run/cache".into() });
         let minimal = b.profiles[0].full.as_ref().unwrap();
@@ -755,14 +762,14 @@ mod tests {
         let mut b = build();
         let disk = "/dev/definitely-not-a-real-disk";
         // Nothing is mounted from that disk, so a remote bundle is fine.
-        assert!(guard_not_on_target(&uboot(), &b, &[], disk).is_ok());
+        assert!(guard_not_on_target(&uboot(), None, &b, &[], disk).is_ok());
         // A local pack under a mountpoint of the target would be caught; with no
         // such mount present the guard is a no-op, which is what this asserts.
         if let Some(full) = b.profiles[0].full.as_mut() {
             full.location = "/mnt/sd/profile-packs/Minimal_9_stock_pack.zst".into();
             full.source = Source::Local { root: "/mnt/sd".into() };
         }
-        assert!(guard_not_on_target(&uboot(), &b, &[], disk).is_ok());
+        assert!(guard_not_on_target(&uboot(), None, &b, &[], disk).is_ok());
     }
 
     #[test]

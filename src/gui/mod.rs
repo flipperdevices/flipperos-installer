@@ -517,7 +517,7 @@ fn apply(win: &MainWindow, state: &AppState) {
         _ => format!(
             "{} target(s), {} build(s) found",
             state.devices.len(),
-            state.uboot_builds.len() + state.snapshot_builds.len()
+            state.uboot_builds.len() + state.boot_menu_builds.len() + state.snapshot_builds.len()
         ),
     };
     win.set_info_text(info.into());

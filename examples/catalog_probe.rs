@@ -1,5 +1,6 @@
-//! Ad-hoc probe: fetch and print the newest U-Boot and snapshot builds from the
-//! real image server, and the profiles of the newest snapshot build.
+//! Ad-hoc probe: fetch and print the newest U-Boot, boot menu and snapshot
+//! builds from the real image server, and the profiles of the newest snapshot
+//! build.
 //!
 //! Run with: `cargo run --example catalog_probe --no-default-features`
 
@@ -19,19 +20,28 @@ fn main() {
     for b in &uboot {
         println!("  {}  [{}]", b.summary(), b.mtime);
         println!("      -> {}", b.image_location);
-        // The image size, digest and boot menu only arrive with the manifest.
-        // The locations share this build's (very long) directory, so print only
-        // what distinguishes them.
+        // The image size and digest only arrive with the manifest. So does the
+        // boot menu, for a build old enough to carry one of its own.
         match catalog::load_uboot_contents(b, "flipper-one") {
-            Ok(c) => match c.boot_menu {
-                Some(m) => println!(
-                    "      image {} B, menu {} B ({})",
-                    c.size,
-                    m.size_bytes,
-                    m.location.rsplit('/').next().unwrap_or(&m.location)
-                ),
-                None => println!("      image {} B, menu (none)", c.size),
-            },
+            Ok(c) => println!(
+                "      image {} B, in-tree menu {}",
+                c.size,
+                match c.boot_menu {
+                    Some(m) => format!("{} B", m.size_bytes),
+                    None => "(none)".to_string(),
+                }
+            ),
+            Err(e) => println!("      manifest error: {e}"),
+        }
+    }
+
+    let menus = catalog::boot_menu_builds(&origin, "flipper-one", 5);
+    println!("\n== Boot menu builds (newest first): {} ==", menus.len());
+    for b in &menus {
+        println!("  {}  [{}]", b.summary(), b.mtime);
+        println!("      -> {}", b.image_location);
+        match catalog::load_boot_menu_contents(b, "flipper-one") {
+            Ok(c) => println!("      image {} B", c.size),
             Err(e) => println!("      manifest error: {e}"),
         }
     }

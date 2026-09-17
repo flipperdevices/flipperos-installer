@@ -431,29 +431,42 @@ impl Controller {
 
         self.log("querying image catalog…");
         let mut uboot_builds: Vec<UbootBuild> = Vec::new();
+        let mut boot_menu_builds: Vec<FalconBuild> = Vec::new();
         let mut snapshot_builds: Vec<SnapshotBuild> = Vec::new();
         for origin in &origins {
             uboot_builds.extend(catalog::uboot_builds(origin, &board_dir, LIMIT));
+            boot_menu_builds.extend(catalog::boot_menu_builds(origin, &board_dir, LIMIT));
             snapshot_builds.extend(catalog::snapshot_builds(origin, LIMIT));
         }
         // Newest first across all origins, then cap.
         uboot_builds.sort_by(|a, b| b.mtime.cmp(&a.mtime));
+        boot_menu_builds.sort_by(|a, b| b.mtime.cmp(&a.mtime));
         snapshot_builds.sort_by(|a, b| b.mtime.cmp(&a.mtime));
         uboot_builds.truncate(LIMIT);
+        boot_menu_builds.truncate(LIMIT);
         snapshot_builds.truncate(LIMIT);
 
         self.log(format!(
-            "catalog: {} u-boot build(s), {} snapshot build(s)",
+            "catalog: {} u-boot build(s), {} boot menu build(s), {} snapshot build(s)",
             uboot_builds.len(),
+            boot_menu_builds.len(),
             snapshot_builds.len()
         ));
 
         self.update(|s| {
             s.uboot_builds = uboot_builds;
+            s.boot_menu_builds = boot_menu_builds;
             s.snapshot_builds = snapshot_builds;
             if s.selection.uboot.is_none() {
                 if let Some(b) = s.uboot_builds.first() {
                     s.selection.uboot = Some(b.id.clone());
+                }
+            }
+            // Left unset when no origin publishes a boot menu listing, which is
+            // what lets `selected_boot_menu` fall back to the U-Boot build's own.
+            if s.selection.boot_menu.is_none() {
+                if let Some(b) = s.boot_menu_builds.first() {
+                    s.selection.boot_menu = Some(b.id.clone());
                 }
             }
             if s.selection.snapshot_build.is_none() {
@@ -471,6 +484,9 @@ impl Controller {
         }
         if let Some(id) = selection.uboot {
             self.load_uboot_contents(&id);
+        }
+        if let Some(id) = selection.boot_menu {
+            self.load_boot_menu_contents(&id);
         }
     }
 
@@ -494,6 +510,7 @@ impl Controller {
                 LoadRequest::Local => this.load_local(),
                 LoadRequest::Bundle(id) => this.load_bundle(id),
                 LoadRequest::UbootContents(id) => this.load_uboot_contents(id),
+                LoadRequest::BootMenuContents(id) => this.load_boot_menu_contents(id),
                 LoadRequest::SnapshotProfiles(id) => {
                     // One request reads everything the rootfs manifest offers:
                     // the packs to install and the metadata the popup shows.
@@ -755,6 +772,33 @@ impl Controller {
                 }
             }),
             Err(e) => self.log(format!("u-boot manifest: {e}")),
+        }
+    }
+
+    /// Fetch a Falcon boot menu build's manifest: the image's size and digest,
+    /// plus the build metadata for the details popup. Blocking, so call it from a
+    /// worker thread; a no-op if already loaded or unknown.
+    fn load_boot_menu_contents(&self, id: &str) {
+        let (build, board_dir) = {
+            let s = self.state.lock().unwrap();
+            match s.boot_menu_builds.iter().find(|b| b.id == id) {
+                Some(b) if !b.loaded => (b.clone(), self.board_dir(&s)),
+                _ => return,
+            }
+        };
+        match catalog::load_boot_menu_contents(&build, &board_dir) {
+            Ok(c) => self.update(|s| {
+                if let Some(b) = s.boot_menu_builds.iter_mut().find(|b| b.id == id) {
+                    b.size_bytes = c.size;
+                    b.sha256 = c.sha256;
+                    if !c.mtime.is_empty() {
+                        b.mtime = c.mtime;
+                    }
+                    b.details = Some(c.details);
+                    b.loaded = true;
+                }
+            }),
+            Err(e) => self.log(format!("boot menu manifest: {e}")),
         }
     }
 
@@ -1026,6 +1070,18 @@ impl Controller {
         let this = Arc::clone(self);
         let id = id.to_string();
         std::thread::spawn(move || this.load_uboot_contents(&id));
+    }
+
+    /// Pick a Falcon boot menu build by hand. Like [`Self::select_uboot`], this
+    /// is the custom flow, and the manifest is read in the background.
+    pub fn select_boot_menu(self: &Arc<Self>, id: &str) {
+        self.update(|s| {
+            s.selection.mode = InstallMode::Custom;
+            s.selection.boot_menu = Some(id.to_string());
+        });
+        let this = Arc::clone(self);
+        let id = id.to_string();
+        std::thread::spawn(move || this.load_boot_menu_contents(&id));
     }
 
     /// Pick a snapshot build by hand, resetting the extra-profile selection, and

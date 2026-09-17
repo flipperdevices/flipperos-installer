@@ -26,7 +26,8 @@ use std::sync::Arc;
 use crate::core::controller::{Config, Controller};
 use crate::core::layout::{self, Layout};
 use crate::core::model::{
-    human_bytes, FetchMode, PackFile, ProfilePack, Source, StorageDevice, StorageKind, UbootBuild,
+    human_bytes, FalconImage, FetchMode, PackFile, ProfilePack, Source, StorageDevice, StorageKind,
+    UbootBuild,
 };
 use crate::core::{fetch, stage, storage, ufs};
 
@@ -255,12 +256,13 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
         return Err("snapshot build has no Minimal profile".to_string());
     }
     // The boot menu goes to the loader partition, and only a UFS target has one to
-    // spare — everywhere else U-Boot itself occupies it. Dropping it here is what
-    // keeps it out of the staging plan too, so a non-UFS run never fetches an
-    // image it has nowhere to put.
-    if device.kind != StorageKind::Ufs {
-        uboot.boot_menu = None;
-    }
+    // spare — everywhere else U-Boot itself occupies it. Resolving it only for UFS
+    // is what keeps it out of the staging plan too, so a non-UFS run never fetches
+    // an image it has nowhere to put.
+    let mut boot_menu = match device.kind {
+        StorageKind::Ufs => state.selected_boot_menu(),
+        _ => None,
+    };
     // Extra profiles the user opted into, in build order.
     let extras: Vec<ProfilePack> = build
         .extra_profiles()
@@ -311,8 +313,8 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
     // this run will write, and `install_uboot` writes that same one.
     let boot_lu = ufs_boot_lu_plan(ctrl, &device);
     guard_ufs_boot_lu(cfg, ctrl, &device, &uboot, boot_lu.as_ref())?;
-    guard_boot_menu_fits(cfg, ctrl, &uboot)?;
-    stage::guard_not_on_target(&uboot, &build, &extras, &device.path)?;
+    guard_boot_menu_fits(cfg, ctrl, boot_menu.as_ref())?;
+    stage::guard_not_on_target(&uboot, boot_menu.as_ref(), &build, &extras, &device.path)?;
 
     // Resolve the Btrfs layout: prefer one shipped with the images, else the
     // built-in default.
@@ -328,7 +330,7 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
     // artifacts are checked before that point at all.
     let fetch_mode = state.selection.fetch;
     let policy = OnMismatch::for_mode(fetch_mode);
-    let plan = stage::plan(&uboot, &build, &extras);
+    let plan = stage::plan(&uboot, boot_menu.as_ref(), &build, &extras);
 
     // A locally supplied `*.tar.zst` is unpacked into the scratch dir first; the
     // bundle already describes its files at the paths they will occupy.
@@ -348,7 +350,7 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
         FetchMode::Stream => 0,
     };
     let total_steps = 4
-        + uboot.boot_menu.is_some() as u32
+        + boot_menu.is_some() as u32
         + pending_archive.is_some() as u32
         + verify_steps
         + deployed as u32 * 3
@@ -367,6 +369,9 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
         FetchMode::VerifyFirst => {
             let staged = stage::run(cfg, ctrl, &plan, &mut ticker)?;
             staged.localise_uboot(&mut uboot);
+            if let Some(menu) = boot_menu.as_mut() {
+                staged.localise_image(menu);
+            }
             staged.localise_build(&mut build);
             Some(staged)
         }
@@ -413,8 +418,8 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
     install_uboot(cfg, ctrl, &device, &uboot, boot_lu.as_ref(), policy)?;
 
     // 3a. Boot menu, onto the loader partition the bootloader left free. A no-op
-    // unless the target is UFS and the build ships one.
-    install_boot_menu(cfg, ctrl, &device, &uboot, policy, &mut ticker)?;
+    // unless the target is UFS and a menu was resolved for it.
+    install_boot_menu(cfg, ctrl, &device, boot_menu.as_ref(), policy, &mut ticker)?;
 
     // 4. Filesystem + subvolumes.
     ticker.begin(ctrl, &format!("mkfs.btrfs {root_part}"));
@@ -691,8 +696,12 @@ fn guard_ufs_boot_lu(
 /// with the target already wiped. The image is the largest thing the installer
 /// writes outside the filesystem and it grows with every Falcon build, so this is
 /// the check that will eventually ask for a bigger partition.
-fn guard_boot_menu_fits(cfg: &Config, ctrl: &Controller, uboot: &UbootBuild) -> Result<()> {
-    let Some(menu) = &uboot.boot_menu else {
+fn guard_boot_menu_fits(
+    cfg: &Config,
+    ctrl: &Controller,
+    boot_menu: Option<&FalconImage>,
+) -> Result<()> {
+    let Some(menu) = boot_menu else {
         return Ok(());
     };
     match menu.size_bytes {
@@ -967,26 +976,26 @@ fn install_uboot(
 /// never looks at this partition, whereas on every other kind of device U-Boot
 /// occupies it and has nowhere else to go.
 ///
-/// A build that ships no boot menu leaves the partition empty rather than falling
-/// back to a copy of U-Boot the boot ROM would never read. The board then boots
-/// through full U-Boot as it always did, only without the graphical menu.
+/// A source that offers no boot menu leaves the partition empty rather than
+/// falling back to a copy of U-Boot the boot ROM would never read. The board then
+/// boots through full U-Boot as it always did, only without the graphical menu.
 fn install_boot_menu(
     cfg: &Config,
     ctrl: &Controller,
     device: &StorageDevice,
-    build: &UbootBuild,
+    boot_menu: Option<&FalconImage>,
     policy: OnMismatch,
     ticker: &mut Ticker,
 ) -> Result<()> {
     if device.kind != StorageKind::Ufs {
         return Ok(());
     }
-    let Some(menu) = &build.boot_menu else {
-        ctrl.log(format!(
-            "warning: u-boot {} ships no boot menu image, so the loader partition is \
-             left empty and the board boots through full u-boot",
-            build.label
-        ));
+    let Some(menu) = boot_menu else {
+        ctrl.log(
+            "warning: no boot menu image was selected, so the loader partition is \
+             left empty and the board boots through full u-boot"
+                .to_string(),
+        );
         return Ok(());
     };
     ticker.begin(ctrl, "installing boot menu");
@@ -1667,7 +1676,6 @@ fn render(cmd: &Command) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::model::BootMenu;
     use std::io::Cursor;
 
     #[test]
@@ -1681,25 +1689,13 @@ mod tests {
         assert_eq!(spare_boot_lu(ufs::BOOT_LUN_NONE), ufs::BOOT_LUN_A);
     }
 
-    /// A U-Boot build carrying a boot menu image of `size` bytes.
-    fn build_with_boot_menu(size: u64) -> UbootBuild {
-        UbootBuild {
-            id: "u".into(),
-            label: "u".into(),
-            mtime: String::new(),
-            image_location: "https://example.invalid/u-boot-rockchip.bin".into(),
-            manifest_location: "https://example.invalid/manifest.json".into(),
+    /// A boot menu image of `size` bytes.
+    fn boot_menu_of(size: u64) -> FalconImage {
+        FalconImage {
+            location: "https://example.invalid/bootmenu-falcon.itb".into(),
             source: Source::Server,
-            size_bytes: 9_961_984,
+            size_bytes: size,
             sha256: None,
-            details: None,
-            boot_menu: Some(BootMenu {
-                location: "https://example.invalid/bootmenu-falcon.itb".into(),
-                source: Source::Server,
-                size_bytes: size,
-                sha256: None,
-            }),
-            loaded: true,
         }
     }
 
@@ -1717,8 +1713,8 @@ mod tests {
         };
 
         // The largest image that still fits, and the first one that does not.
-        guard_boot_menu_fits(&cfg, &ctrl, &build_with_boot_menu(LOADER_CAPACITY)).unwrap();
-        let err = guard_boot_menu_fits(&cfg, &ctrl, &build_with_boot_menu(LOADER_CAPACITY + 1))
+        guard_boot_menu_fits(&cfg, &ctrl, Some(&boot_menu_of(LOADER_CAPACITY))).unwrap();
+        let err = guard_boot_menu_fits(&cfg, &ctrl, Some(&boot_menu_of(LOADER_CAPACITY + 1)))
             .unwrap_err();
         assert!(err.contains("too small for a"), "{err}");
 
@@ -1728,10 +1724,10 @@ mod tests {
             ..Config::default()
         };
         assert!(dry.dry_run);
-        guard_boot_menu_fits(&dry, &ctrl, &build_with_boot_menu(LOADER_CAPACITY + 1)).unwrap();
+        guard_boot_menu_fits(&dry, &ctrl, Some(&boot_menu_of(LOADER_CAPACITY + 1))).unwrap();
 
         // A manifest that publishes no size leaves nothing to compare against.
-        guard_boot_menu_fits(&cfg, &ctrl, &build_with_boot_menu(0)).unwrap();
+        guard_boot_menu_fits(&cfg, &ctrl, Some(&boot_menu_of(0))).unwrap();
     }
 
     #[test]

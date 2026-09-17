@@ -28,7 +28,7 @@
 use serde::Deserialize;
 
 use crate::core::model::{
-    BootMenu, BuildDetails, BuildMeta, BundleLocation, BundleRef, PackFile, ProfilePack,
+    BuildDetails, BuildMeta, BundleLocation, BundleRef, FalconImage, PackFile, ProfilePack,
     SelectedBundle, SnapshotBuild, Source, SourceStamp, UbootBuild,
 };
 use crate::core::{archive, catalog, fetch};
@@ -379,7 +379,7 @@ pub fn resolve(
         .files
         .iter()
         .find(|f| f.path == menu_rel)
-        .map(|f| BootMenu {
+        .map(|f| FalconImage {
             location: location.join(&menu_rel),
             source: source.clone(),
             size_bytes: f.size,
@@ -396,7 +396,8 @@ pub fn resolve(
         size_bytes: image.size,
         sha256: image.digest(),
         details: Some(details.clone()),
-        boot_menu,
+        // The bundle's menu hangs off the bundle, not off this build.
+        boot_menu: None,
         loaded: true,
     };
 
@@ -482,6 +483,7 @@ pub fn resolve(
         board_dir,
         device_types: manifest.device_types(),
         uboot,
+        boot_menu,
         build,
     })
 }
@@ -795,7 +797,7 @@ mod tests {
             Some("4c383d5b2c89245de80d7f3f1c84f0db7ee79995eebebf12e6479016f71255b5")
         );
         // The boot menu comes from the same board's boot-menu directory.
-        let menu = bundle.uboot.boot_menu.as_ref().expect("boot menu");
+        let menu = bundle.boot_menu.as_ref().expect("boot menu");
         assert!(
             menu.location
                 .ends_with("/boot-menu/flipper-one/bootmenu-falcon.itb"),
@@ -912,7 +914,7 @@ mod tests {
         let repo = repo();
         let reference = remote_ref(&repo, "nightly", "x");
         let bundle = resolve(&reference, &reference.location, &manifest, "flipper-one").unwrap();
-        assert!(bundle.uboot.boot_menu.is_none());
+        assert!(bundle.boot_menu.is_none());
     }
 
     #[test]
@@ -926,7 +928,7 @@ mod tests {
         let repo = repo();
         let reference = remote_ref(&repo, "nightly", "x");
         let bundle = resolve(&reference, &reference.location, &manifest, "flipper-one").unwrap();
-        assert!(bundle.uboot.boot_menu.is_none());
+        assert!(bundle.boot_menu.is_none());
     }
 
     #[test]

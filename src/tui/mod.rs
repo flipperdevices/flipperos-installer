@@ -679,6 +679,9 @@ fn render_status(state: &AppState) -> String {
         .selected_uboot()
         .map(|b| b.summary())
         .unwrap_or_else(|| "—".to_string());
+    let boot_menu = state
+        .boot_menu_summary()
+        .unwrap_or_else(|| "—".to_string());
     let build = state
         .selected_build()
         .map(|b| b.summary())
@@ -694,7 +697,7 @@ fn render_status(state: &AppState) -> String {
         },
     };
     format!(
-        "Board   : {} ({})\nBoard id: {}\nPhase   : {}\n{bar}\n\nSource  : {source}\nTarget  : {target}\nU-Boot  : {uboot}\nSnapshot: {build}\nProfiles: {}\nFetch   : {}\nReady   : {}",
+        "Board   : {} ({})\nBoard id: {}\nPhase   : {}\n{bar}\n\nSource  : {source}\nTarget  : {target}\nU-Boot  : {uboot}\nBootmenu: {boot_menu}\nSnapshot: {build}\nProfiles: {}\nFetch   : {}\nReady   : {}",
         state.board.model,
         state.board.soc,
         state.board.board_id,

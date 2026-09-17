@@ -4,22 +4,31 @@
 //! Layout:
 //!   `<base>/u-boot/manifest.json`            -> list of U-Boot build dirs
 //!   `<base>/u-boot/<dir>/manifest.json`      -> files incl. `<board>/u-boot-rockchip.bin`
-//!                                               and `<board>/bootmenu-falcon.itb`
+//!   `<base>/falcon-bootmenu/manifest.json`   -> list of boot menu build dirs
+//!   `<base>/falcon-bootmenu/<dir>/manifest.json`
+//!                                            -> `<board>/bootmenu-falcon.itb`
 //!   `<base>/rootfs/manifest.json`            -> list of rootfs build dirs
 //!   `<base>/rootfs/<dir>/manifest.json`      -> `<Profile>_<build>_stock[_inc]_pack.zst`
 //!
 //! `<base>` is an HTTP(S) URL for the server or a filesystem path for media.
+//!
+//! The Falcon images used to be built by the U-Boot builder and published inside
+//! its directories. Builds from before that split still carry them, which is why
+//! [`load_uboot_contents`] keeps looking beside the bootloader.
 
 use serde::Deserialize;
 
 use crate::core::fetch;
 use crate::core::model::{
-    BootMenu, BuildDetails, PackFile, ProfilePack, SnapshotBuild, Source, UbootBuild,
+    BuildDetails, FalconBuild, FalconImage, PackFile, ProfilePack, SnapshotBuild, Source,
+    UbootBuild,
 };
 
 /// The flashable bootloader inside a U-Boot build's per-board directory.
 const UBOOT_IMAGE: &str = "u-boot-rockchip.bin";
-/// The Falcon-mode boot menu FIT, published beside the bootloader it belongs to.
+/// Top-level directory listing the Falcon boot menu builds.
+const BOOT_MENU_DIR: &str = "falcon-bootmenu";
+/// The Falcon-mode boot menu FIT inside a build's per-board directory.
 const BOOT_MENU_IMAGE: &str = "bootmenu-falcon.itb";
 
 /// A place to read the catalog from.
@@ -102,33 +111,119 @@ pub fn supported_device_types(origin: &Origin) -> Vec<String> {
     types
 }
 
-/// List the available U-Boot builds for `board_dir`, newest first (capped). The
-/// image size and digest are loaded lazily via [`load_uboot_contents`].
-pub fn uboot_builds(origin: &Origin, board_dir: &str, limit: usize) -> Vec<UbootBuild> {
-    let list: ListManifest = match fetch_json(&origin.join("u-boot/manifest.json")) {
+/// List the build directories under `top_dir`, newest first (capped), each with
+/// the base location its files hang off. An unreachable listing is an empty list
+/// rather than an error: the other origins may still have what the run needs.
+fn list_builds(origin: &Origin, top_dir: &str, limit: usize) -> Vec<(DirEntry, String)> {
+    let list: ListManifest = match fetch_json(&origin.join(&format!("{top_dir}/manifest.json"))) {
         Ok(l) => l,
         Err(_) => return Vec::new(),
     };
     newest_first(list.directories, limit)
         .into_iter()
         .map(|d| {
-            let base_location = origin.join(&format!("u-boot/{}", d.name));
-            let image_location = format!("{base_location}{board_dir}/{UBOOT_IMAGE}");
-            UbootBuild {
-                id: d.name.clone(),
-                label: uboot_label(&d.name),
-                mtime: d.mtime.unwrap_or_default(),
-                image_location,
-                manifest_location: format!("{base_location}manifest.json"),
-                source: origin.source(),
-                size_bytes: 0,
-                sha256: None,
-                details: None,
-                boot_menu: None,
-                loaded: false,
-            }
+            // Directory names already carry a trailing slash.
+            let base = origin.join(&format!("{top_dir}/{}", d.name));
+            (d, base)
         })
         .collect()
+}
+
+/// List the available U-Boot builds for `board_dir`, newest first (capped). The
+/// image size and digest are loaded lazily via [`load_uboot_contents`].
+pub fn uboot_builds(origin: &Origin, board_dir: &str, limit: usize) -> Vec<UbootBuild> {
+    list_builds(origin, "u-boot", limit)
+        .into_iter()
+        .map(|(d, base_location)| UbootBuild {
+            id: d.name.clone(),
+            label: uboot_label(&d.name),
+            mtime: d.mtime.unwrap_or_default(),
+            image_location: format!("{base_location}{board_dir}/{UBOOT_IMAGE}"),
+            manifest_location: format!("{base_location}manifest.json"),
+            source: origin.source(),
+            size_bytes: 0,
+            sha256: None,
+            details: None,
+            boot_menu: None,
+            loaded: false,
+        })
+        .collect()
+}
+
+/// List the available Falcon boot menu builds for `board_dir`, newest first
+/// (capped). The image size and digest are loaded lazily via
+/// [`load_boot_menu_contents`].
+pub fn boot_menu_builds(origin: &Origin, board_dir: &str, limit: usize) -> Vec<FalconBuild> {
+    falcon_builds(origin, BOOT_MENU_DIR, BOOT_MENU_IMAGE, "bootmenu", board_dir, limit)
+}
+
+/// The shared body of the Falcon image listings: same two-level layout as
+/// [`uboot_builds`], differing only in which directory is listed, which file is
+/// taken from it, and which revision names the build.
+fn falcon_builds(
+    origin: &Origin,
+    top_dir: &str,
+    image: &str,
+    revision_key: &str,
+    board_dir: &str,
+    limit: usize,
+) -> Vec<FalconBuild> {
+    list_builds(origin, top_dir, limit)
+        .into_iter()
+        .map(|(d, base_location)| FalconBuild {
+            id: d.name.clone(),
+            label: revision_label(&d.name, revision_key, top_dir),
+            mtime: d.mtime.unwrap_or_default(),
+            image_location: format!("{base_location}{board_dir}/{image}"),
+            manifest_location: format!("{base_location}manifest.json"),
+            source: origin.source(),
+            size_bytes: 0,
+            sha256: None,
+            details: None,
+            loaded: false,
+        })
+        .collect()
+}
+
+/// Fetch a Falcon boot menu build's manifest and extract the metadata for its
+/// `<board_dir>/bootmenu-falcon.itb`.
+pub fn load_boot_menu_contents(
+    build: &FalconBuild,
+    board_dir: &str,
+) -> Result<FalconContents, String> {
+    let bm: BuildManifest = fetch_json(&build.manifest_location)?;
+    falcon_contents(&bm, &build.manifest_location, board_dir, BOOT_MENU_IMAGE)
+}
+
+/// Parsed contents of a Falcon image build manifest: the image's size and digest,
+/// and the build metadata for the details popup.
+#[derive(Debug)]
+pub struct FalconContents {
+    pub size: u64,
+    pub sha256: Option<String>,
+    pub mtime: String,
+    pub details: BuildDetails,
+}
+
+/// The decision [`load_boot_menu_contents`] makes, separated from fetching the
+/// manifest so it can be exercised directly.
+fn falcon_contents(
+    bm: &BuildManifest,
+    manifest_location: &str,
+    board_dir: &str,
+    image: &str,
+) -> Result<FalconContents, String> {
+    // The build exists but ships nothing for this board. Report it rather than
+    // silently flashing whatever the URL happens to return.
+    let Some(f) = find_for_board(bm, board_dir, image) else {
+        return Err(format!("{manifest_location} lists no {board_dir}/{image}"));
+    };
+    Ok(FalconContents {
+        size: f.size,
+        sha256: f.digest(),
+        mtime: f.mtime.clone(),
+        details: bm.details(),
+    })
 }
 
 /// Parsed contents of a U-Boot build manifest: the flashable image's size and
@@ -140,12 +235,13 @@ pub struct UbootContents {
     pub sha256: Option<String>,
     pub mtime: String,
     pub details: BuildDetails,
-    /// `None` for a build predating the boot menu.
-    pub boot_menu: Option<BootMenu>,
+    /// `None` unless this build carries a boot menu in its own directory, which
+    /// only the builds predating [`boot_menu_builds`] do.
+    pub boot_menu: Option<FalconImage>,
 }
 
 /// Fetch a U-Boot build's manifest and extract the metadata for its
-/// `<board_dir>/u-boot-rockchip.bin`, plus the `<board_dir>/bootmenu-falcon.itb`
+/// `<board_dir>/u-boot-rockchip.bin`, plus any `<board_dir>/bootmenu-falcon.itb`
 /// published beside it.
 ///
 /// The sibling of [`load_profiles`]: both kinds of build carry a manifest, and
@@ -164,16 +260,7 @@ fn uboot_contents(
     board_dir: &str,
 ) -> Result<UbootContents, String> {
     let details = bm.details();
-    // A manifest may list its files either bare or under a leading directory, so
-    // match the tail rather than the whole path.
-    let find = |name: &str| {
-        let wanted = format!("{board_dir}/{name}");
-        bm.files
-            .iter()
-            .find(move |f| f.path == wanted || f.path.ends_with(&format!("/{wanted}")))
-    };
-
-    let Some(image) = find(UBOOT_IMAGE) else {
+    let Some(image) = find_for_board(bm, board_dir, UBOOT_IMAGE) else {
         // The build exists but ships nothing for this board. Report it rather
         // than silently flashing whatever the URL happens to return.
         return Err(format!(
@@ -181,10 +268,11 @@ fn uboot_contents(
             build.manifest_location
         ));
     };
-    // The boot menu is published in the same per-board directory as the image, so
-    // its location is that image's sibling. A build that ships none is still
-    // installable: the menu is only ever written on UFS.
-    let boot_menu = find(BOOT_MENU_IMAGE).map(|f| BootMenu {
+    // Builds from before the Falcon images moved into listings of their own carry
+    // the boot menu in the same per-board directory as the bootloader, so its
+    // location is that image's sibling. A build that ships none is still
+    // installable, from `falcon-bootmenu/` or with no menu at all.
+    let boot_menu = find_for_board(bm, board_dir, BOOT_MENU_IMAGE).map(|f| FalconImage {
         location: sibling_of(&build.image_location, BOOT_MENU_IMAGE),
         source: build.source.clone(),
         size_bytes: f.size,
@@ -198,6 +286,16 @@ fn uboot_contents(
         details,
         boot_menu,
     })
+}
+
+/// Find `<board_dir>/<name>` in a build manifest. A manifest may list its files
+/// either bare or under a leading directory, so match the tail rather than the
+/// whole path.
+fn find_for_board<'a>(bm: &'a BuildManifest, board_dir: &str, name: &str) -> Option<&'a FileEntry> {
+    let wanted = format!("{board_dir}/{name}");
+    bm.files
+        .iter()
+        .find(|f| f.path == wanted || f.path.ends_with(&format!("/{wanted}")))
 }
 
 /// Swap the last segment of `location` for `name`, naming a file in the same
@@ -378,6 +476,20 @@ fn snapshot_label(dir: &str) -> String {
     "rootfs".to_string()
 }
 
+/// Label a build after the revision that distinguishes it. A build directory is
+/// named for every source revision that went into it, and a Falcon image build
+/// shares most of them with the bootloader it was built against — the one named
+/// by `key` is the one that is its own.
+fn revision_label(dir: &str, key: &str, fallback: &str) -> String {
+    let prefix = format!("{key}=");
+    for seg in dir.trim_end_matches('/').split("__") {
+        if let Some(h) = seg.strip_prefix(&prefix) {
+            return format!("{key} {}", short(h));
+        }
+    }
+    fallback.to_string()
+}
+
 fn short(hash: &str) -> String {
     hash.chars().take(7).collect()
 }
@@ -431,8 +543,9 @@ fn fetch_json<T: serde::de::DeserializeOwned>(location: &str) -> Result<T, Strin
 mod tests {
     use super::*;
 
-    /// A U-Boot build directory as the image server publishes one: per-board
-    /// subdirectories holding the bootloader and the boot menu beside it.
+    /// A U-Boot build directory from before the Falcon images were split off:
+    /// per-board subdirectories holding the bootloader and the boot menu beside
+    /// it.
     const BUILD_MANIFEST: &str = r#"{
       "build": { "builder": "uboot", "number": 570 },
       "files": [
@@ -466,6 +579,42 @@ mod tests {
         serde_json::from_str(BUILD_MANIFEST).expect("valid build manifest")
     }
 
+    /// A `falcon-bootmenu` build directory, holding one image per board and none
+    /// of the bootloader files.
+    const BOOT_MENU_MANIFEST: &str = r#"{
+      "build": { "builder": "falcon-bootmenu", "number": 1 },
+      "files": [
+        { "path": "flipper-one/bootmenu-falcon-loader.bin", "size": 19734748, "sha256": "aa" },
+        { "path": "flipper-one/bootmenu-falcon.itb", "size": 19450880,
+          "mtime": "2026-09-16T18:25:21Z", "sha256": "bb" },
+        { "path": "generic/bootmenu-falcon.itb", "size": 19202048, "sha256": "cc" }
+      ]
+    }"#;
+
+    #[test]
+    fn reads_a_boot_menu_build_for_this_board() {
+        let bm: BuildManifest =
+            serde_json::from_str(BOOT_MENU_MANIFEST).expect("valid build manifest");
+        let c = falcon_contents(&bm, "m.json", "flipper-one", BOOT_MENU_IMAGE).unwrap();
+        assert_eq!(c.size, 19450880);
+        assert_eq!(c.sha256.as_deref(), Some("bb"));
+        assert_eq!(c.mtime, "2026-09-16T18:25:21Z");
+        assert_eq!(c.details.build.number, Some(1));
+
+        // A board the build does not ship is reported rather than guessed at.
+        let err = falcon_contents(&bm, "m.json", "sige5", BOOT_MENU_IMAGE).unwrap_err();
+        assert!(err.contains("lists no sige5/bootmenu-falcon.itb"), "{err}");
+    }
+
+    #[test]
+    fn labels_a_build_after_its_own_revision() {
+        // Every Falcon build directory starts with the bootloader revisions it was
+        // built against, so the label has to come off the segment that is its own.
+        let dir = "u=36d78f6__rk=96f5243__bootmenu=d31d718__menu=fb7251d/";
+        assert_eq!(revision_label(dir, "bootmenu", "falcon"), "bootmenu d31d718");
+        assert_eq!(revision_label("u=36d78f6/", "bootmenu", "falcon"), "falcon");
+    }
+
     #[test]
     fn reads_the_boot_menu_beside_the_bootloader() {
         let build = uboot("flipper-one");
@@ -484,8 +633,10 @@ mod tests {
 
     #[test]
     fn a_build_without_a_boot_menu_still_loads() {
-        // Builds predating the boot menu ship only the bootloader, and stay
-        // installable: the menu is optional in a way the bootloader is not.
+        // A build carrying no menu of its own — one from before the boot menu
+        // existed, or from after it moved into its own listing — ships only the
+        // bootloader and stays installable: the menu is optional in a way the
+        // bootloader is not.
         let build = uboot("generic");
         let c = uboot_contents(&manifest(), &build, "generic").unwrap();
         assert_eq!(c.size, 9441280);
