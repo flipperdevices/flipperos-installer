@@ -74,6 +74,17 @@ impl StorageKind {
             StorageKind::Ufs | StorageKind::Emmc | StorageKind::SdCard
         )
     }
+
+    /// Whether this is media an operator can pull out — which is what makes a
+    /// device a *source* to read bundles from rather than something to
+    /// auto-select as an install target.
+    ///
+    /// Answered from the class, not from sysfs: `/sys/block/<disk>/removable`
+    /// is wrong in both directions. The mmc block driver never sets it, so an
+    /// SD card reads 0, and a USB disk commonly reads 0 as well.
+    pub fn is_removable(&self) -> bool {
+        matches!(self, StorageKind::SdCard | StorageKind::Usb)
+    }
 }
 
 /// A discovered block device that could be a flash target.
@@ -84,6 +95,8 @@ pub struct StorageDevice {
     pub kind: StorageKind,
     pub model: String,
     pub size_bytes: u64,
+    /// Removable *media*, derived from [`StorageKind::is_removable`] — not the
+    /// kernel's `removable` flag, which does not answer this. Do not re-wire it.
     pub removable: bool,
     /// Native logical block (sector) size in bytes, as reported by the kernel.
     /// 512 for most eMMC/SD, typically 4096 for UFS. GPT geometry must be
@@ -1162,5 +1175,18 @@ mod tests {
         }
         .image()
         .is_some());
+    }
+
+    #[test]
+    fn removable_media_is_what_an_operator_can_pull_out() {
+        // An SD card is removable *and* a legal target — it just should not be
+        // the one picked automatically.
+        assert!(StorageKind::SdCard.is_removable());
+        assert!(StorageKind::SdCard.boot_rom_capable());
+        assert!(StorageKind::Usb.is_removable());
+
+        for kind in [StorageKind::Emmc, StorageKind::Ufs, StorageKind::Other] {
+            assert!(!kind.is_removable(), "{}", kind.as_str());
+        }
     }
 }

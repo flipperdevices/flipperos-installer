@@ -2,10 +2,16 @@
 //!
 //! The RK3576 boot ROM can boot from UFS, eMMC and SD. We walk `/sys/block`,
 //! skip virtual/loop/ram devices and partitions, and classify each whole disk.
-//! Classification is heuristic and based on the device node name plus the sysfs
-//! topology (a device whose parent bus is `mmc` with a non-removable flag is
-//! eMMC, a removable one is an SD card, `sd*` backed by USB is USB, `sd*` backed
-//! by a UFS host is UFS).
+//! Classification starts from the device node name: an `mmcblk*` is told apart
+//! by asking the MMC core what the card is (see [`mmc_kind`]), and an `sd*` by
+//! its sysfs bus topology — backed by USB it is USB, backed by a UFS host it is
+//! UFS.
+//!
+//! Note that `/sys/block/<disk>/removable` answers none of this. The mmc block
+//! driver never sets it, so it reads 0 for eMMC and SD alike, and plenty of USB
+//! disks report 0 as well. It is an input to the `sd*` heuristic and nothing
+//! more; whether a device is removable *media* is decided by its class, via
+//! [`StorageKind::is_removable`].
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -49,18 +55,20 @@ pub fn enumerate(min_size_bytes: u64) -> Vec<StorageDevice> {
         // missing (e.g. an unusual virtual device).
         let logical_block_size =
             read_u64(&sysdir.join("queue/logical_block_size")).unwrap_or(SECTOR_SIZE);
-        let removable = read_u64(&sysdir.join("removable")).unwrap_or(0) == 1;
+        let block_removable = read_u64(&sysdir.join("removable")).unwrap_or(0) == 1;
         let model = read_trimmed(&sysdir.join("device/model"))
             .or_else(|| read_trimmed(&sysdir.join("device/name")))
             .unwrap_or_else(|| "unknown".to_string());
-        let kind = classify(&name, &sysdir, removable);
+        let kind = classify(&name, &sysdir, block_removable);
 
         out.push(StorageDevice {
             path: format!("/dev/{name}"),
             kind,
             model,
             size_bytes,
-            removable,
+            // Derived from the class rather than copied from the sysfs flag
+            // above, which lies for exactly the devices we care about.
+            removable: kind.is_removable(),
             logical_block_size,
         });
     }
@@ -81,19 +89,23 @@ fn is_virtual(name: &str) -> bool {
 }
 
 /// Best-effort classification of a whole-disk device.
-fn classify(name: &str, sysdir: &Path, removable: bool) -> StorageKind {
+///
+/// `block_removable` is `/sys/block/<disk>/removable`; only the `sd*` branch
+/// uses it, and only as a tie-breaker.
+fn classify(name: &str, sysdir: &Path, block_removable: bool) -> StorageKind {
+    // Taken before the bus topology is resolved: the card device hangs off the
+    // block device's own `device` link, so the mmc branch needs no canonical
+    // path, and asking for one would be the only thing tying it to a real sysfs.
+    if name.starts_with("mmcblk") {
+        return mmc_kind(
+            read_trimmed(&sysdir.join("device/type")).as_deref(),
+            read_trimmed(&sysdir.join("device/removable")).as_deref(),
+        );
+    }
+
     // Resolve the real sysfs path to inspect the bus topology.
     let real = fs::canonicalize(sysdir).unwrap_or_else(|_| sysdir.to_path_buf());
     let chain = real.to_string_lossy().to_lowercase();
-
-    if name.starts_with("mmcblk") {
-        // mmc-backed: eMMC is non-removable, SD is removable.
-        return if removable {
-            StorageKind::SdCard
-        } else {
-            StorageKind::Emmc
-        };
-    }
 
     if name.starts_with("sd") {
         if chain.contains("usb") {
@@ -103,7 +115,7 @@ fn classify(name: &str, sysdir: &Path, removable: bool) -> StorageKind {
         if chain.contains("ufs") || has_ufs_host(&real) {
             return StorageKind::Ufs;
         }
-        return if removable {
+        return if block_removable {
             StorageKind::Usb
         } else {
             StorageKind::Other
@@ -115,6 +127,49 @@ fn classify(name: &str, sysdir: &Path, removable: bool) -> StorageKind {
     }
 
     StorageKind::Other
+}
+
+/// Decide whether an `mmcblk*` device is a soldered eMMC or a card in a slot,
+/// from the attributes the MMC core publishes about it.
+///
+/// `card_type` is `<card>/type`, printed by `mmc_type_show`
+/// (`drivers/mmc/core/bus.c`) as `MMC`, `SD`, `SDIO`, `SD-combo` or `unknown`.
+/// It is the card's own answer to the initialisation commands — the medium
+/// itself, which is precisely the question being asked — and the mmc bus
+/// attaches it to every card it enumerates.
+///
+/// `slot_removable` is `<card>/removable` (`removable` / `fixed` / `unknown`),
+/// and describes the *slot* rather than what is in it, so it only breaks the tie
+/// for a kernel that has stopped publishing `type`: a fixed slot holds a
+/// soldered eMMC, a pluggable one all but certainly a card.
+///
+/// `/sys/block/<disk>/removable` is deliberately absent from both: the mmc block
+/// driver never sets it, so it reads 0 for every card and used to make every SD
+/// card here an eMMC.
+fn mmc_kind(card_type: Option<&str>, slot_removable: Option<&str>) -> StorageKind {
+    if let Some(t) = card_type {
+        if t.eq_ignore_ascii_case("MMC") {
+            return StorageKind::Emmc;
+        }
+        // `SD-combo` is an SD memory card that also speaks SDIO, and the block
+        // device is its memory half. A pure `SDIO` card exposes no block device
+        // and so cannot reach here, but treat it as a card rather than let an
+        // unexpected spelling fall through to the slot.
+        if t.eq_ignore_ascii_case("SD")
+            || t.eq_ignore_ascii_case("SD-combo")
+            || t.eq_ignore_ascii_case("SDIO")
+        {
+            return StorageKind::SdCard;
+        }
+    }
+
+    // Unrecognised: err towards a card. That keeps the device out of the
+    // automatic target selection, so a mystery device is never pre-selected to
+    // be wiped — it can still be chosen by hand.
+    match slot_removable {
+        Some(s) if s.eq_ignore_ascii_case("fixed") => StorageKind::Emmc,
+        _ => StorageKind::SdCard,
+    }
 }
 
 /// Walk up the sysfs chain looking for a UFS host controller marker.
@@ -326,5 +381,86 @@ fn read_trimmed(path: &Path) -> Option<String> {
         None
     } else {
         Some(s.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Flipper One's microSD, attribute for attribute as the board reports
+    /// it. The block layer calls it non-removable, which is what used to make it
+    /// an eMMC in the target list.
+    #[test]
+    fn a_card_the_block_layer_calls_fixed_is_still_an_sd_card() {
+        assert_eq!(mmc_kind(Some("SD"), Some("removable")), StorageKind::SdCard);
+    }
+
+    #[test]
+    fn the_card_type_outranks_the_slot() {
+        // A soldered eMMC stays an eMMC even where the host describes a slot it
+        // could be pulled from, and vice versa.
+        assert_eq!(mmc_kind(Some("MMC"), Some("removable")), StorageKind::Emmc);
+        assert_eq!(mmc_kind(Some("MMC"), Some("fixed")), StorageKind::Emmc);
+        assert_eq!(mmc_kind(Some("SD"), Some("fixed")), StorageKind::SdCard);
+    }
+
+    #[test]
+    fn every_spelling_of_a_card_reads_as_one() {
+        for t in ["SD", "sd", "SD-combo", "sd-combo", "SDIO"] {
+            assert_eq!(mmc_kind(Some(t), None), StorageKind::SdCard, "{t}");
+        }
+        assert_eq!(mmc_kind(Some("mmc"), None), StorageKind::Emmc);
+    }
+
+    /// Without a usable card type the slot is all there is to go on.
+    #[test]
+    fn an_unreadable_card_type_falls_back_to_the_slot() {
+        assert_eq!(mmc_kind(Some("unknown"), Some("fixed")), StorageKind::Emmc);
+        assert_eq!(mmc_kind(None, Some("fixed")), StorageKind::Emmc);
+        assert_eq!(mmc_kind(None, Some("removable")), StorageKind::SdCard);
+        // Nothing to go on at all: assume a card, so it is never auto-selected
+        // as the device to wipe.
+        assert_eq!(mmc_kind(None, None), StorageKind::SdCard);
+    }
+
+    /// Pins *which* files `classify` reads, and that it does so without needing
+    /// the sysfs symlink farm.
+    #[test]
+    fn classify_reads_the_card_attributes_under_the_block_device() {
+        let dir = Scratch::new("mmc-type");
+        fs::create_dir_all(dir.path("device")).unwrap();
+        fs::write(dir.path("device/type"), "SD\n").unwrap();
+        fs::write(dir.path("device/removable"), "removable\n").unwrap();
+        assert_eq!(
+            classify("mmcblk0", &dir.0, false),
+            StorageKind::SdCard,
+            "the block layer's flag must not get a vote"
+        );
+
+        let bare = Scratch::new("mmc-bare");
+        assert_eq!(classify("mmcblk0", &bare.0, false), StorageKind::SdCard);
+    }
+
+    /// A scratch directory that removes itself.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("flipperos-storage-{name}"));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self, rel: &str) -> PathBuf {
+            self.0.join(rel)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
 }
