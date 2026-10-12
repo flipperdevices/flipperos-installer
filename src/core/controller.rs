@@ -690,6 +690,7 @@ impl Controller {
                     s.supported_device_types = bundle.device_types.clone();
                     s.bundle = Some(bundle);
                     s.bundle_error = None;
+                    s.select_all_profiles();
                 });
             }
             Err(e) => {
@@ -748,6 +749,11 @@ impl Controller {
                         b.loaded = true;
                         // The build number now surfaces via `display_name()`; no
                         // need to splice it into the label.
+                    }
+                    if s.selection.mode == InstallMode::Custom
+                        && s.selection.snapshot_build.as_deref() == Some(id)
+                    {
+                        s.select_all_profiles();
                     }
                 });
             }
@@ -1134,14 +1140,14 @@ impl Controller {
         std::thread::spawn(move || this.load_recovery_contents(&id));
     }
 
-    /// Pick a snapshot build by hand, resetting the extra-profile selection, and
-    /// load its profiles in the background if not already loaded. Like
+    /// Pick a snapshot build by hand, selecting all its extra profiles, and load
+    /// its profiles in the background if not already loaded. Like
     /// [`Self::select_uboot`], this is the custom flow.
     pub fn select_snapshot_build(self: &Arc<Self>, id: &str) {
         self.update(|s| {
             s.selection.mode = InstallMode::Custom;
             s.selection.snapshot_build = Some(id.to_string());
-            s.selection.profiles.clear();
+            s.select_all_profiles();
         });
         let loaded = self
             .snapshot()
@@ -1175,14 +1181,11 @@ impl Controller {
     /// Select all extra profiles of the current build, or none.
     pub fn select_all_profiles(&self, on: bool) {
         self.update(|s| {
-            let names: Vec<String> = if on {
-                s.selected_build()
-                    .map(|b| b.extra_profiles().map(|p| p.name.clone()).collect())
-                    .unwrap_or_default()
+            if on {
+                s.select_all_profiles();
             } else {
-                Vec::new()
-            };
-            s.selection.profiles = names;
+                s.selection.profiles.clear();
+            }
         });
     }
 

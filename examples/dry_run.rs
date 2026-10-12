@@ -12,7 +12,8 @@
 //!   `--bundle <path>`  add a local bundle directory or `*.tar.zst`
 //!   `--custom`         install a hand-picked U-Boot + rootfs pair instead
 //!   `--stream`         stream and verify while writing, rather than up front
-//!   `--profile <name>` add an extra profile (repeatable)
+//!   `--profile <name>` deploy only the named extra profiles (repeatable; all
+//!                      of them by default)
 
 use flipperos_installer::core::menu::{self, MenuKey, Nav};
 use flipperos_installer::core::model::{FetchMode, InstallMode, Phase};
@@ -64,8 +65,11 @@ fn main() {
         }
     }
 
-    for name in &profiles {
-        ctrl.toggle_profile(name, true);
+    if !profiles.is_empty() {
+        ctrl.select_all_profiles(false);
+        for name in &profiles {
+            ctrl.toggle_profile(name, true);
+        }
     }
 
     let state = ctrl.snapshot();

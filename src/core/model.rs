@@ -924,6 +924,16 @@ impl AppState {
         }
     }
 
+    /// Select every extra profile of the selected build, the default for a
+    /// freshly picked one. Leaves the selection empty while its profiles are
+    /// still unknown.
+    pub fn select_all_profiles(&mut self) {
+        self.selection.profiles = self
+            .selected_build()
+            .map(|b| b.extra_profiles().map(|p| p.name.clone()).collect())
+            .unwrap_or_default();
+    }
+
     /// The selected bundle's [`BundleRef`], if the selection names one.
     pub fn selected_bundle_ref(&self) -> Option<&BundleRef> {
         self.bundle_ref_by_id(self.selection.bundle.as_deref()?)
