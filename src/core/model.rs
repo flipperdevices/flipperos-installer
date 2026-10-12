@@ -130,34 +130,38 @@ impl StorageDevice {
 /// listing). The flashable image is `<board>/u-boot-rockchip.bin` inside it.
 /// One entry of a build manifest's `sourcestamps`: a source repository and the
 /// exact revision that went into the build.
-#[derive(Clone, Debug, Deserialize)]
+///
+/// Serialized into the target's metadata partition, where a field the manifest
+/// left out is left out too rather than stored empty.
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SourceStamp {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub codebase: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub repository: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub branch: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub revision: String,
 }
 
 /// The `build` section of a build manifest.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct BuildMeta {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub builder: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub number: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub url: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub timestamp: String,
 }
 
 /// A build manifest's `build` + `sourcestamps` sections, shown in the details
-/// popup. Deserializes directly from the manifest (other fields are ignored).
-#[derive(Clone, Debug, Deserialize)]
+/// popup and recorded in the metadata partition. Deserializes directly from the
+/// manifest (other fields are ignored).
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct BuildDetails {
     #[serde(default)]
     pub build: BuildMeta,
@@ -512,6 +516,8 @@ impl BundleRef {
 #[derive(Clone, Debug)]
 pub struct SelectedBundle {
     pub reference: BundleRef,
+    /// `bundle.name` from the manifest, e.g. `flipperone-update`.
+    pub name: String,
     /// `bundle.version` from the manifest, e.g. `20260812-83ddb68`.
     pub version: String,
     /// `bundle.channel` from the manifest.
@@ -844,28 +850,28 @@ impl AppState {
         match self.selection.mode {
             InstallMode::Bundle => self.bundle.as_ref()?.boot_menu.clone(),
             InstallMode::Custom => match self.selection.boot_menu.as_deref() {
-                Some(id) => self
-                    .boot_menu_builds
-                    .iter()
-                    .find(|b| b.id == id)
-                    .and_then(|b| b.image()),
+                Some(_) => self.selected_boot_menu_build()?.image(),
                 None => self.selected_uboot()?.boot_menu.clone(),
             },
         }
+    }
+
+    /// The hand-picked Falcon boot menu build. [`InstallMode::Custom`] only: a
+    /// bundle pins an image, not a build.
+    pub fn selected_boot_menu_build(&self) -> Option<&FalconBuild> {
+        if self.selection.mode != InstallMode::Custom {
+            return None;
+        }
+        let id = self.selection.boot_menu.as_deref()?;
+        self.boot_menu_builds.iter().find(|b| b.id == id)
     }
 
     /// Value for the boot menu status line: the hand-picked build if there is
     /// one, else what the image a bundle or a U-Boot build supplied says about
     /// itself — there being no build to name in that case.
     pub fn boot_menu_summary(&self) -> Option<String> {
-        if self.selection.mode == InstallMode::Custom {
-            if let Some(id) = self.selection.boot_menu.as_deref() {
-                return self
-                    .boot_menu_builds
-                    .iter()
-                    .find(|b| b.id == id)
-                    .map(|b| b.summary());
-            }
+        if self.selection.mode == InstallMode::Custom && self.selection.boot_menu.is_some() {
+            return self.selected_boot_menu_build().map(|b| b.summary());
         }
         let image = self.selected_boot_menu()?;
         Some(format!(
@@ -884,25 +890,25 @@ impl AppState {
     pub fn selected_recovery(&self) -> Option<FalconImage> {
         match self.selection.mode {
             InstallMode::Bundle => self.bundle.as_ref()?.recovery.clone(),
-            InstallMode::Custom => self
-                .recovery_builds
-                .iter()
-                .find(|b| Some(b.id.as_str()) == self.selection.recovery.as_deref())
-                .and_then(|b| b.image()),
+            InstallMode::Custom => self.selected_recovery_build()?.image(),
         }
+    }
+
+    /// The hand-picked Falcon recovery build, the counterpart of
+    /// [`Self::selected_boot_menu_build`].
+    pub fn selected_recovery_build(&self) -> Option<&FalconBuild> {
+        if self.selection.mode != InstallMode::Custom {
+            return None;
+        }
+        let id = self.selection.recovery.as_deref()?;
+        self.recovery_builds.iter().find(|b| b.id == id)
     }
 
     /// Value for the recovery status line, the counterpart of
     /// [`Self::boot_menu_summary`].
     pub fn recovery_summary(&self) -> Option<String> {
-        if self.selection.mode == InstallMode::Custom {
-            if let Some(id) = self.selection.recovery.as_deref() {
-                return self
-                    .recovery_builds
-                    .iter()
-                    .find(|b| b.id == id)
-                    .map(|b| b.summary());
-            }
+        if self.selection.mode == InstallMode::Custom && self.selection.recovery.is_some() {
+            return self.selected_recovery_build().map(|b| b.summary());
         }
         let image = self.selected_recovery()?;
         Some(format!(
@@ -1112,12 +1118,17 @@ mod tests {
         let picked = state.selected_boot_menu().expect("a menu");
         assert_eq!(picked.location, listed.image_location);
         assert_eq!(picked.size_bytes, 19);
+        assert_eq!(
+            state.selected_boot_menu_build().map(|b| b.id.as_str()),
+            Some("m")
+        );
 
         // With no listing to pick from, the menu the U-Boot build carries is what
-        // an origin publishing none still yields.
+        // an origin publishing none still yields — with no build behind it.
         state.boot_menu_builds.clear();
         state.selection.boot_menu = None;
         assert_eq!(state.selected_boot_menu().expect("a menu").size_bytes, 40);
+        assert!(state.selected_boot_menu_build().is_none());
 
         // A U-Boot build carrying none either leaves the loader partition empty.
         state.uboot_builds = vec![uboot_carrying(None)];
@@ -1156,6 +1167,15 @@ mod tests {
         let picked = state.selected_recovery().expect("a recovery image");
         assert_eq!(picked.location, listed.image_location);
         assert_eq!(picked.size_bytes, 45);
+        assert_eq!(
+            state.selected_recovery_build().map(|b| b.id.as_str()),
+            Some("r")
+        );
+
+        // A bundle pins images, never builds.
+        state.selection.mode = InstallMode::Bundle;
+        assert!(state.selected_recovery_build().is_none());
+        state.selection.mode = InstallMode::Custom;
 
         state.recovery_builds.clear();
         state.selection.recovery = None;

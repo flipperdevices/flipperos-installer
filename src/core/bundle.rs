@@ -490,6 +490,7 @@ pub fn resolve(
 
     Ok(SelectedBundle {
         reference: reference.clone(),
+        name: manifest.bundle.name.clone(),
         version: manifest.bundle.version.clone(),
         channel: if manifest.bundle.channel.is_empty() {
             reference.channel.clone()
