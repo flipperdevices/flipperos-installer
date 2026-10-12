@@ -18,19 +18,21 @@
 //!      base and snapshot a writable `@home` from it so /home starts populated.
 //!   6. For each selected profile: `btrfs receive` its snapshot stream, then
 //!      chroot into it and run `kernel-install` for every installed kernel.
+//!   7. Record the builds installed from in the metadata partition, through the
+//!      Minimal profile's own `flipmeta`.
 
 use std::fs::OpenOptions;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use crate::core::controller::{Config, Controller};
 use crate::core::layout::{self, Layout};
 use crate::core::model::{
-    human_bytes, FalconImage, FetchMode, PackFile, ProfilePack, Source, StorageDevice, StorageKind,
-    UbootBuild,
+    human_bytes, FalconImage, FetchMode, InstallMode, PackFile, ProfilePack, Source, StorageDevice,
+    StorageKind, UbootBuild,
 };
-use crate::core::{fetch, stage, storage, ufs};
+use crate::core::{catalog, fetch, metadata, stage, storage, ufs};
 
 // GPT layout used by FlipperOS images, as byte offsets from the start of disk.
 // These are absolute byte offsets, independent of the device's sector size;
@@ -56,8 +58,20 @@ const ROOT_START: u64 = 64 * 1024 * 1024;
 const LOADER_CAPACITY: u64 = METADATA_START - LOADER_START;
 /// The loader (U-Boot) partition is the first partition.
 const LOADER_PART_INDEX: u32 = 1;
+/// The metadata partition, owned by the profiles' `flipmeta`, is the second.
+const METADATA_PART_INDEX: u32 = 2;
+/// The metadata partition's size, which is also the size of the image
+/// [`write_metadata`] has `flipmeta` build for it.
+const METADATA_SIZE: u64 = ROOT_START - METADATA_START;
 /// The Btrfs root is the third partition.
 const ROOT_PART_INDEX: u32 = 3;
+
+/// The profiles' tool for the metadata partition, as installed in each of them.
+const FLIPMETA: &str = "/usr/local/sbin/flipmeta";
+/// Where, inside the chroot, `flipmeta` builds the metadata partition's image.
+/// Under the tmpfs [`write_metadata`] mounts on `/run`, so nothing of it lands
+/// in the profile.
+const FLIPMETA_IMAGE: &str = "/run/flipmeta.img";
 
 /// The logical unit the Falcon recovery image is written to, as numbered by the
 /// provisioning scheme in `config/flipperos-ufs.toml` (`id = 3`, `name =
@@ -337,6 +351,31 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
     };
     stage::guard_not_on_target(&uboot, falcon, &build, &extras, &device.path)?;
 
+    // What the metadata partition will record, settled before anything is
+    // written. A custom rootfs build's records are only fetched when its details
+    // popup asks for them, so they may well not be here yet.
+    let rootfs_details = match (state.selection.mode, &build.details) {
+        (InstallMode::Custom, None) => {
+            match catalog::load_details(&format!("{}manifest.json", build.base_location)) {
+                Ok(d) => Some(d),
+                Err(e) => {
+                    ctrl.log(format!(
+                        "warning: rootfs manifest: {e}; its build will not be recorded"
+                    ));
+                    None
+                }
+            }
+        }
+        (_, details) => details.clone(),
+    };
+    let install_record = metadata::record(
+        &state,
+        rootfs_details,
+        boot_menu.is_some(),
+        recovery.is_some() && recovery_lu.is_some(),
+    )
+    .to_json();
+
     // Resolve the Btrfs layout: prefer one shipped with the images, else the
     // built-in default.
     let sources: Vec<&Source> = vec![&build.source];
@@ -361,7 +400,7 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
         .map(|b| b.reference.clone())
         .filter(|r| r.archive.is_some());
 
-    // 4 fixed steps, then receive + snapshot + kernel per deployed profile, plus
+    // 5 fixed steps, then receive + snapshot + kernel per deployed profile, plus
     // one receive step for the shared /home seed when the build ships one, one
     // each for the boot menu and the recovery image when the target takes them,
     // one staging step per artifact when verifying up front, and one for
@@ -371,7 +410,7 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
         FetchMode::VerifyFirst => plan.len() as u32,
         FetchMode::Stream => 0,
     };
-    let total_steps = 4
+    let total_steps = 5
         + boot_menu.is_some() as u32
         // Both halves, because a device without the logical unit is installed
         // without the recovery system rather than refused.
@@ -577,6 +616,17 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
                 policy,
                 &mut ticker,
             )?;
+        }
+
+        // 6. Provenance. The system boots without it, so a failure here is
+        // reported rather than allowed to fail an otherwise good install.
+        ticker.begin(ctrl, "recording build metadata");
+        let recorded = install_record
+            .as_deref()
+            .map_err(|e| e.clone())
+            .and_then(|json| write_metadata(cfg, ctrl, &device.path, &root_part, &minimal, json));
+        if let Err(e) = recorded {
+            ctrl.log(format!("warning: metadata partition not written: {e}"));
         }
         Ok(())
     })();
@@ -964,7 +1014,7 @@ fn write_gpt(
         },
     );
     parts.insert(
-        2,
+        METADATA_PART_INDEX,
         gpt::partition::Partition {
             part_type_guid: metadata_type,
             part_guid: uuid::Uuid::new_v4(),
@@ -1489,6 +1539,109 @@ fn install_kernel(
     // unmount error.
     let unmounted = umount_recursive(cfg, ctrl, &root);
     ran?;
+    unmounted?;
+    Ok(())
+}
+
+/// Store `json` under [`metadata::KEY`] in the metadata partition, through the
+/// deployed `profile`'s own `flipmeta`, which owns the partition's format.
+///
+/// `flipmeta` finds the partition by its GPT type through `lsblk`, which takes
+/// the type from the udev database, and the installer initramfs runs no udev:
+/// from a chroot here it would find no partition at all. Pointed at a plain file
+/// it skips that lookup, so it builds the partition's image in a tmpfs instead,
+/// and the image is then written over the whole partition. That also leaves
+/// every byte of the partition defined, which `blkdiscard` does not promise.
+fn write_metadata(
+    cfg: &Config,
+    ctrl: &Controller,
+    disk: &str,
+    root_part: &str,
+    profile: &ProfilePack,
+    json: &str,
+) -> Result<()> {
+    let part = partition_path(disk, METADATA_PART_INDEX);
+    let root_subvol = profile.root_subvol();
+    let key = metadata::KEY;
+    if cfg.dry_run {
+        ctrl.log(format!(
+            "[dry-run] mount -o subvol={root_subvol} {root_part}; \
+             chroot: {FLIPMETA} -d {FLIPMETA_IMAGE} set --json {key} {json}; \
+             {FLIPMETA_IMAGE} -> {part}"
+        ));
+        return Ok(());
+    }
+
+    // A real `-o subvol=` mount at the same place `install_kernel` uses, which
+    // `release_own_mounts` already knows to clear after a failed run.
+    let root = PROFILE_MNT;
+    std::fs::create_dir_all(root).map_err(|e| format!("mkdir {root}: {e}"))?;
+    exec(
+        cfg,
+        ctrl,
+        Command::new("mount")
+            .arg("-o")
+            .arg(format!("subvol={root_subvol}"))
+            .arg(root_part)
+            .arg(root),
+    )?;
+
+    let wrote = (|| -> Result<()> {
+        if !std::path::Path::new(&format!("{root}{FLIPMETA}")).exists() {
+            ctrl.log(format!(
+                "{} ships no {FLIPMETA}; leaving the metadata partition empty",
+                profile.name
+            ));
+            return Ok(());
+        }
+        // `/dev` for the `/dev/null` the script redirects to, and a tmpfs on
+        // `/run` for the image and the script's own scratch files.
+        for (dir, args) in [
+            ("dev", &["--bind", "/dev"][..]),
+            ("proc", &["-t", "proc", "proc"][..]),
+            ("run", &["-t", "tmpfs", "tmpfs"][..]),
+        ] {
+            let target = format!("{root}/{dir}");
+            std::fs::create_dir_all(&target).map_err(|e| format!("mkdir {target}: {e}"))?;
+            exec(cfg, ctrl, Command::new("mount").args(args).arg(&target))?;
+        }
+
+        let image = format!("{root}{FLIPMETA_IMAGE}");
+        std::fs::File::create(&image)
+            .and_then(|f| f.set_len(METADATA_SIZE))
+            .map_err(|e| format!("create {image}: {e}"))?;
+        exec(
+            cfg,
+            ctrl,
+            Command::new("chroot")
+                .arg(root)
+                .arg(FLIPMETA)
+                .arg("-d")
+                .arg(FLIPMETA_IMAGE)
+                .arg("set")
+                .arg("--json")
+                .arg(key)
+                .arg(json)
+                // `mktemp -d` would otherwise leave its scratch in the profile's /tmp.
+                .env("TMPDIR", "/run"),
+        )?;
+        let bytes = std::fs::read(&image).map_err(|e| format!("read {image}: {e}"))?;
+
+        wait_for_device(cfg, ctrl, &part)?;
+        ctrl.log(format!("writing build metadata to {part}"));
+        let mut dev = OpenOptions::new()
+            .write(true)
+            .open(&part)
+            .map_err(|e| format!("open {part}: {e}"))?;
+        dev.write_all(&bytes)
+            .and_then(|()| dev.sync_all())
+            .map_err(|e| format!("write {part}: {e}"))
+    })();
+
+    // Always unmount the profile root and what was mounted under it, surfacing
+    // the step's error in preference to any unmount error.
+    let unmounted = umount_recursive(cfg, ctrl, root);
+    wrote?;
     unmounted?;
     Ok(())
 }

@@ -9,6 +9,7 @@ pub mod fetch;
 pub mod install;
 pub mod layout;
 pub mod menu;
+pub mod metadata;
 pub mod model;
 pub mod power;
 pub mod provision;
