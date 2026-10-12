@@ -209,11 +209,17 @@ impl<R: Read> Read for ProgressReader<'_, R> {
     }
 }
 
+/// How many bytes a receive step takes between two progress log lines. A fixed
+/// byte step rather than a share of the total, so a large pack on a slow link
+/// still moves the status line every few seconds.
+const PROGRESS_LOG_STEP: u64 = 10 * 1024 * 1024;
+
 /// Build a throttled byte-progress callback for a receive step: it animates the
 /// bar within this step's `(base, span)` slice on each 1% change and logs a
-/// `<what>: N%` line every 10%. `total` is the expected (compressed) byte count;
-/// when it is 0 (unknown) the bar is left alone and throughput is logged every
-/// 32 MiB so the step is never silent.
+/// `<what>: N%` line every [`PROGRESS_LOG_STEP`] bytes and once more on reaching
+/// `total`. `total` is the expected (compressed) byte count; when it is 0
+/// (unknown) the bar is left alone and throughput is logged at the same step so
+/// the step is never silent.
 pub(crate) fn receive_progress(
     ctrl: &Controller,
     what: String,
@@ -227,12 +233,17 @@ pub(crate) fn receive_progress(
         if total > 0 {
             let read = read.min(total);
             let pct = (read * 100 / total) as i64;
-            if pct == last_pct {
-                return;
+            if pct != last_pct {
+                last_pct = pct;
+                ctrl.set_progress(base + span * (read as f32 / total as f32));
             }
-            last_pct = pct;
-            ctrl.set_progress(base + span * (read as f32 / total as f32));
-            let bucket = pct / 10;
+            // The end rarely lands on a step boundary, so give it a bucket of
+            // its own to have the 100% line logged exactly once.
+            let bucket = if read == total {
+                i64::MAX
+            } else {
+                (read / PROGRESS_LOG_STEP) as i64
+            };
             if bucket != last_bucket {
                 last_bucket = bucket;
                 ctrl.log(format!(
@@ -242,7 +253,7 @@ pub(crate) fn receive_progress(
                 ));
             }
         } else {
-            let bucket = (read / (32 * 1024 * 1024)) as i64;
+            let bucket = (read / PROGRESS_LOG_STEP) as i64;
             if bucket != last_bucket {
                 last_bucket = bucket;
                 ctrl.log(format!("{what}: {} received", human_bytes(read)));
@@ -2142,6 +2153,51 @@ mod tests {
         // full length (EOF's zero-length read reports nothing).
         assert_eq!(seen.last().copied(), Some(10));
         assert!(seen.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    /// The progress lines `receive_progress` logs while fed `reads`.
+    fn progress_lines(total: u64, reads: impl IntoIterator<Item = u64>) -> Vec<String> {
+        let ctrl = Controller::new(Config {
+            automount: false,
+            ..Config::default()
+        });
+        let mut cb = receive_progress(&ctrl, "pack".into(), 0.0, 1.0, total);
+        for read in reads {
+            cb(read);
+        }
+        ctrl.snapshot()
+            .log
+            .into_iter()
+            .filter(|l| l.starts_with("pack: "))
+            .collect()
+    }
+
+    #[test]
+    fn receive_progress_logs_every_step_and_the_end() {
+        const MIB: u64 = 1024 * 1024;
+        // Each MiB reported twice: a repeated total must not log twice.
+        let reads = (1..=25).flat_map(|m| [m * MIB, m * MIB]);
+        assert_eq!(
+            progress_lines(25 * MIB, reads),
+            [
+                "pack: 4% (1.0 MiB / 25.0 MiB)",
+                "pack: 40% (10.0 MiB / 25.0 MiB)",
+                "pack: 80% (20.0 MiB / 25.0 MiB)",
+                "pack: 100% (25.0 MiB / 25.0 MiB)",
+            ],
+        );
+        // A pack big enough that 1% spans several steps still logs each step.
+        let lines = progress_lines(4096 * MIB, (1..=100).map(|m| m * MIB));
+        assert_eq!(lines.len(), 11, "{lines:?}");
+        // Without a total, throughput is logged at the same step.
+        assert_eq!(
+            progress_lines(0, (1..=25).map(|m| m * MIB)),
+            [
+                "pack: 1.0 MiB received",
+                "pack: 10.0 MiB received",
+                "pack: 20.0 MiB received",
+            ],
+        );
     }
 
     #[test]
