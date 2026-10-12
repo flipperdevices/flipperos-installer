@@ -241,22 +241,14 @@ fn main() {
     // Details popup (screen 2): sourcestamps for a bundle.
     ui.set_details_title("Bundle details".into());
     let raw = "Build #692 (rootfs)\n  2026-07-16 09:42\n  https://linux-images.flipp.dev/#/builders/11/builds/692\n\nlinux-mainline\n  branch: flipper-devel\n  rev: 895107b0c84dd4f9af8791f15d66447fbe48743e\n  https://github.com/flipperdevices/flipper-linux-kernel.git\n\nbuildscripts\n  branch: dev\n  rev: ae979d1abf2a8f833e303185e28eb177e7008a0b";
-    let lines: Vec<SharedString> = raw
-        .split('\n')
-        .flat_map(|l| {
-            let c: Vec<char> = l.chars().collect();
-            if c.len() <= 40 {
-                vec![l.to_string()]
-            } else {
-                c.chunks(40).map(|ch| ch.iter().collect()).collect()
-            }
-        })
-        .map(SharedString::from)
-        .collect();
-    ui.set_details_model(ModelRc::new(VecModel::from(lines)));
+    ui.set_details_text(raw.into());
     ui.set_details_scroll(0);
     ui.set_screen(2);
     shoot(&window, "06-details");
+    // Scrolled as far as the Down key goes: the last line has to land at the
+    // bottom of the panel, neither cut off nor followed by blank lines.
+    ui.set_details_scroll(ui.get_details_max_scroll());
+    shoot(&window, "06b-details-end");
 
     // The target-device level of a UFS board whose logical units do not match the
     // Flipper provisioning scheme: the last row offers to rewrite them.
@@ -310,7 +302,7 @@ fn main() {
                   LU 1: 4.0 MiB boot A \u{2192} 16.0 MiB boot A\n\
                   LU 2: 4.0 MiB boot B \u{2192} 16.0 MiB boot B\n\
                   LU 3: 8.0 MiB \u{2192} 128.0 MiB";
-    ui.set_prompt_model(wrapped(prompt));
+    ui.set_prompt_text(prompt.into());
     ui.set_prompt_scroll(0);
     ui.set_screen(3);
     shoot(&window, "10-prompt-reprovision");
@@ -327,21 +319,11 @@ fn main() {
                  LU 1: absent \u{2192} 16.0 MiB boot A\n\
                  LU 2: absent \u{2192} 16.0 MiB boot B\n\
                  LU 3: absent \u{2192} 128.0 MiB";
-    ui.set_prompt_model(wrapped(blank));
+    ui.set_prompt_text(blank.into());
     ui.set_prompt_scroll(0);
     shoot(&window, "11-prompt-provision-blank");
 
     println!("wrote PNGs to target/screenshots/");
-}
-
-/// Wrap to the 40 columns the popups hold, through the very function the device
-/// uses, so a screenshot cannot flatter the real layout.
-fn wrapped(text: &str) -> ModelRc<SharedString> {
-    let lines: Vec<SharedString> = flipperos_installer::gui::wrap_lines(text, 40)
-        .into_iter()
-        .map(SharedString::from)
-        .collect();
-    ModelRc::new(VecModel::from(lines))
 }
 
 fn shoot(window: &Rc<MinimalSoftwareWindow>, name: &str) {

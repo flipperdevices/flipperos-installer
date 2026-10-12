@@ -367,60 +367,15 @@ pub fn display_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Wrap each line of `text` to at most `width` characters, so a popup can scroll
-/// by whole lines.
-///
-/// Breaks at spaces where it can — the confirmation prompts are prose, and
-/// chopping mid-word made them hard to read — and falls back to a hard cut for a
-/// single token longer than the width (a URL in a build's sourcestamps, say).
-///
-/// Public so the off-device screenshot harness wraps exactly the way the device
-/// does, instead of approximating it.
-pub fn wrap_lines(text: &str, width: usize) -> Vec<String> {
-    let mut out = Vec::new();
-    for line in text.split('\n') {
-        let mut rest: Vec<char> = line.chars().collect();
-        if rest.is_empty() {
-            out.push(String::new());
-            continue;
-        }
-        while rest.len() > width {
-            // The last space that still fits; `width` itself is a valid break
-            // point, since the space is dropped rather than carried over.
-            let cut = rest[..=width]
-                .iter()
-                .rposition(|c| *c == ' ')
-                .filter(|p| *p > 0)
-                .unwrap_or(width)
-                .max(1);
-            out.push(rest[..cut].iter().collect());
-            // Drop the space we broke on, plus any run of them.
-            let mut next = cut;
-            while rest.get(next) == Some(&' ') {
-                next += 1;
-            }
-            rest = rest[next..].to_vec();
-        }
-        out.push(rest.iter().collect());
-    }
-    out
-}
-
-/// Fill the details popup (title + wrapped source-stamp lines) for the currently
-/// open target, resolving it against the freshest snapshot.
+/// Fill the details popup (title + source-stamp text) for the currently open
+/// target, resolving it against the freshest snapshot.
 fn apply_details(win: &MainWindow, state: &AppState, target: &Option<DetailsTarget>) {
-    use slint::{ModelRc, SharedString, VecModel};
-
     let (title, text) = match target {
         Some(target) => menu::details_text(state, target),
         None => (String::new(), String::new()),
     };
     win.set_details_title(title.into());
-    let lines: Vec<SharedString> = wrap_lines(&text, 40)
-        .into_iter()
-        .map(SharedString::from)
-        .collect();
-    win.set_details_model(ModelRc::new(VecModel::from(lines)));
+    win.set_details_text(text.into());
 }
 
 /// Raise or drop the core's modal prompt (screen 3).
@@ -430,8 +385,6 @@ fn apply_details(win: &MainWindow, state: &AppState, target: &Option<DetailsTarg
 /// soft button just answers the controller. Called after [`apply_nav`], whose
 /// `screen` decision it overrides while a prompt is pending.
 fn apply_prompt(win: &MainWindow, state: &AppState, nav: &Nav) {
-    use slint::{ModelRc, SharedString, VecModel};
-
     let Some(prompt) = &state.prompt else {
         // Back to whatever was on screen before, unless a level popup or the
         // summary is already showing.
@@ -443,11 +396,7 @@ fn apply_prompt(win: &MainWindow, state: &AppState, nav: &Nav) {
     win.set_prompt_title(prompt.title.clone().into());
     win.set_prompt_confirm(prompt.confirm.clone().into());
     win.set_prompt_cancel(prompt.cancel.clone().into());
-    let lines: Vec<SharedString> = wrap_lines(&prompt.lines.join("\n"), 40)
-        .into_iter()
-        .map(SharedString::from)
-        .collect();
-    win.set_prompt_model(ModelRc::new(VecModel::from(lines)));
+    win.set_prompt_text(prompt.lines.join("\n").into());
     if win.get_screen() != PROMPT_SCREEN {
         win.set_prompt_scroll(0);
         win.set_screen(PROMPT_SCREEN);
@@ -537,50 +486,4 @@ fn apply(win: &MainWindow, state: &AppState) {
     // Everything list-shaped — the summary rows and the open level's rows, with
     // their values, markers and chevrons — is built by `core::menu` and pushed by
     // `apply_nav`, which the same subscriber calls.
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn wrapping_breaks_on_spaces() {
-        // The reprovisioning caution has to stay readable: no word may be cut in
-        // half, and every line has to fit the popup's 40 columns.
-        let caution = "ALL DATA ON /dev/sda WILL BE PERMANENTLY LOST.";
-        let lines = wrap_lines(caution, 40);
-        assert_eq!(
-            lines,
-            vec![
-                "ALL DATA ON /dev/sda WILL BE PERMANENTLY".to_string(),
-                "LOST.".to_string(),
-            ]
-        );
-        for line in wrap_lines(caution, 40) {
-            assert!(line.chars().count() <= 40, "{line:?}");
-        }
-    }
-
-    #[test]
-    fn wrapping_keeps_short_lines_and_blank_ones() {
-        assert_eq!(wrap_lines("short", 40), vec!["short".to_string()]);
-        // Blank lines are the paragraph breaks in a prompt, so they survive.
-        assert_eq!(
-            wrap_lines("a\n\nb", 40),
-            vec!["a".to_string(), String::new(), "b".to_string()]
-        );
-        // Exactly the width is left alone.
-        let exact = "x".repeat(40);
-        assert_eq!(wrap_lines(&exact, 40), vec![exact]);
-    }
-
-    #[test]
-    fn wrapping_hard_cuts_an_unbreakable_token() {
-        // A build's sourcestamp URL has no spaces to break on.
-        let url = "https://linux-images.flipp.dev/#/builders/11/builds/692";
-        let lines = wrap_lines(url, 40);
-        assert_eq!(lines.len(), 2);
-        assert_eq!(lines[0].chars().count(), 40);
-        assert_eq!(lines.concat(), url);
-    }
 }

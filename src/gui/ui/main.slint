@@ -19,7 +19,7 @@ import "../../../third_party/flipctl-fonts/HaxrCorp4090-FlipCTL/HaxrCorp4090-Fli
 import "../../../third_party/flipctl-fonts/Busy9px-FlipCTL/Busy9px-FlipCTL.ttf";
 import "../../../third_party/flipctl-fonts/Born2bSportyV2-FlipCTL/Born2bSportyV2-FlipCTL.ttf";
 
-import { OutlineFrame, ProgressBar, ScrollBar, DarkTab } from "widgets.slint";
+import { OutlineFrame, ProgressBar, ScrollBar, DarkTab, TextPanel } from "widgets.slint";
 import { ListRow, MenuRow, SoftButton } from "rows.slint";
 
 // One row of the summary screen or of the open menu level. Built by
@@ -105,16 +105,16 @@ export component MainWindow inherits Window {
     in property <bool> level-can-details;
     in property <bool> level-can-refresh;
 
-    // Details popup (screen 2): sourcestamps for the highlighted build,
-    // pre-wrapped into display lines for line-based scrolling.
+    // Details popup (screen 2): sourcestamps for the highlighted build, as one
+    // string that the popup wraps to its own width.
     in property <string> details-title;
-    in property <[string]> details-model;
+    in property <string> details-text;
 
     // Confirmation prompt (screen 3), raised by the core rather than by a key:
     // the same question is on the serial console at the same time, and either
-    // answer closes both. Pre-wrapped like the details popup.
+    // answer closes both. Wrapped by the popup like the details text.
     in property <string> prompt-title;
-    in property <[string]> prompt-model;
+    in property <string> prompt-text;
     in property <string> prompt-confirm;
     in property <string> prompt-cancel;
 
@@ -160,10 +160,15 @@ export component MainWindow inherits Window {
     // arrow key never has to round-trip through the controller; Rust reads it
     // when a row is activated and rewrites it when a level is entered or left.
     in-out property <int> cursor: 0;
-    // Scroll offset (in rows) for the details popup on screen 2.
+    // Scroll offset (in lines) for the details popup on screen 2.
     in-out property <int> details-scroll: 0;
-    // Scroll offset (in rows) for the prompt on screen 3.
+    // Scroll offset (in lines) for the prompt on screen 3.
     in-out property <int> prompt-scroll: 0;
+    // How far each popup can scroll, once its text is wrapped. The popup sits
+    // inside an `if`, out of reach of the key handler, so it reports this back
+    // up whenever the wrapped height changes.
+    out property <int> details-max-scroll: 0;
+    out property <int> prompt-max-scroll: 0;
 
     function level-count() -> int { return root.level-items.length; }
     // First visible row, chosen so the cursor stays on screen.
@@ -181,11 +186,6 @@ export component MainWindow inherits Window {
     function popup-frame-y() -> length {
         return (root.height - 14px - 14px - popup-frame-h()) / 2 + 14px;
     }
-    // Rows visible at once in the details popup (screen 2), at the 14px pitch.
-    function details-visible() -> int { return 7; }
-    // The prompt (screen 3) spends a row on its title tab and keeps a soft-button
-    // bar with two captions, so it fits one line fewer than the details popup.
-    function prompt-visible() -> int { return 6; }
 
     forward-focus: fs;
     fs := FocusScope {
@@ -221,7 +221,7 @@ export component MainWindow inherits Window {
                     return accept;
                 }
                 if (event.text == Key.DownArrow) {
-                    if (root.prompt-scroll < max(0, root.prompt-model.length - root.prompt-visible())) {
+                    if (root.prompt-scroll < root.prompt-max-scroll) {
                         root.prompt-scroll += 1;
                     }
                     return accept;
@@ -255,7 +255,7 @@ export component MainWindow inherits Window {
                     return accept;
                 }
                 if (event.text == Key.DownArrow) {
-                    if (root.details-scroll < max(0, root.details-model.length - root.details-visible())) {
+                    if (root.details-scroll < root.details-max-scroll) {
                         root.details-scroll += 1;
                     }
                     return accept;
@@ -532,25 +532,12 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                // Bordered, scrolling text panel. Roomier than before: 3px
-                // inner padding and a 14px line pitch (vs the old crammed
-                // 12px) so the sourcestamps read like the reference popup.
-                OutlineFrame {
-                    clip: true;
+                TextPanel {
                     vertical-stretch: 1;
-                    VerticalLayout {
-                        width: 100%;
-                        padding: 3px;
-                        y: -root.details-scroll * 14px;
-                        for line[i] in root.details-model : Text {
-                            height: 14px;
-                            text: line;
-                            font-family: "HaxrCorp 4090";
-                            color: #000000;
-                            vertical-alignment: center;
-                            overflow: elide;
-                        }
-                    }
+                    text: root.details-text;
+                    scroll: root.details-scroll;
+                    init => { root.details-max-scroll = self.max-scroll; }
+                    changed max-scroll => { root.details-max-scroll = self.max-scroll; }
                 }
             }
 
@@ -588,22 +575,12 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                OutlineFrame {
-                    clip: true;
+                TextPanel {
                     vertical-stretch: 1;
-                    VerticalLayout {
-                        width: 100%;
-                        padding: 3px;
-                        y: -root.prompt-scroll * 14px;
-                        for line[i] in root.prompt-model : Text {
-                            height: 14px;
-                            text: line;
-                            font-family: "HaxrCorp 4090";
-                            color: #000000;
-                            vertical-alignment: center;
-                            overflow: elide;
-                        }
-                    }
+                    text: root.prompt-text;
+                    scroll: root.prompt-scroll;
+                    init => { root.prompt-max-scroll = self.max-scroll; }
+                    changed max-scroll => { root.prompt-max-scroll = self.max-scroll; }
                 }
             }
 

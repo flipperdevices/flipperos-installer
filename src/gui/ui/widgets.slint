@@ -129,6 +129,42 @@ export component ScrollBar inherits Rectangle {
     }
 }
 
+// Bordered, scrolling text panel for the popups' bodies. Slint wraps the text
+// to the panel's width — HaxrCorp 4090 is proportional, so only the renderer
+// can tell where a line is full — and the panel scrolls it by whole lines.
+export component TextPanel inherits OutlineFrame {
+    in property <string> text;
+    // Scroll offset in lines.
+    in property <int> scroll;
+    // The largest `scroll` that still shows something new: the last line sits
+    // at the bottom of the viewport.
+    out property <int> max-scroll:
+        max(0, ceil((body.preferred-height - viewport.height) / root.line-h));
+    // HaxrCorp 4090's natural line height at the pinned 16px size (hhea ascent
+    // + descent = 704 of 1024 units). Slint 1.17 cannot space lines any other
+    // way, so this has to change with `default-font-size`.
+    property <length> line-h: 11px;
+
+    // Clip to whole lines inside the 3px padding, so a line scrolled half out of
+    // view never leaves a sliver at either edge.
+    viewport := Rectangle {
+        x: 3px;
+        y: 3px;
+        width: parent.width - 6px;
+        height: floor((parent.height - 6px) / root.line-h) * root.line-h;
+        clip: true;
+        body := Text {
+            y: -root.scroll * root.line-h;
+            width: parent.width;
+            height: self.preferred-height;
+            text: root.text;
+            wrap: word-wrap;
+            font-family: "HaxrCorp 4090";
+            color: #000000;
+        }
+    }
+}
+
 // Dark heading tab (FlipCTL popup style, e.g. "Visible networks"): a solid
 // black body with 2px-rounded top corners and a square bottom that merges into
 // the popup frame beneath it. White HaxrCorp caption; width tracks the text.
