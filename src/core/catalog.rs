@@ -80,6 +80,23 @@ pub fn board_dir(board_id: &str) -> &'static str {
     }
 }
 
+/// The per-board directory to list builds from, given the device types the
+/// server `offered`.
+///
+/// An empty list means the listing could not be read — most likely the network
+/// was not up yet — not that the server offers nothing, so it is no reason to
+/// give up on the detected board: a board id only ever comes from
+/// [`crate::core::board::COMPATIBLE_DEVICE_TYPES`], which names device types the
+/// server builds, and a build that lacks it is reported when its manifest is
+/// read. Only a list that leaves the board out sends it to [`board_dir`].
+pub fn listing_board_dir(board_id: &str, offered: &[String]) -> String {
+    if offered.is_empty() || offered.iter().any(|t| t == board_id) {
+        board_id.to_string()
+    } else {
+        board_dir(board_id).to_string()
+    }
+}
+
 /// The device types (image-server board ids) offered by the latest U-Boot build.
 ///
 /// The newest U-Boot build directory's manifest lists a
@@ -759,6 +776,21 @@ mod tests {
             err.contains("lists no nanopi-m5/u-boot-rockchip.bin"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn keeps_the_board_when_the_offer_is_unknown() {
+        let offered: Vec<String> = ["evb", "flipper-one", "generic"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(listing_board_dir("evb", &offered), "evb");
+        // An unreadable listing — no network yet — is not a refusal, so the
+        // detected board keeps its own builds rather than falling to generic.
+        assert_eq!(listing_board_dir("evb", &[]), "evb");
+        // Only a listing that leaves the board out sends it to the fallback.
+        assert_eq!(listing_board_dir("sige5", &offered), "generic");
+        assert_eq!(listing_board_dir("generic", &[]), "generic");
     }
 
     #[test]

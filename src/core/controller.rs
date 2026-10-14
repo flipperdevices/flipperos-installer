@@ -402,22 +402,23 @@ impl Controller {
         // U-Boot manifest, and choose the per-board U-Boot directory that matches
         // our detected device type (falling back to the generic build otherwise).
         let supported = catalog::supported_device_types(&server);
-        if !supported.is_empty() {
+        let board_dir = catalog::listing_board_dir(&board_id, &supported);
+        if supported.is_empty() {
+            self.log(format!(
+                "could not read the device types the server offers; \
+                 listing builds for '{board_dir}'"
+            ));
+        } else {
             self.log(format!(
                 "server supports device type(s): {}",
                 supported.join(", ")
             ));
-        }
-        let board_dir: String = if supported.iter().any(|t| t == &board_id) {
-            board_id.clone()
-        } else {
-            if !supported.is_empty() {
+            if board_dir != board_id {
                 self.log(format!(
-                    "device type '{board_id}' not offered by server; using generic U-Boot"
+                    "device type '{board_id}' not offered by server; using the {board_dir} U-Boot"
                 ));
             }
-            catalog::board_dir(&board_id).to_string()
-        };
+        }
         // In bundle mode the installable device types come from the bundle's own
         // manifest, so don't let the legacy catalog overwrite them.
         if self.snapshot().selection.mode == InstallMode::Custom {
