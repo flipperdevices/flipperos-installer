@@ -213,24 +213,18 @@ fn falcon_builds(
         .collect()
 }
 
-/// Fetch a Falcon boot menu build's manifest and extract the metadata for its
-/// `<board_dir>/bootmenu-falcon.itb`.
-pub fn load_boot_menu_contents(
-    build: &FalconBuild,
-    board_dir: &str,
-) -> Result<FalconContents, String> {
+/// Fetch a Falcon boot menu build's manifest and extract the metadata for the
+/// `<board_dir>/bootmenu-falcon.itb` it was listed with.
+pub fn load_boot_menu_contents(build: &FalconBuild) -> Result<FalconContents, String> {
     let bm: BuildManifest = fetch_json(&build.manifest_location)?;
-    falcon_contents(&bm, &build.manifest_location, board_dir, BOOT_MENU_IMAGE)
+    falcon_contents(&bm, build, BOOT_MENU_IMAGE)
 }
 
-/// Fetch a Falcon recovery build's manifest and extract the metadata for its
-/// `<board_dir>/recovery-falcon.itb`.
-pub fn load_recovery_contents(
-    build: &FalconBuild,
-    board_dir: &str,
-) -> Result<FalconContents, String> {
+/// Fetch a Falcon recovery build's manifest and extract the metadata for the
+/// `<board_dir>/recovery-falcon.itb` it was listed with.
+pub fn load_recovery_contents(build: &FalconBuild) -> Result<FalconContents, String> {
     let bm: BuildManifest = fetch_json(&build.manifest_location)?;
-    falcon_contents(&bm, &build.manifest_location, board_dir, RECOVERY_IMAGE)
+    falcon_contents(&bm, build, RECOVERY_IMAGE)
 }
 
 /// Parsed contents of a Falcon image build manifest: the image's size and digest,
@@ -247,14 +241,17 @@ pub struct FalconContents {
 /// manifest so it can be exercised directly.
 fn falcon_contents(
     bm: &BuildManifest,
-    manifest_location: &str,
-    board_dir: &str,
+    build: &FalconBuild,
     image: &str,
 ) -> Result<FalconContents, String> {
+    let board_dir = listed_board_dir(&build.image_location, &build.manifest_location, image)?;
     // The build exists but ships nothing for this board. Report it rather than
     // silently flashing whatever the URL happens to return.
     let Some(f) = find_for_board(bm, board_dir, image) else {
-        return Err(format!("{manifest_location} lists no {board_dir}/{image}"));
+        return Err(format!(
+            "{} lists no {board_dir}/{image}",
+            build.manifest_location
+        ));
     };
     Ok(FalconContents {
         size: f.size,
@@ -278,25 +275,22 @@ pub struct UbootContents {
     pub boot_menu: Option<FalconImage>,
 }
 
-/// Fetch a U-Boot build's manifest and extract the metadata for its
-/// `<board_dir>/u-boot-rockchip.bin`, plus any `<board_dir>/bootmenu-falcon.itb`
-/// published beside it.
+/// Fetch a U-Boot build's manifest and extract the metadata for the
+/// `<board_dir>/u-boot-rockchip.bin` it was listed with, plus any
+/// `<board_dir>/bootmenu-falcon.itb` published beside it.
 ///
 /// The sibling of [`load_profiles`]: both kinds of build carry a manifest, and
 /// both are read exactly once through this pair, so the details popup, the
 /// verification pass and the install path all see the same fields.
-pub fn load_uboot_contents(build: &UbootBuild, board_dir: &str) -> Result<UbootContents, String> {
+pub fn load_uboot_contents(build: &UbootBuild) -> Result<UbootContents, String> {
     let bm: BuildManifest = fetch_json(&build.manifest_location)?;
-    uboot_contents(&bm, build, board_dir)
+    uboot_contents(&bm, build)
 }
 
 /// The decision [`load_uboot_contents`] makes, separated from fetching the
 /// manifest so it can be exercised directly.
-fn uboot_contents(
-    bm: &BuildManifest,
-    build: &UbootBuild,
-    board_dir: &str,
-) -> Result<UbootContents, String> {
+fn uboot_contents(bm: &BuildManifest, build: &UbootBuild) -> Result<UbootContents, String> {
+    let board_dir = listed_board_dir(&build.image_location, &build.manifest_location, UBOOT_IMAGE)?;
     let details = bm.details();
     let Some(image) = find_for_board(bm, board_dir, UBOOT_IMAGE) else {
         // The build exists but ships nothing for this board. Report it rather
@@ -324,6 +318,28 @@ fn uboot_contents(
         details,
         boot_menu,
     })
+}
+
+/// The per-board directory a build was listed with: the segment of its image
+/// location between the build directory and the image's name.
+///
+/// The digest has to be looked up for the very file that will be fetched, so the
+/// directory is read back off that file's location rather than worked out again
+/// from the board: a second derivation can disagree with the first, and then a
+/// board's image is checked against another board's digest.
+fn listed_board_dir<'a>(
+    image_location: &'a str,
+    manifest_location: &str,
+    image: &str,
+) -> Result<&'a str, String> {
+    manifest_location
+        .strip_suffix("manifest.json")
+        .and_then(|base| image_location.strip_prefix(base))
+        .and_then(|rel| rel.strip_suffix(&format!("/{image}")))
+        .filter(|dir| !dir.is_empty())
+        .ok_or_else(|| {
+            format!("{image_location} is not a <board>/{image} beside {manifest_location}")
+        })
 }
 
 /// Find `<board_dir>/<name>` in a build manifest. A manifest may list its files
@@ -614,6 +630,22 @@ mod tests {
         serde_json::from_str(BUILD_MANIFEST).expect("valid build manifest")
     }
 
+    fn falcon(board_dir: &str, image: &str) -> FalconBuild {
+        let base = "https://images.invalid/falcon/m=abc/";
+        FalconBuild {
+            id: "m=abc/".into(),
+            label: "abc".into(),
+            mtime: String::new(),
+            image_location: format!("{base}{board_dir}/{image}"),
+            manifest_location: format!("{base}manifest.json"),
+            source: Source::Server,
+            size_bytes: 0,
+            sha256: None,
+            details: None,
+            loaded: false,
+        }
+    }
+
     /// A `falcon-bootmenu` build directory, holding one image per board and none
     /// of the bootloader files.
     const BOOT_MENU_MANIFEST: &str = r#"{
@@ -630,14 +662,16 @@ mod tests {
     fn reads_a_boot_menu_build_for_this_board() {
         let bm: BuildManifest =
             serde_json::from_str(BOOT_MENU_MANIFEST).expect("valid build manifest");
-        let c = falcon_contents(&bm, "m.json", "flipper-one", BOOT_MENU_IMAGE).unwrap();
+        let build = falcon("flipper-one", BOOT_MENU_IMAGE);
+        let c = falcon_contents(&bm, &build, BOOT_MENU_IMAGE).unwrap();
         assert_eq!(c.size, 19450880);
         assert_eq!(c.sha256.as_deref(), Some("bb"));
         assert_eq!(c.mtime, "2026-09-16T18:25:21Z");
         assert_eq!(c.details.build.number, Some(1));
 
         // A board the build does not ship is reported rather than guessed at.
-        let err = falcon_contents(&bm, "m.json", "sige5", BOOT_MENU_IMAGE).unwrap_err();
+        let build = falcon("sige5", BOOT_MENU_IMAGE);
+        let err = falcon_contents(&bm, &build, BOOT_MENU_IMAGE).unwrap_err();
         assert!(err.contains("lists no sige5/bootmenu-falcon.itb"), "{err}");
     }
 
@@ -656,13 +690,15 @@ mod tests {
     fn reads_a_recovery_build_for_this_board() {
         let bm: BuildManifest =
             serde_json::from_str(RECOVERY_MANIFEST).expect("valid build manifest");
-        let c = falcon_contents(&bm, "r.json", "flipper-one", RECOVERY_IMAGE).unwrap();
+        let build = falcon("flipper-one", RECOVERY_IMAGE);
+        let c = falcon_contents(&bm, &build, RECOVERY_IMAGE).unwrap();
         assert_eq!(c.size, 44997120);
         assert_eq!(c.sha256.as_deref(), Some("dd"));
 
         // A recovery build is not a boot menu build: asking it for the other
         // image must not fall through to the one it does ship.
-        let err = falcon_contents(&bm, "r.json", "flipper-one", BOOT_MENU_IMAGE).unwrap_err();
+        let build = falcon("flipper-one", BOOT_MENU_IMAGE);
+        let err = falcon_contents(&bm, &build, BOOT_MENU_IMAGE).unwrap_err();
         assert!(
             err.contains("lists no flipper-one/bootmenu-falcon.itb"),
             "{err}"
@@ -690,7 +726,7 @@ mod tests {
     #[test]
     fn reads_the_boot_menu_beside_the_bootloader() {
         let build = uboot("flipper-one");
-        let c = uboot_contents(&manifest(), &build, "flipper-one").unwrap();
+        let c = uboot_contents(&manifest(), &build).unwrap();
         assert_eq!(c.size, 9961984);
         assert_eq!(c.sha256.as_deref(), Some("bb"));
 
@@ -710,7 +746,7 @@ mod tests {
         // bootloader and stays installable: the menu is optional in a way the
         // bootloader is not.
         let build = uboot("generic");
-        let c = uboot_contents(&manifest(), &build, "generic").unwrap();
+        let c = uboot_contents(&manifest(), &build).unwrap();
         assert_eq!(c.size, 9441280);
         assert!(c.boot_menu.is_none());
     }
@@ -718,11 +754,44 @@ mod tests {
     #[test]
     fn a_build_without_this_board_is_an_error() {
         let build = uboot("nanopi-m5");
-        let err = uboot_contents(&manifest(), &build, "nanopi-m5").unwrap_err();
+        let err = uboot_contents(&manifest(), &build).unwrap_err();
         assert!(
             err.contains("lists no nanopi-m5/u-boot-rockchip.bin"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn reads_the_board_dir_off_the_image_location() {
+        let m = "https://x.invalid/u-boot/u=abc/manifest.json";
+        assert_eq!(
+            listed_board_dir(
+                "https://x.invalid/u-boot/u=abc/evb/u-boot-rockchip.bin",
+                m,
+                UBOOT_IMAGE
+            ),
+            Ok("evb")
+        );
+        // An image from another build directory, or another image entirely, is
+        // refused rather than mapped onto some directory of this build.
+        assert!(listed_board_dir(
+            "https://x.invalid/u-boot/u=def/evb/u-boot-rockchip.bin",
+            m,
+            UBOOT_IMAGE
+        )
+        .is_err());
+        assert!(listed_board_dir(
+            "https://x.invalid/u-boot/u=abc/evb/bootmenu-falcon.itb",
+            m,
+            UBOOT_IMAGE
+        )
+        .is_err());
+        assert!(listed_board_dir(
+            "https://x.invalid/u-boot/u=abc/u-boot-rockchip.bin",
+            m,
+            UBOOT_IMAGE
+        )
+        .is_err());
     }
 
     #[test]

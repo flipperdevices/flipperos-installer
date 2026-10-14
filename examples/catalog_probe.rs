@@ -25,7 +25,7 @@ fn main() {
         println!("      -> {}", b.image_location);
         // The image size and digest only arrive with the manifest. So does the
         // boot menu, for a build old enough to carry one of its own.
-        match catalog::load_uboot_contents(b, "flipper-one") {
+        match catalog::load_uboot_contents(b) {
             Ok(c) => println!(
                 "      image {} B, in-tree menu {}",
                 c.size,
@@ -43,7 +43,7 @@ fn main() {
     for b in &menus {
         println!("  {}  [{}]", b.summary(), b.mtime);
         println!("      -> {}", b.image_location);
-        match catalog::load_boot_menu_contents(b, "flipper-one") {
+        match catalog::load_boot_menu_contents(b) {
             Ok(c) => println!("      image {} B", c.size),
             Err(e) => println!("      manifest error: {e}"),
         }
@@ -57,7 +57,7 @@ fn main() {
     for b in &recoveries {
         println!("  {}  [{}]", b.summary(), b.mtime);
         println!("      -> {}", b.image_location);
-        match catalog::load_recovery_contents(b, "flipper-one") {
+        match catalog::load_recovery_contents(b) {
             Ok(c) => println!("      image {} B", c.size),
             Err(e) => println!("      manifest error: {e}"),
         }

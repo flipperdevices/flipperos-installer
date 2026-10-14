@@ -769,14 +769,14 @@ impl Controller {
     /// manifest and are read exactly once through this pair, so the details
     /// popup, the verification pass and the install path all see the same fields.
     fn load_uboot_contents(&self, id: &str) {
-        let (build, board_dir) = {
+        let build = {
             let s = self.state.lock().unwrap();
             match s.uboot_builds.iter().find(|b| b.id == id) {
-                Some(b) if !b.loaded => (b.clone(), self.board_dir(&s)),
+                Some(b) if !b.loaded => b.clone(),
                 _ => return,
             }
         };
-        match catalog::load_uboot_contents(&build, &board_dir) {
+        match catalog::load_uboot_contents(&build) {
             Ok(c) => self.update(|s| {
                 if let Some(b) = s.uboot_builds.iter_mut().find(|b| b.id == id) {
                     b.size_bytes = c.size;
@@ -797,14 +797,14 @@ impl Controller {
     /// plus the build metadata for the details popup. Blocking, so call it from a
     /// worker thread; a no-op if already loaded or unknown.
     fn load_boot_menu_contents(&self, id: &str) {
-        let (build, board_dir) = {
+        let build = {
             let s = self.state.lock().unwrap();
             match s.boot_menu_builds.iter().find(|b| b.id == id) {
-                Some(b) if !b.loaded => (b.clone(), self.board_dir(&s)),
+                Some(b) if !b.loaded => b.clone(),
                 _ => return,
             }
         };
-        match catalog::load_boot_menu_contents(&build, &board_dir) {
+        match catalog::load_boot_menu_contents(&build) {
             Ok(c) => self.update(|s| {
                 if let Some(b) = s.boot_menu_builds.iter_mut().find(|b| b.id == id) {
                     b.size_bytes = c.size;
@@ -823,14 +823,14 @@ impl Controller {
     /// Fetch a Falcon recovery build's manifest, the counterpart of
     /// [`Self::load_boot_menu_contents`].
     fn load_recovery_contents(&self, id: &str) {
-        let (build, board_dir) = {
+        let build = {
             let s = self.state.lock().unwrap();
             match s.recovery_builds.iter().find(|b| b.id == id) {
-                Some(b) if !b.loaded => (b.clone(), self.board_dir(&s)),
+                Some(b) if !b.loaded => b.clone(),
                 _ => return,
             }
         };
-        match catalog::load_recovery_contents(&build, &board_dir) {
+        match catalog::load_recovery_contents(&build) {
             Ok(c) => self.update(|s| {
                 if let Some(b) = s.recovery_builds.iter_mut().find(|b| b.id == id) {
                     b.size_bytes = c.size;
@@ -865,17 +865,6 @@ impl Controller {
                 }
             }),
             Err(e) => self.log(format!("rootfs details: {e}")),
-        }
-    }
-
-    /// The per-board U-Boot directory to install from: the detected board when
-    /// the server offers it, else the generic build.
-    fn board_dir(&self, state: &AppState) -> String {
-        let board_id = &state.board.board_id;
-        if state.supported_device_types.iter().any(|t| t == board_id) {
-            board_id.clone()
-        } else {
-            catalog::board_dir(board_id).to_string()
         }
     }
 
