@@ -147,6 +147,10 @@ export component MainWindow inherits Window {
     // Ask Rust to start whatever lazy fetch the rows now on screen need:
     // (first-row, count). Fired when a level opens and as it scrolls.
     callback ensure-visible(int, int);
+    // Report the highlighted row after every move, on the summary and in a
+    // level alike. Rust repaints both cursors from its stack on each snapshot,
+    // so a move it never heard of would be undone by the next background fetch.
+    callback cursor-moved(int);
 
     // --- navigation state ---
     // screen: 0 = summary, 1 = level popup, 2 = details popup, 3 = the core's
@@ -156,9 +160,9 @@ export component MainWindow inherits Window {
     in-out property <int> screen: 0;
     // Highlighted summary row.
     in-out property <int> menu-index: 0;
-    // Highlighted row of the open level. Kept here rather than in Rust so an
-    // arrow key never has to round-trip through the controller; Rust reads it
-    // when a row is activated and rewrites it when a level is entered or left.
+    // Highlighted row of the open level. Moved here so an arrow key never has
+    // to round-trip through the controller; each move is reported through
+    // `cursor-moved`, and Rust rewrites it from its stack on every snapshot.
     in-out property <int> cursor: 0;
     // Scroll offset (in lines) for the details popup on screen 2.
     in-out property <int> details-scroll: 0;
@@ -303,12 +307,14 @@ export component MainWindow inherits Window {
                     root.menu-index = root.menu-index > 0
                         ? root.menu-index - 1
                         : max(root.summary-items.length - 1, 0);
+                    root.cursor-moved(root.menu-index);
                     return accept;
                 }
                 if (event.text == Key.DownArrow) {
                     root.menu-index = root.menu-index < root.summary-items.length - 1
                         ? root.menu-index + 1
                         : 0;
+                    root.cursor-moved(root.menu-index);
                     return accept;
                 }
                 if (event.text == Key.Return) {
@@ -326,6 +332,7 @@ export component MainWindow inherits Window {
                     root.cursor = root.cursor > 0
                         ? root.cursor - 1
                         : max(root.level-count() - 1, 0);
+                    root.cursor-moved(root.cursor);
                     root.ensure-visible(root.sub-offset(), root.visible-rows);
                     return accept;
                 }
@@ -333,6 +340,7 @@ export component MainWindow inherits Window {
                     root.cursor = root.cursor < root.level-count() - 1
                         ? root.cursor + 1
                         : 0;
+                    root.cursor-moved(root.cursor);
                     root.ensure-visible(root.sub-offset(), root.visible-rows);
                     return accept;
                 }

@@ -202,6 +202,29 @@ pub fn build(ctrl: Arc<Controller>) -> Result<Gui, slint::PlatformError> {
         });
     }
     {
+        // Record every arrow move in the stack. Each snapshot repaints the cursor
+        // from it, so without this a background fetch landing would snap the
+        // highlight back to wherever the level was opened.
+        let cache = Arc::clone(&cache);
+        let nav = Arc::clone(&nav);
+        let weak = win.as_weak();
+        win.on_cursor_moved(move |idx| {
+            let index = idx.max(0) as usize;
+            let mut nav_now = nav.lock().unwrap();
+            nav_now.set_cursor(index);
+            let nav_copy = nav_now.clone();
+            drop(nav_now);
+            // VIEW is per-row, so its availability follows the highlight.
+            if nav_copy.depth() > 0 {
+                let state = cache.lock().unwrap().clone();
+                let level = menu::level(&nav_copy, &state);
+                if let Some(win) = weak.upgrade() {
+                    win.set_level_can_details(level.details_at(index).is_some());
+                }
+            }
+        });
+    }
+    {
         // Answering the core's prompt only calls the controller: it clears the
         // prompt in the shared state, and the snapshot that follows is what takes
         // the popup down — in both frontends at once.
