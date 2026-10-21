@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use crate::core::controller::{Config, Controller};
 use crate::core::fetch;
-use crate::core::install::{apply_verdict, receive_progress, OnMismatch, Ticker};
+use crate::core::install::{apply_verdict, receive_progress, transfer_weight, OnMismatch, Ticker};
 use crate::core::model::{
     human_bytes, BundleRef, FalconImage, PackFile, ProfilePack, SnapshotBuild, Source, UbootBuild,
 };
@@ -303,6 +303,21 @@ pub fn ensure_space(dir: &str, needed: u64, what: &str) -> Result<()> {
     ))
 }
 
+/// Size of the archive behind a bundle, or 0 when it has none or it cannot be
+/// read.
+///
+/// The bundle's payload is already-compressed packs, so this is also a close
+/// estimate of the unpacked total — close enough for a space check and for the
+/// progress bar, and far cheaper than a decompression pass just to add up the
+/// headers.
+pub(crate) fn archive_size(reference: &BundleRef) -> u64 {
+    reference
+        .archive
+        .as_ref()
+        .and_then(|path| fs::metadata(path).ok())
+        .map_or(0, |m| m.len())
+}
+
 /// Unpack an archive-backed bundle into the scratch directory it was listed
 /// against, so the install reads plain local files.
 ///
@@ -317,12 +332,9 @@ pub(crate) fn unpack_bundle(
     let Some(path) = &reference.archive else {
         return Ok(());
     };
-    ticker.begin(ctrl, &format!("unpacking {path}"));
+    let estimate = archive_size(reference);
+    ticker.begin(ctrl, &format!("unpacking {path}"), estimate);
 
-    // The bundle's payload is already-compressed packs, so the archive's own size
-    // is a close estimate of the unpacked total — close enough for a space check,
-    // and far cheaper than a decompression pass just to add up the headers.
-    let estimate = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     if cfg.dry_run {
         ctrl.log(format!(
             "[dry-run] would unpack {path} (~{}) into {}",
@@ -362,7 +374,11 @@ pub(crate) fn run(
             dir.display()
         ));
         for a in plan {
-            ticker.begin(ctrl, &format!("[dry-run] verifying {}", a.label));
+            ticker.begin(
+                ctrl,
+                &format!("[dry-run] verifying {}", a.label),
+                transfer_weight(a.size),
+            );
         }
         return Ok(Staged {
             dir,
@@ -391,7 +407,11 @@ pub(crate) fn run(
     };
 
     for a in plan {
-        ticker.begin(ctrl, &format!("verifying {}", a.label));
+        ticker.begin(
+            ctrl,
+            &format!("verifying {}", a.label),
+            transfer_weight(a.size),
+        );
         let (base, span) = ticker.step_span();
         let mut on_progress =
             receive_progress(ctrl, format!("verifying {}", a.label), base, span, a.size);
@@ -753,7 +773,7 @@ mod tests {
             local_artifact(&src, "home_9_pack.zst", b"seed", None),
         ];
 
-        let mut ticker = Ticker::new(plan.len() as u32);
+        let mut ticker = Ticker::new(plan.iter().map(|a| a.size).sum());
         let staged = run(ctrl.config(), &ctrl, &plan, &mut ticker).expect("staging succeeds");
 
         // Every artifact was copied into the scratch dir, byte for byte.
@@ -793,7 +813,7 @@ mod tests {
             Some(digest(b"different bytes")),
         )];
 
-        let mut ticker = Ticker::new(1);
+        let mut ticker = Ticker::new(plan[0].size);
         let err = match run(ctrl.config(), &ctrl, &plan, &mut ticker) {
             Ok(_) => panic!("a digest mismatch must fail the run"),
             Err(e) => e,
@@ -819,7 +839,7 @@ mod tests {
             Some(digest(b"bytes")),
         )];
 
-        let mut ticker = Ticker::new(1);
+        let mut ticker = Ticker::new(plan[0].size);
         run(ctrl.config(), &ctrl, &plan, &mut ticker).expect("dry run succeeds");
         assert!(
             !cache.path("pack.zst").exists(),

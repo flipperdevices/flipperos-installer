@@ -107,36 +107,54 @@ const INSTALL_KERNEL_SH: &str = include_str!("../../scripts/flipperos-install-ke
 
 type Result<T> = std::result::Result<T, String>;
 
-/// Coarse, step-based progress reporter for an install run. Each [`Ticker::begin`]
-/// marks the start of a discrete step and moves the bar to the fraction of steps
-/// completed so far; long steps can additionally animate within their own slice
-/// via [`Ticker::step_span`] + [`Controller::set_progress`].
+/// Step-based progress reporter for an install run, weighted by how much work
+/// each step does. Each [`Ticker::begin`] marks the start of a discrete step and
+/// moves the bar to the share of the total weight completed so far; long steps
+/// can additionally animate within their own slice via [`Ticker::step_span`] +
+/// [`Controller::set_progress`].
+///
+/// Weights are bytes: a transfer weighs what its manifest says it moves, and a
+/// step that moves nothing weighs a byte-equivalent of how long it takes (see
+/// [`KERNEL_WEIGHT`] and its neighbours).
 pub(crate) struct Ticker {
-    step: u32,
-    total: u32,
+    /// Weight of the steps already finished.
+    done: u64,
+    /// Weight of the step under way.
+    current: u64,
+    total: u64,
 }
 
 impl Ticker {
-    pub(crate) fn new(total: u32) -> Self {
-        Ticker { step: 0, total }
+    pub(crate) fn new(total: u64) -> Self {
+        Ticker {
+            done: 0,
+            current: 0,
+            total,
+        }
     }
 
-    /// Advance to the next step: log `msg` and set the bar to the fraction of
-    /// steps completed *before* this one (so the step's own slice is left free
-    /// to fill in as it progresses).
-    pub(crate) fn begin(&mut self, ctrl: &Controller, msg: &str) {
-        self.step += 1;
-        ctrl.set_progress((self.step - 1) as f32 / self.total as f32);
+    /// Advance to the next step, weighing `weight`: log `msg` and set the bar to
+    /// the share of the total completed *before* this step (so the step's own
+    /// slice is left free to fill in as it progresses).
+    pub(crate) fn begin(&mut self, ctrl: &Controller, msg: &str, weight: u64) {
+        self.done += self.current;
+        self.current = weight;
+        ctrl.set_progress(self.share(self.done));
         ctrl.log(msg.to_string());
     }
 
     /// `(base, span)` of the current step's slice of the overall bar, so a step
     /// can report intra-step progress as `set_progress(base + span * frac)`.
     pub(crate) fn step_span(&self) -> (f32, f32) {
-        (
-            (self.step - 1) as f32 / self.total as f32,
-            1.0 / self.total as f32,
-        )
+        (self.share(self.done), self.share(self.current))
+    }
+
+    /// `weight` as a fraction of the whole bar.
+    fn share(&self, weight: u64) -> f32 {
+        if self.total == 0 {
+            return 0.0;
+        }
+        weight as f32 / self.total as f32
     }
 }
 
@@ -213,6 +231,30 @@ impl<R: Read> Read for ProgressReader<'_, R> {
 /// byte step rather than a share of the total, so a large pack on a slow link
 /// still moves the status line every few seconds.
 const PROGRESS_LOG_STEP: u64 = 10 * 1024 * 1024;
+
+// What the steps that move no bytes of their own weigh on the progress bar, as
+// the number of bytes a transfer would move in about the time the step takes.
+// Rough by nature; what matters is that they are small next to the packs yet not
+// zero, so the bar still moves past them.
+/// `blkdiscard` of the whole target, which can take seconds on a large SD card.
+const DISCARD_WEIGHT: u64 = 16 * 1024 * 1024;
+const GPT_WEIGHT: u64 = 1024 * 1024;
+const MKFS_WEIGHT: u64 = 8 * 1024 * 1024;
+const SNAPSHOT_WEIGHT: u64 = 1024 * 1024;
+/// The chroot plus `kernel-install`, which copies a kernel and initrd into /boot.
+const KERNEL_WEIGHT: u64 = 64 * 1024 * 1024;
+/// A transfer whose manifest publishes no size.
+const UNKNOWN_SIZE_WEIGHT: u64 = 64 * 1024 * 1024;
+
+/// What a transfer of `size` bytes weighs on the progress bar: its size, or
+/// [`UNKNOWN_SIZE_WEIGHT`] when the manifest gives none.
+pub(crate) fn transfer_weight(size: u64) -> u64 {
+    if size == 0 {
+        UNKNOWN_SIZE_WEIGHT
+    } else {
+        size
+    }
+}
 
 /// Build a throttled byte-progress callback for a receive step: it animates the
 /// bar within this step's `(base, span)` slice on each 1% change and logs a
@@ -411,26 +453,47 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
         .map(|b| b.reference.clone())
         .filter(|r| r.archive.is_some());
 
-    // 5 fixed steps, then receive + snapshot + kernel per deployed profile, plus
-    // one receive step for the shared /home seed when the build ships one, one
-    // each for the boot menu and the recovery image when the target takes them,
-    // one staging step per artifact when verifying up front, and one for
-    // unpacking a local archive.
-    let deployed = 1 + extras.len();
-    let verify_steps = match fetch_mode {
-        FetchMode::VerifyFirst => plan.len() as u32,
+    // The bar's total, in bytes: the weight of every step the run below begins.
+    // When verifying up front each artifact counts twice, once staged and once
+    // written, because it really is moved twice.
+    let staging: u64 = match fetch_mode {
+        FetchMode::VerifyFirst => plan.iter().map(|a| transfer_weight(a.size)).sum(),
         FetchMode::Stream => 0,
     };
-    let total_steps = 5
-        + boot_menu.is_some() as u32
-        // Both halves, because a device without the logical unit is installed
-        // without the recovery system rather than refused.
-        + (recovery.is_some() && recovery_lu.is_some()) as u32
-        + pending_archive.is_some() as u32
-        + verify_steps
-        + deployed as u32 * 3
-        + build.home_pack.is_some() as u32;
-    let mut ticker = Ticker::new(total_steps);
+    let minimal_size = build
+        .minimal()
+        .and_then(|m| m.full.as_ref())
+        .map_or(0, |f| f.size_bytes);
+    let deploying: u64 = std::iter::once(minimal_size)
+        .chain(
+            extras
+                .iter()
+                .map(|p| p.incremental.as_ref().map_or(0, |i| i.size_bytes)),
+        )
+        .map(|size| transfer_weight(size) + SNAPSHOT_WEIGHT + KERNEL_WEIGHT)
+        .sum();
+    let total_weight = pending_archive.as_ref().map_or(0, stage::archive_size)
+        + staging
+        + DISCARD_WEIGHT
+        + GPT_WEIGHT
+        + transfer_weight(uboot.size_bytes)
+        + boot_menu
+            .as_ref()
+            .map_or(0, |m| transfer_weight(m.size_bytes))
+        // Only with the logical unit too, because a device without one is
+        // installed without the recovery system rather than refused.
+        + recovery
+            .as_ref()
+            .filter(|_| recovery_lu.is_some())
+            .map_or(0, |r| transfer_weight(r.size_bytes))
+        + MKFS_WEIGHT
+        + build
+            .home_pack
+            .as_ref()
+            .map_or(0, |h| transfer_weight(h.size_bytes))
+        + deploying
+        + METADATA_SIZE;
+    let mut ticker = Ticker::new(total_weight);
 
     if let Some(reference) = &pending_archive {
         stage::unpack_bundle(cfg, ctrl, reference, &mut ticker)?;
@@ -477,7 +540,7 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
     let root_part = partition_path(&device.path, ROOT_PART_INDEX);
 
     // 1. Wipe.
-    ticker.begin(ctrl, &format!("blkdiscard {}", device.path));
+    ticker.begin(ctrl, &format!("blkdiscard {}", device.path), DISCARD_WEIGHT);
     wait_for_exclusive_access(cfg, ctrl, &device.path);
     exec(
         cfg,
@@ -486,7 +549,7 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
     )?;
 
     // 2. Partition.
-    ticker.begin(ctrl, "writing GPT");
+    ticker.begin(ctrl, "writing GPT", GPT_WEIGHT);
     write_gpt(
         cfg,
         ctrl,
@@ -496,7 +559,11 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
     )?;
 
     // 3. Bootloader.
-    ticker.begin(ctrl, &format!("installing u-boot {}", uboot.label));
+    ticker.begin(
+        ctrl,
+        &format!("installing u-boot {}", uboot.label),
+        transfer_weight(uboot.size_bytes),
+    );
     install_uboot(cfg, ctrl, &device, &uboot, boot_lu.as_ref(), policy)?;
 
     // 3a. Boot menu, onto the loader partition the bootloader left free. A no-op
@@ -515,7 +582,7 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
     )?;
 
     // 4. Filesystem + subvolumes.
-    ticker.begin(ctrl, &format!("mkfs.btrfs {root_part}"));
+    ticker.begin(ctrl, &format!("mkfs.btrfs {root_part}"), MKFS_WEIGHT);
     let mnt = make_filesystem(cfg, ctrl, &root_part, &fs_layout)?;
 
     // The target is mounted from here on. Run the remaining steps in an inner
@@ -543,7 +610,11 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
         // base — copy-on-write keeps the data with @home, and no golden base for
         // the version-independent @home lingers.
         if let Some(home_pack) = &build.home_pack {
-            ticker.begin(ctrl, "receiving /home seed");
+            ticker.begin(
+                ctrl,
+                "receiving /home seed",
+                transfer_weight(home_pack.size_bytes),
+            );
             let (base, span) = ticker.step_span();
             let mut on_progress = receive_progress(
                 ctrl,
@@ -631,7 +702,7 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
 
         // 6. Provenance. The system boots without it, so a failure here is
         // reported rather than allowed to fail an otherwise good install.
-        ticker.begin(ctrl, "recording build metadata");
+        ticker.begin(ctrl, "recording build metadata", METADATA_SIZE);
         let recorded = install_record
             .as_deref()
             .map_err(|e| e.clone())
@@ -668,7 +739,11 @@ fn deploy_profile(
     policy: OnMismatch,
     ticker: &mut Ticker,
 ) -> Result<()> {
-    ticker.begin(ctrl, &format!("receiving {} ({kind})", profile.name));
+    ticker.begin(
+        ctrl,
+        &format!("receiving {} ({kind})", profile.name),
+        transfer_weight(pack.size_bytes),
+    );
 
     // The receive is by far the longest step: decompressing and streaming a
     // multi-hundred-MiB pack. Animate the bar within this step's slice and log a
@@ -686,7 +761,11 @@ fn deploy_profile(
     let stock_dir = format!("{mnt}/{STOCK_SNAPSHOTS_DIR}");
     receive_pack(cfg, ctrl, &stock_dir, pack, &what, policy, &mut on_progress)?;
 
-    ticker.begin(ctrl, &format!("snapshotting {}", profile.root_subvol()));
+    ticker.begin(
+        ctrl,
+        &format!("snapshotting {}", profile.root_subvol()),
+        SNAPSHOT_WEIGHT,
+    );
     make_writable_snapshot(
         cfg,
         ctrl,
@@ -695,7 +774,11 @@ fn deploy_profile(
         &profile.root_subvol(),
     )?;
 
-    ticker.begin(ctrl, &format!("installing kernel for {}", profile.name));
+    ticker.begin(
+        ctrl,
+        &format!("installing kernel for {}", profile.name),
+        KERNEL_WEIGHT,
+    );
     install_kernel(
         cfg,
         ctrl,
@@ -1177,7 +1260,11 @@ fn install_boot_menu(
         );
         return Ok(());
     };
-    ticker.begin(ctrl, "installing boot menu");
+    ticker.begin(
+        ctrl,
+        "installing boot menu",
+        transfer_weight(menu.size_bytes),
+    );
     let loader = partition_path(&device.path, LOADER_PART_INDEX);
     wait_for_device(cfg, ctrl, &loader)?;
     write_source_to_offset(
@@ -1220,7 +1307,11 @@ fn install_recovery(
         ));
         return Ok(());
     };
-    ticker.begin(ctrl, "installing recovery");
+    ticker.begin(
+        ctrl,
+        "installing recovery",
+        transfer_weight(image.size_bytes),
+    );
     wait_for_device(cfg, ctrl, node)?;
     write_source_to_offset(
         cfg,
@@ -2201,17 +2292,41 @@ mod tests {
     }
 
     #[test]
-    fn ticker_step_spans_tile_the_bar() {
-        let mut t = Ticker::new(4);
-        t.step = 1;
-        let (base, span) = t.step_span();
-        assert!(base.abs() < 1e-6);
-        assert!((span - 0.25).abs() < 1e-6);
+    fn ticker_step_spans_tile_the_bar_by_weight() {
+        let ctrl = Controller::new(Config {
+            automount: false,
+            ..Config::default()
+        });
+        let mut t = Ticker::new(100);
+        let mut spans = Vec::new();
+        for weight in [10, 30, 60] {
+            t.begin(&ctrl, "step", weight);
+            spans.push(t.step_span());
+            // Each step starts the bar where the steps before it left off.
+            assert!((ctrl.snapshot().progress - spans.last().unwrap().0).abs() < 1e-6);
+        }
+        // Each slice starts where the last ended and is as wide as its weight.
+        for ((base, span), (want_base, want_span)) in
+            spans.into_iter().zip([(0.0, 0.1), (0.1, 0.3), (0.4, 0.6)])
+        {
+            assert!((base - want_base).abs() < 1e-6, "{base} != {want_base}");
+            assert!((span - want_span).abs() < 1e-6, "{span} != {want_span}");
+        }
         // The last step's slice ends exactly at a full bar.
-        t.step = 4;
         let (base, span) = t.step_span();
-        assert!((base - 0.75).abs() < 1e-6);
         assert!((base + span - 1.0).abs() < 1e-6);
+
+        // A run with nothing to weigh leaves the bar alone rather than dividing
+        // by zero.
+        let mut empty = Ticker::new(0);
+        empty.begin(&ctrl, "step", 0);
+        assert_eq!(empty.step_span(), (0.0, 0.0));
+    }
+
+    #[test]
+    fn a_transfer_of_unknown_size_still_weighs_something() {
+        assert_eq!(transfer_weight(42), 42);
+        assert_eq!(transfer_weight(0), UNKNOWN_SIZE_WEIGHT);
     }
 
     /// A mount table as it looks mid-install: the target's top level, the
