@@ -208,8 +208,8 @@ pub(crate) fn apply_verdict(
 }
 
 /// A `Read` adapter that reports the running total of bytes read to a callback
-/// after each read, used to surface transfer progress for the long profile
-/// receive step.
+/// after each read, used to surface transfer progress for the pack receives and
+/// the image writes.
 struct ProgressReader<'a, R> {
     inner: R,
     read: u64,
@@ -564,7 +564,23 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
         &format!("installing u-boot {}", uboot.label),
         transfer_weight(uboot.size_bytes),
     );
-    install_uboot(cfg, ctrl, &device, &uboot, boot_lu.as_ref(), policy)?;
+    let (base, span) = ticker.step_span();
+    let mut on_progress = receive_progress(
+        ctrl,
+        "writing u-boot image".to_string(),
+        base,
+        span,
+        uboot.size_bytes,
+    );
+    install_uboot(
+        cfg,
+        ctrl,
+        &device,
+        &uboot,
+        boot_lu.as_ref(),
+        policy,
+        &mut on_progress,
+    )?;
 
     // 3a. Boot menu, onto the loader partition the bootloader left free. A no-op
     // unless the target is UFS and a menu was resolved for it.
@@ -1153,6 +1169,7 @@ fn install_uboot(
     build: &UbootBuild,
     boot_lu: Option<&BootLuPlan>,
     policy: OnMismatch,
+    on_progress: &mut dyn FnMut(u64),
 ) -> Result<()> {
     // Everywhere but UFS the RK3576 boot ROM reads the bootloader from byte offset
     // 32 KiB of the disk, which the GPT makes the start of the loader partition
@@ -1171,6 +1188,7 @@ fn install_uboot(
             0,
             build.sha256.as_deref(),
             policy,
+            on_progress,
         )?;
         return Ok(());
     }
@@ -1208,6 +1226,7 @@ fn install_uboot(
         LOADER_START,
         build.sha256.as_deref(),
         policy,
+        on_progress,
     )?;
 
     if plan.id == plan.active {
@@ -1265,6 +1284,14 @@ fn install_boot_menu(
         "installing boot menu",
         transfer_weight(menu.size_bytes),
     );
+    let (base, span) = ticker.step_span();
+    let mut on_progress = receive_progress(
+        ctrl,
+        "writing boot menu image".to_string(),
+        base,
+        span,
+        menu.size_bytes,
+    );
     let loader = partition_path(&device.path, LOADER_PART_INDEX);
     wait_for_device(cfg, ctrl, &loader)?;
     write_source_to_offset(
@@ -1277,6 +1304,7 @@ fn install_boot_menu(
         0,
         menu.sha256.as_deref(),
         policy,
+        &mut on_progress,
     )?;
     Ok(())
 }
@@ -1312,6 +1340,14 @@ fn install_recovery(
         "installing recovery",
         transfer_weight(image.size_bytes),
     );
+    let (base, span) = ticker.step_span();
+    let mut on_progress = receive_progress(
+        ctrl,
+        "writing recovery image".to_string(),
+        base,
+        span,
+        image.size_bytes,
+    );
     wait_for_device(cfg, ctrl, node)?;
     write_source_to_offset(
         cfg,
@@ -1323,6 +1359,7 @@ fn install_recovery(
         0,
         image.sha256.as_deref(),
         policy,
+        &mut on_progress,
     )?;
     Ok(())
 }
@@ -1996,6 +2033,7 @@ fn open_source(location: &str, source: &Source) -> Result<Box<dyn Read + Send>> 
 /// Stream a source (HTTP URL for [`Source::Server`], local path otherwise)
 /// directly onto `device`, starting at `offset` bytes, then flush to disk. A
 /// short write is an error, so the digest always covers the whole image.
+/// `on_progress` sees the running total of bytes read from the source.
 ///
 /// Returns whether the bytes now on the device are trustworthy: true when the
 /// digest matched, or when the manifest published none to compare against, and
@@ -2013,6 +2051,7 @@ fn write_source_to_offset(
     offset: u64,
     expect: Option<&str>,
     policy: OnMismatch,
+    on_progress: &mut dyn FnMut(u64),
 ) -> Result<bool> {
     if cfg.dry_run {
         ctrl.log(format!(
@@ -2025,9 +2064,13 @@ fn write_source_to_offset(
     ));
 
     let mut sha = fetch::Sha256::new();
-    let mut reader = fetch::Digesting {
-        inner: open_source(location, source)?,
-        sha: &mut sha,
+    let mut reader = ProgressReader {
+        inner: fetch::Digesting {
+            inner: open_source(location, source)?,
+            sha: &mut sha,
+        },
+        read: 0,
+        on_progress,
     };
     let mut file = OpenOptions::new()
         .write(true)
@@ -2243,6 +2286,49 @@ mod tests {
         // The callback sees a strictly increasing running total that ends at the
         // full length (EOF's zero-length read reports nothing).
         assert_eq!(seen.last().copied(), Some(10));
+        assert!(seen.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn writing_an_image_reports_its_progress() {
+        let dir = std::env::temp_dir().join("flipperos-install-write-progress");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let image = dir.join("image.bin");
+        let device = dir.join("device.bin");
+        let body = vec![0xa5u8; 100_000];
+        std::fs::write(&image, &body).unwrap();
+        std::fs::write(&device, []).unwrap();
+
+        let cfg = Config {
+            dry_run: false,
+            automount: false,
+            ..Config::default()
+        };
+        let ctrl = Controller::new(cfg.clone());
+        let mut seen: Vec<u64> = Vec::new();
+        let verified = write_source_to_offset(
+            &cfg,
+            &ctrl,
+            "image",
+            &image.to_string_lossy(),
+            &Source::Local {
+                root: dir.to_string_lossy().into_owned(),
+            },
+            &device.to_string_lossy(),
+            16,
+            None,
+            OnMismatch::Fail,
+            &mut |n| seen.push(n),
+        )
+        .unwrap();
+        let written = std::fs::read(&device).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(verified);
+        assert_eq!(&written[16..], &body[..]);
+        // The callback follows the copy all the way to the end of the image.
+        assert_eq!(seen.last().copied(), Some(body.len() as u64));
         assert!(seen.windows(2).all(|w| w[0] < w[1]));
     }
 
