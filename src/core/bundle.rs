@@ -29,7 +29,7 @@
 use serde::Deserialize;
 
 use crate::core::model::{
-    BuildDetails, BuildMeta, BundleLocation, BundleRef, FalconImage, PackFile, ProfilePack,
+    BuildDetails, BuildMeta, BundleLocation, BundleRef, ImageFile, PackFile, ProfilePack,
     SelectedBundle, SnapshotBuild, Source, SourceStamp, UbootBuild,
 };
 use crate::core::{archive, catalog, fetch};
@@ -384,7 +384,7 @@ pub fn resolve(
         .files
         .iter()
         .find(|f| f.path == menu_rel)
-        .map(|f| FalconImage {
+        .map(|f| ImageFile {
             location: location.join(&menu_rel),
             source: source.clone(),
             size_bytes: f.size,
@@ -397,7 +397,7 @@ pub fn resolve(
         .files
         .iter()
         .find(|f| f.path == recovery_rel)
-        .map(|f| FalconImage {
+        .map(|f| ImageFile {
             location: location.join(&recovery_rel),
             source: source.clone(),
             size_bytes: f.size,

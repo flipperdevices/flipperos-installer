@@ -1181,8 +1181,8 @@ mod tests {
             .collect()
     }
 
-    fn falcon_build(id: &str, label: &str, image: &str) -> FalconBuild {
-        FalconBuild {
+    fn falcon_build(id: &str, label: &str, image: &str) -> ImageBuild {
+        ImageBuild {
             id: id.into(),
             label: label.into(),
             mtime: "2026-09-16T18:25:35Z".into(),

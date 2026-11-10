@@ -21,7 +21,7 @@ use crate::core::controller::{Config, Controller};
 use crate::core::fetch;
 use crate::core::install::{apply_verdict, receive_progress, transfer_weight, OnMismatch, Ticker};
 use crate::core::model::{
-    human_bytes, BundleRef, FalconImage, PackFile, ProfilePack, SnapshotBuild, Source, UbootBuild,
+    human_bytes, BundleRef, ImageFile, PackFile, ProfilePack, SnapshotBuild, Source, UbootBuild,
 };
 
 pub type Result<T> = std::result::Result<T, String>;
@@ -47,13 +47,13 @@ pub struct Artifact {
     pub rel: String,
 }
 
-/// The Falcon images a run writes outside the filesystem. A named struct rather
-/// than two arguments of the same type, which nothing would stop a caller
-/// transposing.
+/// The images a run writes as they are, outside the filesystem. A named struct
+/// rather than several arguments of the same type, which nothing would stop a
+/// caller transposing.
 #[derive(Clone, Copy, Default)]
-pub struct FalconImages<'a> {
-    pub boot_menu: Option<&'a FalconImage>,
-    pub recovery: Option<&'a FalconImage>,
+pub struct RawImages<'a> {
+    pub boot_menu: Option<&'a ImageFile>,
+    pub recovery: Option<&'a ImageFile>,
 }
 
 /// Everything the run will read, in install order.
@@ -64,7 +64,7 @@ pub struct FalconImages<'a> {
 /// installed onto.
 pub fn plan(
     uboot: &UbootBuild,
-    falcon: FalconImages,
+    images: RawImages,
     build: &SnapshotBuild,
     extras: &[ProfilePack],
 ) -> Vec<Artifact> {
@@ -77,10 +77,10 @@ pub fn plan(
         size: uboot.size_bytes,
         rel: "u-boot-rockchip.bin".to_string(),
     });
-    if let Some(menu) = falcon.boot_menu {
+    if let Some(menu) = images.boot_menu {
         out.push(image_artifact("boot menu image", menu));
     }
-    if let Some(recovery) = falcon.recovery {
+    if let Some(recovery) = images.recovery {
         out.push(image_artifact("recovery image", recovery));
     }
     if let Some(home) = &build.home_pack {
@@ -97,7 +97,7 @@ pub fn plan(
     out
 }
 
-fn image_artifact(label: &str, image: &FalconImage) -> Artifact {
+fn image_artifact(label: &str, image: &ImageFile) -> Artifact {
     Artifact {
         label: label.to_string(),
         location: image.location.clone(),
@@ -164,8 +164,8 @@ impl Staged {
         }
     }
 
-    /// Point a Falcon image at its staged copy.
-    pub fn localise_image(&self, image: &mut FalconImage) {
+    /// Point an image at its staged copy.
+    pub fn localise_image(&self, image: &mut ImageFile) {
         if let Some(path) = self.staged_path(&image.location) {
             image.location = path.to_string();
             image.source = self.local_source();
@@ -216,13 +216,13 @@ impl Drop for Staged {
 /// warning.
 pub fn guard_not_on_target(
     uboot: &UbootBuild,
-    falcon: FalconImages,
+    images: RawImages,
     build: &SnapshotBuild,
     extras: &[ProfilePack],
     disk: &str,
 ) -> Result<()> {
     let mounts = crate::core::removable::mounts_on(disk);
-    check_not_on_mounts(&plan(uboot, falcon, build, extras), &mounts, disk)
+    check_not_on_mounts(&plan(uboot, images, build, extras), &mounts, disk)
 }
 
 /// The decision [`guard_not_on_target`] makes, separated from reading
@@ -558,8 +558,8 @@ mod tests {
     }
 
     /// The boot menu a UFS run would install.
-    fn boot_menu() -> FalconImage {
-        FalconImage {
+    fn boot_menu() -> ImageFile {
+        ImageFile {
             location: "https://example.invalid/m/flipper-one/bootmenu-falcon.itb".into(),
             source: Source::Server,
             size_bytes: 99,
@@ -568,8 +568,8 @@ mod tests {
     }
 
     /// The recovery image a UFS run would install.
-    fn recovery() -> FalconImage {
-        FalconImage {
+    fn recovery() -> ImageFile {
+        ImageFile {
             location: "https://example.invalid/r/flipper-one/recovery-falcon.itb".into(),
             source: Source::Server,
             size_bytes: 55,
@@ -581,7 +581,7 @@ mod tests {
     fn plans_only_what_is_needed_in_install_order() {
         let b = build();
         let extras = vec![b.profiles[1].clone()];
-        let p = plan(&uboot(), FalconImages::default(), &b, &extras);
+        let p = plan(&uboot(), RawImages::default(), &b, &extras);
 
         let labels: Vec<&str> = p.iter().map(|a| a.label.as_str()).collect();
         assert_eq!(
@@ -600,7 +600,7 @@ mod tests {
         assert_eq!(p[2].rel, "Minimal_9_stock_pack.zst");
         assert_eq!(p[0].rel, "u-boot-rockchip.bin");
         // An unpublished digest is carried through as `None`, not invented.
-        let all = plan(&uboot(), FalconImages::default(), &b, &b.profiles[1..]);
+        let all = plan(&uboot(), RawImages::default(), &b, &b.profiles[1..]);
         assert!(all.iter().any(|a| a.sha256.is_none()));
     }
 
@@ -611,7 +611,7 @@ mod tests {
         let rec = recovery();
         let p = plan(
             &uboot(),
-            FalconImages {
+            RawImages {
                 boot_menu: Some(&menu),
                 recovery: Some(&rec),
             },
@@ -859,7 +859,7 @@ mod tests {
         let mut b = build();
         let disk = "/dev/definitely-not-a-real-disk";
         // Nothing is mounted from that disk, so a remote bundle is fine.
-        assert!(guard_not_on_target(&uboot(), FalconImages::default(), &b, &[], disk).is_ok());
+        assert!(guard_not_on_target(&uboot(), RawImages::default(), &b, &[], disk).is_ok());
         // A local pack under a mountpoint of the target would be caught; with no
         // such mount present the guard is a no-op, which is what this asserts.
         if let Some(full) = b.profiles[0].full.as_mut() {
@@ -868,7 +868,7 @@ mod tests {
                 root: "/mnt/sd".into(),
             };
         }
-        assert!(guard_not_on_target(&uboot(), FalconImages::default(), &b, &[], disk).is_ok());
+        assert!(guard_not_on_target(&uboot(), RawImages::default(), &b, &[], disk).is_ok());
     }
 
     #[test]

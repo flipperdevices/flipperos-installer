@@ -130,7 +130,7 @@ mod tests {
     use super::*;
     use crate::core::bundle;
     use crate::core::model::{
-        BundleLocation, BundleRef, FalconBuild, Selection, Source, UbootBuild,
+        BundleLocation, BundleRef, ImageBuild, Selection, Source, UbootBuild,
     };
     use serde_json::Value;
 
@@ -154,8 +154,8 @@ mod tests {
         }
     }
 
-    fn falcon(id: &str, details: Option<BuildDetails>) -> FalconBuild {
-        FalconBuild {
+    fn falcon(id: &str, details: Option<BuildDetails>) -> ImageBuild {
+        ImageBuild {
             id: id.into(),
             label: id.into(),
             mtime: String::new(),

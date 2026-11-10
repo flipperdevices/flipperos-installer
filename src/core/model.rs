@@ -192,9 +192,9 @@ pub struct UbootBuild {
     /// The Falcon boot menu this build carries in its own directory, if it
     /// carries one. `None` until the manifest has been read, and after that for
     /// every build that predates the boot menu or postdates the split that moved
-    /// it into a listing of its own — see [`FalconBuild`]. Only a fallback now,
-    /// for an origin that publishes no such listing.
-    pub boot_menu: Option<FalconImage>,
+    /// it into a listing of its own — see [`AppState::boot_menu_builds`]. Only a
+    /// fallback now, for an origin that publishes no such listing.
+    pub boot_menu: Option<ImageFile>,
     /// Whether this build's manifest has been read (filling [`Self::size_bytes`],
     /// [`Self::sha256`], [`Self::details`] and [`Self::boot_menu`]). Mirrors
     /// [`SnapshotBuild::loaded`]: both kinds of build carry a manifest and are
@@ -202,18 +202,19 @@ pub struct UbootBuild {
     pub loaded: bool,
 }
 
-/// A Falcon-mode FIT image — a kernel plus an initramfs that U-Boot starts
-/// without going through a full boot — written raw to a fixed place on the
-/// target.
+/// One image file a run writes as is, rather than receiving it into the
+/// filesystem: the file a manifest lists, with the size and digest it publishes.
 ///
-/// Two of them exist: the boot menu (`bootmenu-falcon.itb`), which goes to the
-/// start of the loader partition, and the recovery system
-/// (`recovery-falcon.itb`), which goes to its own logical unit. Both are UFS-only
-/// for the same reason: the boot ROM reads U-Boot from a boot LU there, leaving
-/// the loader partition free, and only a UFS device has the spare logical unit.
+/// Two of them are Falcon-mode FIT images — a kernel plus an initramfs that
+/// U-Boot starts without going through a full boot — written raw to a fixed place
+/// on the target: the boot menu (`bootmenu-falcon.itb`), which goes to the start
+/// of the loader partition, and the recovery system (`recovery-falcon.itb`),
+/// which goes to its own logical unit. Both are UFS-only for the same reason: the
+/// boot ROM reads U-Boot from a boot LU there, leaving the loader partition free,
+/// and only a UFS device has the spare logical unit.
 #[derive(Clone, Debug)]
-pub struct FalconImage {
-    /// URL (server) or path (media) of the `.itb`.
+pub struct ImageFile {
+    /// URL (server) or path (media) of the image.
     pub location: String,
     pub source: Source,
     pub size_bytes: u64,
@@ -251,21 +252,21 @@ impl UbootBuild {
     }
 }
 
-/// One build directory of a Falcon image listing (`falcon-bootmenu/`,
-/// `falcon-recovery/`), holding one image per board.
+/// One build directory of an image listing (`falcon-bootmenu/`,
+/// `falcon-recovery/`), holding one [`ImageFile`] per board.
 ///
 /// The image server builds these separately from the bootloader, so they are
 /// picked separately too — the counterpart of [`UbootBuild`] for everything that
 /// is not the bootloader itself.
 #[derive(Clone, Debug)]
-pub struct FalconBuild {
+pub struct ImageBuild {
     /// Stable id: the build's directory segment on the server.
     pub id: String,
     /// Short human label (revision + date).
     pub label: String,
     /// Modification time (ISO-8601), used for newest-first sorting.
     pub mtime: String,
-    /// URL (server) or path (media) of this board's `.itb`.
+    /// URL (server) or path (media) of the image this build was listed for.
     pub image_location: String,
     /// Location of this build's `manifest.json`, for lazily loading contents.
     pub manifest_location: String,
@@ -280,7 +281,7 @@ pub struct FalconBuild {
     pub loaded: bool,
 }
 
-impl FalconBuild {
+impl ImageBuild {
     /// Build number from the (lazily fetched) manifest, if known.
     pub fn build_number(&self) -> Option<u64> {
         self.details.as_ref().and_then(|d| d.build.number)
@@ -312,11 +313,11 @@ impl FalconBuild {
     /// The image this build offers for the board it was listed for. `None` until
     /// the manifest has been read, since neither the size nor the digest the
     /// install verifies against is known before that.
-    pub fn image(&self) -> Option<FalconImage> {
+    pub fn image(&self) -> Option<ImageFile> {
         if !self.loaded {
             return None;
         }
-        Some(FalconImage {
+        Some(ImageFile {
             location: self.image_location.clone(),
             source: self.source.clone(),
             size_bytes: self.size_bytes,
@@ -532,10 +533,10 @@ pub struct SelectedBundle {
     pub device_types: Vec<String>,
     pub uboot: UbootBuild,
     /// The Falcon boot menu for [`Self::board_dir`], if the bundle ships one.
-    pub boot_menu: Option<FalconImage>,
+    pub boot_menu: Option<ImageFile>,
     /// The Falcon recovery image for [`Self::board_dir`], if the bundle ships
     /// one.
-    pub recovery: Option<FalconImage>,
+    pub recovery: Option<ImageFile>,
     pub build: SnapshotBuild,
 }
 
@@ -755,9 +756,9 @@ pub struct AppState {
     /// Available U-Boot builds, newest first.
     pub uboot_builds: Vec<UbootBuild>,
     /// Available Falcon boot menu builds, newest first.
-    pub boot_menu_builds: Vec<FalconBuild>,
+    pub boot_menu_builds: Vec<ImageBuild>,
     /// Available Falcon recovery builds, newest first.
-    pub recovery_builds: Vec<FalconBuild>,
+    pub recovery_builds: Vec<ImageBuild>,
     /// Available snapshot builds, newest first.
     pub snapshot_builds: Vec<SnapshotBuild>,
     pub selection: Selection,
@@ -846,7 +847,7 @@ impl AppState {
     /// directory, which is how an origin publishing no `falcon-bootmenu/` listing
     /// — an older removable-media mirror, or a U-Boot build from before the split
     /// — still yields a menu.
-    pub fn selected_boot_menu(&self) -> Option<FalconImage> {
+    pub fn selected_boot_menu(&self) -> Option<ImageFile> {
         match self.selection.mode {
             InstallMode::Bundle => self.bundle.as_ref()?.boot_menu.clone(),
             InstallMode::Custom => match self.selection.boot_menu.as_deref() {
@@ -858,7 +859,7 @@ impl AppState {
 
     /// The hand-picked Falcon boot menu build. [`InstallMode::Custom`] only: a
     /// bundle pins an image, not a build.
-    pub fn selected_boot_menu_build(&self) -> Option<&FalconBuild> {
+    pub fn selected_boot_menu_build(&self) -> Option<&ImageBuild> {
         if self.selection.mode != InstallMode::Custom {
             return None;
         }
@@ -887,7 +888,7 @@ impl AppState {
     /// No fallback to the U-Boot build, unlike [`Self::selected_boot_menu`]: the
     /// builds that carry a recovery image of their own were never installed from,
     /// so there is no behaviour to preserve.
-    pub fn selected_recovery(&self) -> Option<FalconImage> {
+    pub fn selected_recovery(&self) -> Option<ImageFile> {
         match self.selection.mode {
             InstallMode::Bundle => self.bundle.as_ref()?.recovery.clone(),
             InstallMode::Custom => self.selected_recovery_build()?.image(),
@@ -896,7 +897,7 @@ impl AppState {
 
     /// The hand-picked Falcon recovery build, the counterpart of
     /// [`Self::selected_boot_menu_build`].
-    pub fn selected_recovery_build(&self) -> Option<&FalconBuild> {
+    pub fn selected_recovery_build(&self) -> Option<&ImageBuild> {
         if self.selection.mode != InstallMode::Custom {
             return None;
         }
@@ -1063,8 +1064,8 @@ mod tests {
         }
     }
 
-    fn falcon_image(location: &str, size: u64) -> FalconImage {
-        FalconImage {
+    fn falcon_image(location: &str, size: u64) -> ImageFile {
+        ImageFile {
             location: location.to_string(),
             source: Source::Server,
             size_bytes: size,
@@ -1072,7 +1073,7 @@ mod tests {
         }
     }
 
-    fn uboot_carrying(menu: Option<FalconImage>) -> UbootBuild {
+    fn uboot_carrying(menu: Option<ImageFile>) -> UbootBuild {
         UbootBuild {
             id: "u".into(),
             label: "u".into(),
@@ -1091,7 +1092,7 @@ mod tests {
     #[test]
     fn the_boot_menu_listing_wins_over_the_one_inside_a_uboot_build() {
         let in_tree = falcon_image("https://i.invalid/u/flipper-one/bootmenu-falcon.itb", 40);
-        let listed = FalconBuild {
+        let listed = ImageBuild {
             id: "m".into(),
             label: "m".into(),
             mtime: String::new(),
@@ -1140,7 +1141,7 @@ mod tests {
         // No fallback to the U-Boot build, unlike the boot menu: a build carrying
         // `recovery-falcon.itb` of its own was never installed from, so picking it
         // up now would start writing an image this installer has never written.
-        let listed = FalconBuild {
+        let listed = ImageBuild {
             id: "r".into(),
             label: "r".into(),
             mtime: String::new(),
@@ -1186,7 +1187,7 @@ mod tests {
     fn a_boot_menu_build_offers_nothing_until_its_manifest_is_read() {
         // The size and digest the install verifies against arrive with the
         // manifest, so an unloaded build must not be installed from.
-        let build = FalconBuild {
+        let build = ImageBuild {
             id: "m".into(),
             label: "m".into(),
             mtime: String::new(),
@@ -1199,7 +1200,7 @@ mod tests {
             loaded: false,
         };
         assert!(build.image().is_none());
-        assert!(FalconBuild {
+        assert!(ImageBuild {
             loaded: true,
             ..build
         }

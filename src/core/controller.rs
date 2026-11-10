@@ -432,8 +432,8 @@ impl Controller {
 
         self.log("querying image catalog…");
         let mut uboot_builds: Vec<UbootBuild> = Vec::new();
-        let mut boot_menu_builds: Vec<FalconBuild> = Vec::new();
-        let mut recovery_builds: Vec<FalconBuild> = Vec::new();
+        let mut boot_menu_builds: Vec<ImageBuild> = Vec::new();
+        let mut recovery_builds: Vec<ImageBuild> = Vec::new();
         let mut snapshot_builds: Vec<SnapshotBuild> = Vec::new();
         for origin in &origins {
             uboot_builds.extend(catalog::uboot_builds(origin, &board_dir, LIMIT));

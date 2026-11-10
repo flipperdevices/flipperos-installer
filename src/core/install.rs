@@ -29,7 +29,7 @@ use std::sync::Arc;
 use crate::core::controller::{Config, Controller};
 use crate::core::layout::{self, Layout};
 use crate::core::model::{
-    human_bytes, FalconImage, FetchMode, InstallMode, PackFile, ProfilePack, Source, StorageDevice,
+    human_bytes, FetchMode, ImageFile, InstallMode, PackFile, ProfilePack, Source, StorageDevice,
     StorageKind, UbootBuild,
 };
 use crate::core::{catalog, fetch, metadata, stage, storage, ufs};
@@ -398,11 +398,11 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
         recovery_lu.as_deref(),
         recovery_capacity,
     )?;
-    let falcon = stage::FalconImages {
+    let images = stage::RawImages {
         boot_menu: boot_menu.as_ref(),
         recovery: recovery.as_ref(),
     };
-    stage::guard_not_on_target(&uboot, falcon, &build, &extras, &device.path)?;
+    stage::guard_not_on_target(&uboot, images, &build, &extras, &device.path)?;
 
     // What the metadata partition will record, settled before anything is
     // written. A custom rootfs build's records are only fetched when its details
@@ -443,7 +443,7 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
     // artifacts are checked before that point at all.
     let fetch_mode = state.selection.fetch;
     let policy = OnMismatch::for_mode(fetch_mode);
-    let plan = stage::plan(&uboot, falcon, &build, &extras);
+    let plan = stage::plan(&uboot, images, &build, &extras);
 
     // A locally supplied `*.tar.zst` is unpacked into the scratch dir first; the
     // bundle already describes its files at the paths they will occupy.
@@ -908,7 +908,7 @@ fn guard_ufs_boot_lu(
 fn guard_boot_menu_fits(
     cfg: &Config,
     ctrl: &Controller,
-    boot_menu: Option<&FalconImage>,
+    boot_menu: Option<&ImageFile>,
 ) -> Result<()> {
     let Some(menu) = boot_menu else {
         return Ok(());
@@ -960,7 +960,7 @@ fn ufs_recovery_lu(device: &StorageDevice) -> Option<String> {
 fn guard_recovery_fits(
     cfg: &Config,
     ctrl: &Controller,
-    recovery: Option<&FalconImage>,
+    recovery: Option<&ImageFile>,
     lu: Option<&str>,
     capacity: Option<u64>,
 ) -> Result<()> {
@@ -1264,7 +1264,7 @@ fn install_boot_menu(
     cfg: &Config,
     ctrl: &Controller,
     device: &StorageDevice,
-    boot_menu: Option<&FalconImage>,
+    boot_menu: Option<&ImageFile>,
     policy: OnMismatch,
     ticker: &mut Ticker,
 ) -> Result<()> {
@@ -1319,7 +1319,7 @@ fn install_boot_menu(
 fn install_recovery(
     cfg: &Config,
     ctrl: &Controller,
-    recovery: Option<&FalconImage>,
+    recovery: Option<&ImageFile>,
     lu: Option<&str>,
     policy: OnMismatch,
     ticker: &mut Ticker,
@@ -2176,8 +2176,8 @@ mod tests {
     }
 
     /// A boot menu image of `size` bytes.
-    fn boot_menu_of(size: u64) -> FalconImage {
-        FalconImage {
+    fn boot_menu_of(size: u64) -> ImageFile {
+        ImageFile {
             location: "https://example.invalid/bootmenu-falcon.itb".into(),
             source: Source::Server,
             size_bytes: size,
@@ -2217,8 +2217,8 @@ mod tests {
     }
 
     /// A recovery image of `size` bytes.
-    fn recovery_of(size: u64) -> FalconImage {
-        FalconImage {
+    fn recovery_of(size: u64) -> ImageFile {
+        ImageFile {
             location: "https://example.invalid/recovery-falcon.itb".into(),
             source: Source::Server,
             size_bytes: size,

@@ -23,8 +23,7 @@ use serde::Deserialize;
 
 use crate::core::fetch;
 use crate::core::model::{
-    BuildDetails, FalconBuild, FalconImage, PackFile, ProfilePack, SnapshotBuild, Source,
-    UbootBuild,
+    BuildDetails, ImageBuild, ImageFile, PackFile, ProfilePack, SnapshotBuild, Source, UbootBuild,
 };
 
 /// The flashable bootloader inside a U-Boot build's per-board directory.
@@ -177,8 +176,8 @@ pub fn uboot_builds(origin: &Origin, board_dir: &str, limit: usize) -> Vec<Uboot
 /// List the available Falcon boot menu builds for `board_dir`, newest first
 /// (capped). The image size and digest are loaded lazily via
 /// [`load_boot_menu_contents`].
-pub fn boot_menu_builds(origin: &Origin, board_dir: &str, limit: usize) -> Vec<FalconBuild> {
-    falcon_builds(
+pub fn boot_menu_builds(origin: &Origin, board_dir: &str, limit: usize) -> Vec<ImageBuild> {
+    image_builds(
         origin,
         BOOT_MENU_DIR,
         BOOT_MENU_IMAGE,
@@ -191,8 +190,8 @@ pub fn boot_menu_builds(origin: &Origin, board_dir: &str, limit: usize) -> Vec<F
 /// List the available Falcon recovery builds for `board_dir`, newest first
 /// (capped). The image size and digest are loaded lazily via
 /// [`load_recovery_contents`].
-pub fn recovery_builds(origin: &Origin, board_dir: &str, limit: usize) -> Vec<FalconBuild> {
-    falcon_builds(
+pub fn recovery_builds(origin: &Origin, board_dir: &str, limit: usize) -> Vec<ImageBuild> {
+    image_builds(
         origin,
         RECOVERY_DIR,
         RECOVERY_IMAGE,
@@ -202,20 +201,20 @@ pub fn recovery_builds(origin: &Origin, board_dir: &str, limit: usize) -> Vec<Fa
     )
 }
 
-/// The shared body of the Falcon image listings: same two-level layout as
+/// The shared body of the image listings: same two-level layout as
 /// [`uboot_builds`], differing only in which directory is listed, which file is
 /// taken from it, and which revision names the build.
-fn falcon_builds(
+fn image_builds(
     origin: &Origin,
     top_dir: &str,
     image: &str,
     revision_key: &str,
     board_dir: &str,
     limit: usize,
-) -> Vec<FalconBuild> {
+) -> Vec<ImageBuild> {
     list_builds(origin, top_dir, limit)
         .into_iter()
-        .map(|(d, base_location)| FalconBuild {
+        .map(|(d, base_location)| ImageBuild {
             id: d.name.clone(),
             label: revision_label(&d.name, revision_key, top_dir),
             mtime: d.mtime.unwrap_or_default(),
@@ -232,22 +231,22 @@ fn falcon_builds(
 
 /// Fetch a Falcon boot menu build's manifest and extract the metadata for the
 /// `<board_dir>/bootmenu-falcon.itb` it was listed with.
-pub fn load_boot_menu_contents(build: &FalconBuild) -> Result<FalconContents, String> {
+pub fn load_boot_menu_contents(build: &ImageBuild) -> Result<ImageContents, String> {
     let bm: BuildManifest = fetch_json(&build.manifest_location)?;
-    falcon_contents(&bm, build, BOOT_MENU_IMAGE)
+    image_contents(&bm, build, BOOT_MENU_IMAGE)
 }
 
 /// Fetch a Falcon recovery build's manifest and extract the metadata for the
 /// `<board_dir>/recovery-falcon.itb` it was listed with.
-pub fn load_recovery_contents(build: &FalconBuild) -> Result<FalconContents, String> {
+pub fn load_recovery_contents(build: &ImageBuild) -> Result<ImageContents, String> {
     let bm: BuildManifest = fetch_json(&build.manifest_location)?;
-    falcon_contents(&bm, build, RECOVERY_IMAGE)
+    image_contents(&bm, build, RECOVERY_IMAGE)
 }
 
-/// Parsed contents of a Falcon image build manifest: the image's size and digest,
-/// and the build metadata for the details popup.
+/// Parsed contents of an image build manifest: the image's size and digest, and
+/// the build metadata for the details popup.
 #[derive(Debug)]
-pub struct FalconContents {
+pub struct ImageContents {
     pub size: u64,
     pub sha256: Option<String>,
     pub mtime: String,
@@ -256,11 +255,11 @@ pub struct FalconContents {
 
 /// The decision [`load_boot_menu_contents`] makes, separated from fetching the
 /// manifest so it can be exercised directly.
-fn falcon_contents(
+fn image_contents(
     bm: &BuildManifest,
-    build: &FalconBuild,
+    build: &ImageBuild,
     image: &str,
-) -> Result<FalconContents, String> {
+) -> Result<ImageContents, String> {
     let board_dir = listed_board_dir(&build.image_location, &build.manifest_location, image)?;
     // The build exists but ships nothing for this board. Report it rather than
     // silently flashing whatever the URL happens to return.
@@ -270,7 +269,7 @@ fn falcon_contents(
             build.manifest_location
         ));
     };
-    Ok(FalconContents {
+    Ok(ImageContents {
         size: f.size,
         sha256: f.digest(),
         mtime: f.mtime.clone(),
@@ -289,7 +288,7 @@ pub struct UbootContents {
     pub details: BuildDetails,
     /// `None` unless this build carries a boot menu in its own directory, which
     /// only the builds predating [`boot_menu_builds`] do.
-    pub boot_menu: Option<FalconImage>,
+    pub boot_menu: Option<ImageFile>,
 }
 
 /// Fetch a U-Boot build's manifest and extract the metadata for the
@@ -321,7 +320,7 @@ fn uboot_contents(bm: &BuildManifest, build: &UbootBuild) -> Result<UbootContent
     // the boot menu in the same per-board directory as the bootloader, so its
     // location is that image's sibling. A build that ships none is still
     // installable, from `falcon-bootmenu/` or with no menu at all.
-    let boot_menu = find_for_board(bm, board_dir, BOOT_MENU_IMAGE).map(|f| FalconImage {
+    let boot_menu = find_for_board(bm, board_dir, BOOT_MENU_IMAGE).map(|f| ImageFile {
         location: sibling_of(&build.image_location, BOOT_MENU_IMAGE),
         source: build.source.clone(),
         size_bytes: f.size,
@@ -647,9 +646,9 @@ mod tests {
         serde_json::from_str(BUILD_MANIFEST).expect("valid build manifest")
     }
 
-    fn falcon(board_dir: &str, image: &str) -> FalconBuild {
+    fn falcon(board_dir: &str, image: &str) -> ImageBuild {
         let base = "https://images.invalid/falcon/m=abc/";
-        FalconBuild {
+        ImageBuild {
             id: "m=abc/".into(),
             label: "abc".into(),
             mtime: String::new(),
@@ -680,7 +679,7 @@ mod tests {
         let bm: BuildManifest =
             serde_json::from_str(BOOT_MENU_MANIFEST).expect("valid build manifest");
         let build = falcon("flipper-one", BOOT_MENU_IMAGE);
-        let c = falcon_contents(&bm, &build, BOOT_MENU_IMAGE).unwrap();
+        let c = image_contents(&bm, &build, BOOT_MENU_IMAGE).unwrap();
         assert_eq!(c.size, 19450880);
         assert_eq!(c.sha256.as_deref(), Some("bb"));
         assert_eq!(c.mtime, "2026-09-16T18:25:21Z");
@@ -688,7 +687,7 @@ mod tests {
 
         // A board the build does not ship is reported rather than guessed at.
         let build = falcon("sige5", BOOT_MENU_IMAGE);
-        let err = falcon_contents(&bm, &build, BOOT_MENU_IMAGE).unwrap_err();
+        let err = image_contents(&bm, &build, BOOT_MENU_IMAGE).unwrap_err();
         assert!(err.contains("lists no sige5/bootmenu-falcon.itb"), "{err}");
     }
 
@@ -708,14 +707,14 @@ mod tests {
         let bm: BuildManifest =
             serde_json::from_str(RECOVERY_MANIFEST).expect("valid build manifest");
         let build = falcon("flipper-one", RECOVERY_IMAGE);
-        let c = falcon_contents(&bm, &build, RECOVERY_IMAGE).unwrap();
+        let c = image_contents(&bm, &build, RECOVERY_IMAGE).unwrap();
         assert_eq!(c.size, 44997120);
         assert_eq!(c.sha256.as_deref(), Some("dd"));
 
         // A recovery build is not a boot menu build: asking it for the other
         // image must not fall through to the one it does ship.
         let build = falcon("flipper-one", BOOT_MENU_IMAGE);
-        let err = falcon_contents(&bm, &build, BOOT_MENU_IMAGE).unwrap_err();
+        let err = image_contents(&bm, &build, BOOT_MENU_IMAGE).unwrap_err();
         assert!(
             err.contains("lists no flipper-one/bootmenu-falcon.itb"),
             "{err}"
