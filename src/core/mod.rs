@@ -8,6 +8,7 @@ pub mod controller;
 pub mod fetch;
 pub mod install;
 pub mod layout;
+pub mod mcu;
 pub mod menu;
 pub mod metadata;
 pub mod model;

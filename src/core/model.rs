@@ -658,6 +658,19 @@ pub struct BoardInfo {
     pub board_id: String,
 }
 
+/// The board's MCU, as the kernel's firmware update driver reports it (see
+/// [`crate::core::mcu`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McuInfo {
+    /// The firmware build target matching this board revision (`f1`, `f2`),
+    /// which names the directory the MCU images are published under. `None` on
+    /// a revision the driver does not know, which leaves no image to pick.
+    pub target: Option<String>,
+    /// The firmware version the MCU runs now, as `major.minor.patch`. Firmware
+    /// that predates updates over I2C reads as `0.0.0`.
+    pub version: String,
+}
+
 /// The user's current selections in the installer.
 #[derive(Clone, Debug, Default)]
 pub struct Selection {
@@ -752,6 +765,8 @@ pub enum PromptKind {
 #[derive(Clone, Debug, Default)]
 pub struct AppState {
     pub board: BoardInfo,
+    /// The board's MCU, when the running kernel can update its firmware.
+    pub mcu: Option<McuInfo>,
     pub devices: Vec<StorageDevice>,
     /// Available U-Boot builds, newest first.
     pub uboot_builds: Vec<UbootBuild>,

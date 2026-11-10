@@ -705,6 +705,14 @@ fn render_status(state: &AppState) -> String {
         .unwrap_or_else(|| "—".to_string());
     let boot_menu = state.boot_menu_summary().unwrap_or_else(|| "—".to_string());
     let recovery = state.recovery_summary().unwrap_or_else(|| "—".to_string());
+    let mcu = match &state.mcu {
+        Some(m) => format!(
+            "{} (target {})",
+            m.version,
+            m.target.as_deref().unwrap_or("unknown")
+        ),
+        None => "—".to_string(),
+    };
     let build = state
         .selected_build()
         .map(|b| b.summary())
@@ -725,7 +733,7 @@ fn render_status(state: &AppState) -> String {
         },
     };
     format!(
-        "Board   : {} ({})\nBoard id: {}\nPhase   : {}\n{bar}\n\nSource  : {source}\nTarget  : {target}\nU-Boot  : {uboot}\nBootmenu: {boot_menu}\nRecovery: {recovery}\nSnapshot: {build}\nProfiles: {}\nFetch   : {}\nReady   : {}",
+        "Board   : {} ({})\nBoard id: {}\nPhase   : {}\n{bar}\n\nSource  : {source}\nTarget  : {target}\nU-Boot  : {uboot}\nBootmenu: {boot_menu}\nRecovery: {recovery}\nMCU     : {mcu}\nSnapshot: {build}\nProfiles: {}\nFetch   : {}\nReady   : {}",
         state.board.model,
         state.board.soc,
         state.board.board_id,

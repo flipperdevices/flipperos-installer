@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::core::menu::LoadRequest;
 use crate::core::model::*;
-use crate::core::{board, bundle, catalog, install, provision, removable, ufs};
+use crate::core::{board, bundle, catalog, install, mcu, provision, removable, ufs};
 
 /// Runtime configuration for the installer.
 #[derive(Clone, Debug)]
@@ -266,7 +266,31 @@ impl Controller {
             "board: {} ({}, id={})",
             board.model, board.soc, board.board_id
         ));
-        self.update(|s| s.board = board);
+        let mcu = mcu::detect();
+        match &mcu {
+            Some(McuInfo {
+                target: Some(target),
+                version,
+            }) => self.log(format!("mcu: firmware {version}, target {target}")),
+            Some(McuInfo {
+                target: None,
+                version,
+            }) => self.log(format!(
+                "warning: mcu: firmware {version}, but the kernel knows no firmware target for \
+                 this board revision, so the MCU firmware will not be updated"
+            )),
+            // Every Flipper One has the MCU, so its absence there means a kernel
+            // built without the update driver. Anywhere else it is expected.
+            None if board.board_id == "flipper-one" => self.log(
+                "warning: mcu: the kernel offers no MCU firmware update interface, so the MCU \
+                 firmware will not be updated",
+            ),
+            None => {}
+        }
+        self.update(|s| {
+            s.board = board;
+            s.mcu = mcu;
+        });
 
         self.log("enumerating boot-ROM capable storage…");
         let devices = storage_list();
