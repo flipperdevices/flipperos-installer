@@ -40,12 +40,13 @@ pub enum MenuKey {
     /// Bundles found on removable media or given on the command line.
     Local,
     /// The legacy free-form flow: pick a U-Boot build, a boot menu build, a
-    /// recovery build and a rootfs build.
+    /// recovery build, a rootfs build and an MCU firmware build.
     Custom,
     Uboot,
     BootMenu,
     Recovery,
     Snapshot,
+    Mcu,
     Device,
     Profiles,
     Fetch,
@@ -61,6 +62,7 @@ pub enum Action {
     PickBootMenu(String),
     PickRecovery(String),
     PickSnapshot(String),
+    PickMcu(String),
     PickBundle(String),
     PickFetch(FetchMode),
     ToggleProfile {
@@ -90,6 +92,8 @@ pub enum LoadRequest {
     BootMenuContents(String),
     /// A legacy recovery build's manifest (size, digest, details).
     RecoveryContents(String),
+    /// A legacy MCU firmware build's manifest (size, digest, details).
+    McuContents(String),
     /// A legacy rootfs build's profile packs.
     SnapshotProfiles(String),
 }
@@ -101,6 +105,7 @@ pub enum DetailsTarget {
     BootMenu(String),
     Recovery(String),
     Snapshot(String),
+    Mcu(String),
     /// The selected bundle, whose manifest is already loaded.
     Bundle(String),
     /// A UFS target's logical units and how they compare to the scheme.
@@ -388,6 +393,7 @@ fn build(key: &MenuKey, state: &AppState) -> Level {
         MenuKey::Uboot => uboot(state),
         MenuKey::BootMenu => boot_menu(state),
         MenuKey::Recovery => recovery(state),
+        MenuKey::Mcu => mcu(state),
         MenuKey::Snapshot => snapshot(state),
         MenuKey::Device => device(state),
         MenuKey::Profiles => profiles(state),
@@ -643,12 +649,26 @@ fn custom(state: &AppState) -> Level {
         .find(|b| Some(b.id.as_str()) == state.selection.snapshot_build.as_deref())
         .map(|b| b.display_name())
         .unwrap_or_else(|| "(select)".to_string());
+    // The MCU images are listed per MCU build target, so without one there is
+    // no list to open.
+    let mcu = if state.mcu.as_ref().is_some_and(|m| m.target.is_some()) {
+        let picked = state
+            .mcu_builds
+            .iter()
+            .find(|b| Some(b.id.as_str()) == state.selection.mcu.as_deref())
+            .map(|b| b.display_name())
+            .unwrap_or_else(|| "(select)".to_string());
+        MenuItem::plain("MCU firmware build", Action::Open(MenuKey::Mcu)).with_detail(picked)
+    } else {
+        MenuItem::inert("MCU firmware build").with_detail("(no updatable MCU)")
+    };
 
     let items = vec![
         MenuItem::plain("U-Boot build", Action::Open(MenuKey::Uboot)).with_detail(uboot),
         MenuItem::plain("Boot menu build", Action::Open(MenuKey::BootMenu)).with_detail(boot_menu),
         MenuItem::plain("Recovery build", Action::Open(MenuKey::Recovery)).with_detail(recovery),
         MenuItem::plain("Snapshot build", Action::Open(MenuKey::Snapshot)).with_detail(snapshot),
+        mcu,
     ];
     let mut level = level_of(
         MenuKey::Custom,
@@ -732,6 +752,34 @@ fn recovery(state: &AppState) -> Level {
         items,
     );
     level.crumb = "Source \u{203a} Custom \u{203a} Recovery build".to_string();
+    level.can_refresh = true;
+    if level.items.is_empty() {
+        level.items = vec![MenuItem::inert("(none found)")];
+    }
+    level
+}
+
+fn mcu(state: &AppState) -> Level {
+    let items: Vec<MenuItem> = state
+        .mcu_builds
+        .iter()
+        .map(|b| {
+            let mut item = MenuItem::plain(b.display_name(), Action::PickMcu(b.id.clone()))
+                .with_detail(human_time(&b.mtime))
+                .with_icon(Icon::for_source(&b.source))
+                .selected_if(Some(b.id.as_str()) == state.selection.mcu.as_deref());
+            item.on_focus = Some(LoadRequest::McuContents(b.id.clone()));
+            item.details = Some(DetailsTarget::Mcu(b.id.clone()));
+            item
+        })
+        .collect();
+    let mut level = level_of(
+        MenuKey::Mcu,
+        "MCU firmware build",
+        LevelKind::SinglePick,
+        items,
+    );
+    level.crumb = "Source \u{203a} Custom \u{203a} MCU firmware build".to_string();
     level.can_refresh = true;
     if level.items.is_empty() {
         level.items = vec![MenuItem::inert("(none found)")];
@@ -998,6 +1046,10 @@ pub fn activate(ctrl: &Arc<Controller>, level: &Level, index: usize) -> Move {
             ctrl.select_recovery(id);
             Move::Pop
         }
+        Action::PickMcu(id) => {
+            ctrl.select_mcu(id);
+            Move::Pop
+        }
         Action::PickSnapshot(id) => {
             ctrl.select_snapshot_build(id);
             Move::Pop
@@ -1113,6 +1165,15 @@ pub fn details_text(state: &AppState, target: &DetailsTarget) -> (String, String
                     .unwrap_or_else(|| "(gone)".to_string()),
             )
         }
+        DetailsTarget::Mcu(id) => {
+            let build = state.mcu_builds.iter().find(|b| &b.id == id);
+            (
+                "MCU firmware details".to_string(),
+                build
+                    .map(|b| b.details_text())
+                    .unwrap_or_else(|| "(gone)".to_string()),
+            )
+        }
         DetailsTarget::Snapshot(id) => {
             let build = state.snapshot_builds.iter().find(|b| &b.id == id);
             (
@@ -1214,7 +1275,8 @@ mod tests {
                 "U-Boot build",
                 "Boot menu build",
                 "Recovery build",
-                "Snapshot build"
+                "Snapshot build",
+                "MCU firmware build"
             ]
         );
         assert_eq!(custom.items[1].detail, "bootmenu d31d718");
@@ -1255,6 +1317,53 @@ mod tests {
             assert_eq!(empty.items.len(), 1, "{key:?}");
             assert_eq!(empty.items[0].action, Action::Inert, "{key:?}");
         }
+    }
+
+    #[test]
+    fn the_custom_flow_offers_an_mcu_build_only_with_a_target() {
+        let mut s = state();
+        // No MCU the kernel can update: the row says so and leads nowhere.
+        let custom = build(&MenuKey::Custom, &s);
+        let row = custom.items.last().unwrap();
+        assert_eq!(row.text, "MCU firmware build");
+        assert_eq!(row.detail, "(no updatable MCU)");
+        assert_eq!(row.action, Action::Inert);
+        assert!(row.dim);
+
+        s.mcu = Some(McuInfo {
+            target: Some("f1".into()),
+            version: "0.1.0".into(),
+        });
+        s.mcu_builds = vec![falcon_build(
+            "mcu=504fac3/",
+            "mcu 504fac3",
+            "flipperone-mcu-firmware.uf2",
+        )];
+        s.selection.mcu = Some("mcu=504fac3/".into());
+        let custom = build(&MenuKey::Custom, &s);
+        let row = custom.items.last().unwrap();
+        assert_eq!(row.detail, "mcu 504fac3");
+        assert_eq!(row.action, Action::Open(MenuKey::Mcu));
+
+        let level = build(&MenuKey::Mcu, &s);
+        assert_eq!(level.kind, LevelKind::SinglePick);
+        assert!(level.items[0].selected);
+        assert_eq!(
+            level.items[0].action,
+            Action::PickMcu("mcu=504fac3/".into())
+        );
+        assert_eq!(
+            level.items[0].on_focus,
+            Some(LoadRequest::McuContents("mcu=504fac3/".into()))
+        );
+        assert_eq!(
+            level.details_at(0),
+            Some(DetailsTarget::Mcu("mcu=504fac3/".into()))
+        );
+
+        s.mcu_builds.clear();
+        let empty = build(&MenuKey::Mcu, &s);
+        assert_eq!(empty.items[0].action, Action::Inert);
     }
 
     #[test]

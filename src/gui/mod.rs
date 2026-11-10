@@ -501,6 +501,7 @@ fn apply(win: &MainWindow, state: &AppState) {
             state.uboot_builds.len()
                 + state.boot_menu_builds.len()
                 + state.recovery_builds.len()
+                + state.mcu_builds.len()
                 + state.snapshot_builds.len()
         ),
     };

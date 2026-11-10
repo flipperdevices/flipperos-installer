@@ -1,6 +1,6 @@
-//! Ad-hoc probe: fetch and print the newest U-Boot, boot menu and snapshot
-//! builds from the real image server, and the profiles of the newest snapshot
-//! build.
+//! Ad-hoc probe: fetch and print the newest U-Boot, boot menu, recovery, MCU
+//! firmware and snapshot builds from the real image server, and the profiles of
+//! the newest snapshot build.
 //!
 //! Run with: `cargo run --example catalog_probe --no-default-features`
 
@@ -59,6 +59,30 @@ fn main() {
         println!("      -> {}", b.image_location);
         match catalog::load_recovery_contents(b) {
             Ok(c) => println!("      image {} B", c.size),
+            Err(e) => println!("      manifest error: {e}"),
+        }
+    }
+
+    // Listed per MCU build target rather than per board; `f1` stands in for
+    // whatever the kernel reports on a real device.
+    let mcus = catalog::mcu_builds(&origin, "f1", 5);
+    println!(
+        "\n== MCU firmware builds for f1 (newest first): {} ==",
+        mcus.len()
+    );
+    for b in &mcus {
+        println!("  {}  [{}]", b.summary(), b.mtime);
+        println!("      -> {}", b.image_location);
+        match catalog::load_mcu_contents(b) {
+            Ok(c) => println!(
+                "      image {} B, branch {}",
+                c.size,
+                c.details
+                    .sourcestamps
+                    .iter()
+                    .find(|s| s.codebase == "mcu-firmware")
+                    .map_or("?", |s| s.branch.as_str())
+            ),
             Err(e) => println!("      manifest error: {e}"),
         }
     }

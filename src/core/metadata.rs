@@ -9,7 +9,7 @@
 //! install:
 //!   mode: "bundle" | "custom"
 //!   bundle:     {name, version, channel, build, sourcestamps}   # bundle installs
-//!   components: {u-boot, rootfs, boot-menu, recovery}           # custom installs
+//!   components: {u-boot, rootfs, boot-menu, recovery, mcu-firmware}  # custom installs
 //! ```
 //!
 //! A bundle is one build with one set of sourcestamps covering everything in
@@ -70,12 +70,14 @@ impl InstallRecord {
 /// in rather than read from the selection because the selection only has them
 /// once the details popup asked for them. `boot_menu` and `recovery` say
 /// whether the run writes those images at all: a target that takes neither
-/// should not claim either.
+/// should not claim either. `mcu` says whether the MCU took its firmware, which
+/// is why the record is built only once the upload is over.
 pub fn record(
     state: &AppState,
     rootfs: Option<BuildDetails>,
     boot_menu: bool,
     recovery: bool,
+    mcu: bool,
 ) -> InstallRecord {
     let mode = state.selection.mode;
     let mut record = InstallRecord {
@@ -114,6 +116,13 @@ pub fn record(
                         .selected_recovery_build()
                         .and_then(|b| b.details.clone())
                         .filter(|_| recovery),
+                ),
+                (
+                    "mcu-firmware",
+                    state
+                        .selected_mcu_build()
+                        .and_then(|b| b.details.clone())
+                        .filter(|_| mcu),
                 ),
             ];
             record.components = components
@@ -206,7 +215,7 @@ mod tests {
 
         // What the operator passes for the rootfs is ignored: the bundle speaks
         // for everything in it.
-        let v = json(&record(&state, Some(details("{}")), true, true));
+        let v = json(&record(&state, Some(details("{}")), true, true, true));
         assert_eq!(v["mode"], "bundle");
         assert!(v.get("components").is_none());
         let b = &v["bundle"];
@@ -238,18 +247,25 @@ mod tests {
                     r#"{"build":{"builder":"falcon-recovery","number":2}}"#,
                 )),
             )],
+            mcu_builds: vec![falcon(
+                "mcu=504fac3/",
+                Some(details(
+                    r#"{"build":{"builder":"mcu-firmware","number":381}}"#,
+                )),
+            )],
             selection: Selection {
                 mode: InstallMode::Custom,
                 uboot: Some("u".into()),
                 boot_menu: Some("m".into()),
                 recovery: Some("r".into()),
+                mcu: Some("mcu=504fac3/".into()),
                 ..Selection::default()
             },
             ..AppState::default()
         };
         let rootfs = details(r#"{"build":{"builder":"rootfs"}}"#);
 
-        let v = json(&record(&state, Some(rootfs.clone()), true, true));
+        let v = json(&record(&state, Some(rootfs.clone()), true, true, true));
         assert_eq!(v["mode"], "custom");
         assert!(v.get("bundle").is_none());
         let c = &v["components"];
@@ -257,15 +273,17 @@ mod tests {
         assert_eq!(c["u-boot"]["sourcestamps"][0]["revision"], "fddd7e0");
         assert_eq!(c["boot-menu"]["build"]["number"], 1);
         assert_eq!(c["recovery"]["build"]["number"], 2);
+        assert_eq!(c["mcu-firmware"]["build"]["number"], 381);
         // A field the manifest did not have is not stored as null or "".
         assert_eq!(
             c["rootfs"]["build"],
             serde_json::json!({ "builder": "rootfs" })
         );
 
-        // A target that takes neither Falcon image does not claim them, and a
-        // rootfs whose manifest could not be read is left out.
-        let v = json(&record(&state, None, false, false));
+        // A target that takes neither Falcon image does not claim them, an MCU
+        // that did not take its firmware does not claim it either, and a rootfs
+        // whose manifest could not be read is left out.
+        let v = json(&record(&state, None, false, false, false));
         let names: Vec<&str> = v["components"]
             .as_object()
             .unwrap()

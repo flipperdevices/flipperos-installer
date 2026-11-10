@@ -422,9 +422,10 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
     };
     stage::guard_not_on_target(&uboot, images, &build, &extras, &device.path)?;
 
-    // What the metadata partition will record, settled before anything is
-    // written. A custom rootfs build's records are only fetched when its details
-    // popup asks for them, so they may well not be here yet.
+    // The rootfs records the metadata partition will hold, fetched before anything
+    // is written so a failure is on screen early. A custom rootfs build's records
+    // are only fetched when its details popup asks for them, so they may well not
+    // be here yet. The record itself waits for the MCU update, which it reports.
     let rootfs_details = match (state.selection.mode, &build.details) {
         (InstallMode::Custom, None) => {
             match catalog::load_details(&format!("{}manifest.json", build.base_location)) {
@@ -439,13 +440,6 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
         }
         (_, details) => details.clone(),
     };
-    let install_record = metadata::record(
-        &state,
-        rootfs_details,
-        boot_menu.is_some(),
-        recovery.is_some() && recovery_lu.is_some(),
-    )
-    .to_json();
 
     // Resolve the Btrfs layout: prefer one shipped with the images, else the
     // built-in default.
@@ -739,8 +733,8 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
         }
 
         // 6. MCU firmware, last of what the run installs. Its outcome is held
-        // back until the provenance below is written, which a failed update
-        // must not cost an installed system.
+        // back until the provenance below is written, which records it and which
+        // a failed update must not cost an installed system.
         let mcu_updated = install_mcu_firmware(
             cfg,
             ctrl,
@@ -752,14 +746,19 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
         // 7. Provenance. The system boots without it, so a failure here is
         // reported rather than allowed to fail an otherwise good install.
         ticker.begin(ctrl, "recording build metadata", METADATA_SIZE);
-        let recorded = install_record
-            .as_deref()
-            .map_err(|e| e.clone())
-            .and_then(|json| write_metadata(cfg, ctrl, &device.path, &root_part, &minimal, json));
+        let recorded = metadata::record(
+            &state,
+            rootfs_details,
+            boot_menu.is_some(),
+            recovery.is_some() && recovery_lu.is_some(),
+            mcu_updated == Ok(true),
+        )
+        .to_json()
+        .and_then(|json| write_metadata(cfg, ctrl, &device.path, &root_part, &minimal, &json));
         if let Err(e) = recorded {
             ctrl.log(format!("warning: metadata partition not written: {e}"));
         }
-        mcu_updated
+        mcu_updated.map(|_| ())
     })();
 
     // Always unmount, then surface the deployment error (if any) in preference
@@ -780,15 +779,18 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
 /// on the firmware it booted, but fails the run anyway: the system just
 /// installed may well need the new firmware, and a warning on a 256×144 screen is
 /// easy to miss.
+///
+/// Returns whether the MCU took an image, which is what the provenance record
+/// goes by.
 fn install_mcu_firmware(
     cfg: &Config,
     ctrl: &Controller,
     mcu: Option<&McuInfo>,
     image: Option<&ImageFile>,
     ticker: &mut Ticker,
-) -> Result<()> {
+) -> Result<bool> {
     let (Some(mcu), Some(image)) = (mcu, image) else {
-        return Ok(());
+        return Ok(false);
     };
     ticker.begin(ctrl, "updating the MCU firmware", MCU_UPDATE_WEIGHT);
     let (base, span) = ticker.step_span();
@@ -801,7 +803,7 @@ fn install_mcu_firmware(
                     mcu.version
                 ));
             }
-            Ok(())
+            Ok(true)
         }
         Err(e) => Err(format!(
             "the system is installed, but the MCU firmware update failed: {e}; the MCU keeps \

@@ -10,6 +10,9 @@
 //!   `<base>/falcon-recovery/manifest.json`   -> list of recovery build dirs
 //!   `<base>/falcon-recovery/<dir>/manifest.json`
 //!                                            -> `<board>/recovery-falcon.itb`
+//!   `<base>/mcu-firmware/manifest.json`      -> list of MCU firmware build dirs
+//!   `<base>/mcu-firmware/<dir>/manifest.json`
+//!                                            -> `<target>/flipperone-mcu-firmware.uf2`
 //!   `<base>/rootfs/manifest.json`            -> list of rootfs build dirs
 //!   `<base>/rootfs/<dir>/manifest.json`      -> `<Profile>_<build>_stock[_inc]_pack.zst`
 //!
@@ -21,10 +24,10 @@
 
 use serde::Deserialize;
 
-use crate::core::fetch;
 use crate::core::model::{
     BuildDetails, ImageBuild, ImageFile, PackFile, ProfilePack, SnapshotBuild, Source, UbootBuild,
 };
+use crate::core::{fetch, mcu};
 
 /// The flashable bootloader inside a U-Boot build's per-board directory.
 const UBOOT_IMAGE: &str = "u-boot-rockchip.bin";
@@ -36,6 +39,9 @@ const BOOT_MENU_IMAGE: &str = "bootmenu-falcon.itb";
 const RECOVERY_DIR: &str = "falcon-recovery";
 /// The Falcon-mode recovery FIT inside a build's per-board directory.
 const RECOVERY_IMAGE: &str = "recovery-falcon.itb";
+/// Top-level directory listing the MCU firmware builds, whose sub-directories
+/// are MCU build targets rather than boards.
+const MCU_DIR: &str = "mcu-firmware";
 
 /// A place to read the catalog from.
 #[derive(Clone, Debug)]
@@ -201,6 +207,17 @@ pub fn recovery_builds(origin: &Origin, board_dir: &str, limit: usize) -> Vec<Im
     )
 }
 
+/// List the available MCU firmware builds for the MCU build target `target`,
+/// newest first (capped). The image size and digest are loaded lazily via
+/// [`load_mcu_contents`].
+///
+/// The same two-level layout as the Falcon listings, with the MCU build target
+/// where they have the board: one board takes either target's image, depending
+/// on its revision.
+pub fn mcu_builds(origin: &Origin, target: &str, limit: usize) -> Vec<ImageBuild> {
+    image_builds(origin, MCU_DIR, mcu::IMAGE_NAME, "mcu", target, limit)
+}
+
 /// The shared body of the image listings: same two-level layout as
 /// [`uboot_builds`], differing only in which directory is listed, which file is
 /// taken from it, and which revision names the build.
@@ -241,6 +258,13 @@ pub fn load_boot_menu_contents(build: &ImageBuild) -> Result<ImageContents, Stri
 pub fn load_recovery_contents(build: &ImageBuild) -> Result<ImageContents, String> {
     let bm: BuildManifest = fetch_json(&build.manifest_location)?;
     image_contents(&bm, build, RECOVERY_IMAGE)
+}
+
+/// Fetch an MCU firmware build's manifest and extract the metadata for the
+/// `<target>/flipperone-mcu-firmware.uf2` it was listed with.
+pub fn load_mcu_contents(build: &ImageBuild) -> Result<ImageContents, String> {
+    let bm: BuildManifest = fetch_json(&build.manifest_location)?;
+    image_contents(&bm, build, mcu::IMAGE_NAME)
 }
 
 /// Parsed contents of an image build manifest: the image's size and digest, and
@@ -718,6 +742,84 @@ mod tests {
         assert!(
             err.contains("lists no flipper-one/bootmenu-falcon.itb"),
             "{err}"
+        );
+    }
+
+    /// An `mcu-firmware` build directory, as the image server publishes it
+    /// (build #381, trimmed): one directory per MCU build target, each holding
+    /// the image beside the files only a debugger wants.
+    const MCU_MANIFEST: &str = r#"{
+      "build": { "builder": "mcu-firmware", "number": 381 },
+      "sourcestamps": [
+        { "codebase": "mcu-firmware",
+          "repository": "https://github.com/flipperdevices/flipperone-mcu-firmware",
+          "branch": "imalkav/bug-report-template",
+          "revision": "504fac38959d0c9d26281f89d474b19539dcae95" }
+      ],
+      "files": [
+        { "path": "f1/flipperone-mcu-firmware.elf", "size": 4921072, "sha256": "aa" },
+        { "path": "f1/flipperone-mcu-firmware.uf2", "size": 964096,
+          "mtime": "2026-11-10T13:22:57Z", "sha256": "bb" },
+        { "path": "f2/flipperone-mcu-firmware.hex", "size": 1353735, "sha256": "cc" },
+        { "path": "f2/flipperone-mcu-firmware.uf2", "size": 963072,
+          "mtime": "2026-11-10T13:22:56Z", "sha256": "dd" }
+      ]
+    }"#;
+
+    #[test]
+    fn reads_an_mcu_build_for_this_target() {
+        let bm: BuildManifest = serde_json::from_str(MCU_MANIFEST).expect("valid build manifest");
+        for (target, size, digest) in [("f1", 964096, "bb"), ("f2", 963072, "dd")] {
+            let build = falcon(target, mcu::IMAGE_NAME);
+            let c = image_contents(&bm, &build, mcu::IMAGE_NAME).unwrap();
+            assert_eq!(c.size, size, "{target}");
+            assert_eq!(c.sha256.as_deref(), Some(digest), "{target}");
+        }
+        // The branch is what tells one developer's build from another's.
+        let c = image_contents(&bm, &falcon("f1", mcu::IMAGE_NAME), mcu::IMAGE_NAME).unwrap();
+        assert_eq!(
+            c.details.sourcestamps[0].branch,
+            "imalkav/bug-report-template"
+        );
+        // A target the build has nothing for is an error, not another target's
+        // image.
+        let err = image_contents(&bm, &falcon("f3", mcu::IMAGE_NAME), mcu::IMAGE_NAME).unwrap_err();
+        assert!(
+            err.contains("lists no f3/flipperone-mcu-firmware.uf2"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn lists_mcu_builds_by_target() {
+        let root = std::env::temp_dir().join("flipperos-catalog-mcu");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(MCU_DIR)).unwrap();
+        std::fs::write(
+            root.join(MCU_DIR).join("manifest.json"),
+            r#"{ "directories": [
+                 { "name": "mcu=b2df0ff03197a0db65b2b2fe1b0fb711e8dcdb34/",
+                   "mtime": "2026-11-09T21:05:02Z" },
+                 { "name": "mcu=504fac38959d0c9d26281f89d474b19539dcae95/",
+                   "mtime": "2026-11-10T13:23:15Z" } ] }"#,
+        )
+        .unwrap();
+        let origin = Origin::Media {
+            device: "/dev/sdz1".into(),
+            root: root.to_string_lossy().into_owned(),
+        };
+
+        let builds = mcu_builds(&origin, "f1", 10);
+        let _ = std::fs::remove_dir_all(&root);
+        let labels: Vec<&str> = builds.iter().map(|b| b.label.as_str()).collect();
+        assert_eq!(labels, ["mcu 504fac3", "mcu b2df0ff"]);
+        assert!(
+            builds[0].image_location.ends_with(
+                "/mcu-firmware/mcu=504fac38959d0c9d26281f89d474b19539dcae95/f1/\
+                 flipperone-mcu-firmware.uf2"
+            ),
+            "{}",
+            builds[0].image_location
         );
     }
 

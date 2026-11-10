@@ -685,6 +685,8 @@ pub struct Selection {
     pub boot_menu: Option<String>,
     /// Selected Falcon recovery build id. [`InstallMode::Custom`] only.
     pub recovery: Option<String>,
+    /// Selected MCU firmware build id. [`InstallMode::Custom`] only.
+    pub mcu: Option<String>,
     /// Selected snapshot build id. [`InstallMode::Custom`] only.
     pub snapshot_build: Option<String>,
     /// Extra profile names to deploy (Minimal is always deployed implicitly).
@@ -777,6 +779,9 @@ pub struct AppState {
     pub boot_menu_builds: Vec<ImageBuild>,
     /// Available Falcon recovery builds, newest first.
     pub recovery_builds: Vec<ImageBuild>,
+    /// Available MCU firmware builds for the MCU's build target, newest first.
+    /// Empty without an MCU the kernel can update.
+    pub mcu_builds: Vec<ImageBuild>,
     /// Available snapshot builds, newest first.
     pub snapshot_builds: Vec<SnapshotBuild>,
     pub selection: Selection,
@@ -938,7 +943,7 @@ impl AppState {
     }
 
     /// The MCU firmware this run would upload: the image a bundle ships for the
-    /// board's MCU build target.
+    /// board's MCU build target, or the one hand-picked from the image server.
     ///
     /// `None` without an MCU the kernel can update, or without a target to pick
     /// an image by. Unlike the Falcon images this does not depend on the target
@@ -947,8 +952,18 @@ impl AppState {
         self.mcu.as_ref()?.target.as_ref()?;
         match self.selection.mode {
             InstallMode::Bundle => self.bundle.as_ref()?.mcu_firmware.clone(),
-            InstallMode::Custom => None,
+            InstallMode::Custom => self.selected_mcu_build()?.image(),
         }
+    }
+
+    /// The hand-picked MCU firmware build, the counterpart of
+    /// [`Self::selected_recovery_build`].
+    pub fn selected_mcu_build(&self) -> Option<&ImageBuild> {
+        if self.selection.mode != InstallMode::Custom {
+            return None;
+        }
+        let id = self.selection.mcu.as_deref()?;
+        self.mcu_builds.iter().find(|b| b.id == id)
     }
 
     /// Value for the MCU status line: the firmware the MCU runs now, and what
@@ -958,13 +973,14 @@ impl AppState {
         let Some(target) = mcu.target.as_deref() else {
             return Some(format!("{}, unknown target: not updated", mcu.version));
         };
-        let update = match self.selected_mcu_firmware() {
-            Some(image) => format!(
+        let update = match (self.selected_mcu_build(), self.selected_mcu_firmware()) {
+            (Some(build), _) => build.summary(),
+            (None, Some(image)) => format!(
                 "{} ({})",
                 human_bytes(image.size_bytes),
                 image.source.label()
             ),
-            None => "not updated".to_string(),
+            (None, None) => "not updated".to_string(),
         };
         Some(format!("{} ({target}) \u{2192} {update}", mcu.version))
     }
@@ -1231,6 +1247,58 @@ mod tests {
         state.recovery_builds.clear();
         state.selection.recovery = None;
         assert!(state.selected_recovery().is_none());
+    }
+
+    #[test]
+    fn the_mcu_firmware_needs_a_target_to_be_picked_by() {
+        let listed = ImageBuild {
+            id: "mcu=504fac3/".into(),
+            label: "mcu 504fac3".into(),
+            mtime: String::new(),
+            image_location: "https://i.invalid/mcu-firmware/mcu=504fac3/f1/\
+                             flipperone-mcu-firmware.uf2"
+                .into(),
+            manifest_location: "https://i.invalid/mcu-firmware/mcu=504fac3/manifest.json".into(),
+            source: Source::Server,
+            size_bytes: 964096,
+            sha256: None,
+            details: None,
+            loaded: true,
+        };
+        let mut state = AppState {
+            mcu: Some(McuInfo {
+                target: Some("f1".into()),
+                version: "0.1.0".into(),
+            }),
+            mcu_builds: vec![listed.clone()],
+            selection: Selection {
+                mode: InstallMode::Custom,
+                mcu: Some(listed.id.clone()),
+                ..Selection::default()
+            },
+            ..AppState::default()
+        };
+        let picked = state.selected_mcu_firmware().expect("an MCU image");
+        assert_eq!(picked.location, listed.image_location);
+        // The status line names the picked build, after what the MCU runs now.
+        let summary = state.mcu_summary().expect("a summary");
+        assert!(
+            summary.starts_with("0.1.0 (f1) \u{2192} mcu 504fac3 ("),
+            "{summary}"
+        );
+
+        // A revision the kernel does not know leaves nothing to pick by, even with
+        // a build selected.
+        state.mcu.as_mut().unwrap().target = None;
+        assert!(state.selected_mcu_firmware().is_none());
+        assert_eq!(
+            state.mcu_summary().as_deref(),
+            Some("0.1.0, unknown target: not updated")
+        );
+        // And without the update interface there is no MCU to speak of.
+        state.mcu = None;
+        assert!(state.selected_mcu_firmware().is_none());
+        assert!(state.mcu_summary().is_none());
     }
 
     #[test]

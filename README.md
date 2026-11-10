@@ -254,6 +254,10 @@ The *custom development build* flow reads the image server's two-level catalog
 - **Recovery:** `/falcon-recovery/manifest.json`, the same shape again, with
   `<board>/recovery-falcon.itb` (see
   [The recovery system](#the-recovery-system)).
+- **MCU firmware:** `/mcu-firmware/manifest.json`, the same shape with the MCU
+  build target where the others have the board:
+  `<target>/flipperone-mcu-firmware.uf2` (see [The MCU firmware](#the-mcu-firmware)).
+  Listed only when the kernel reports a target.
 - **Snapshots (rootfs):** `/rootfs/manifest.json` lists build directories; each
   build's `manifest.json` contains per-profile packs
   `<Profile>_<build>_stock_pack.zst` (full) and `<Profile>_<build>_stock_inc_pack.zst`
@@ -450,14 +454,19 @@ whenever the source ships an image for this board's MCU, on every kind of target
 Which image fits is decided by the MCU's firmware **build target** (`f1`, `f2`),
 which follows the board revision rather than the board, and which the driver
 reports as the `target` attribute of its platform device. An image does not say
-which target it was built for, so nothing else can choose: a bundle's
-`mcu/<target>/flipperone-mcu-firmware.uf2` is the one taken.
+which target it was built for, so nothing else can choose:
+
+- bundle: `mcu/<target>/flipperone-mcu-firmware.uf2`;
+- custom development build: `<target>/flipperone-mcu-firmware.uf2` from the
+  `mcu-firmware/` build the operator picked, the newest by default.
 
 A kernel without the driver, or a board revision the driver does not know, leaves
 the MCU alone, with a warning on a Flipper One.
 
 The update is the **last** install step, after every profile is deployed; only the
-record in the metadata partition comes after it. It takes about 25 s: the MCU erases its spare
+record in the metadata partition comes after it, so that a custom install can
+record the MCU build as one of its components once the MCU has taken it. It
+takes about 25 s: the MCU erases its spare
 firmware slot, takes the image over I2C, and checks it. The firmware it booted
 stays where it is, so an update that fails leaves it exactly as it was — and still
 **fails the run**, with a message that the system itself is installed: the system
