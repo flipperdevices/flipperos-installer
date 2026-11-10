@@ -119,10 +119,31 @@
       "item": "recovery"
     },
     {
-      "path": "mcu/flipperone-mcu-firmware.uf2",
-      "size": 843264,
-      "mtime": "2026-08-11T17:45:28Z",
-      "sha256": "2cad2a936a8b9a9299dcca61112dcf8cb368936bcfb890bc35e0c7e83343912c",
+      "path": "mcu/f1/flipperone-mcu-firmware.elf",
+      "size": 4921048,
+      "mtime": "2026-11-09T21:04:47Z",
+      "sha256": "e9d116a16f3ff65cf7cb00eb75d2498ff95cba400e48628a93a33e3237f2259c",
+      "item": "mcu-firmware"
+    },
+    {
+      "path": "mcu/f1/flipperone-mcu-firmware.uf2",
+      "size": 964096,
+      "mtime": "2026-11-09T21:04:52Z",
+      "sha256": "5815d4534c58eefdc5139733df995878fc0d7f34781476e50a759cab08a4b9c6",
+      "item": "mcu-firmware"
+    },
+    {
+      "path": "mcu/f2/flipperone-mcu-firmware.elf",
+      "size": 4907868,
+      "mtime": "2026-11-09T21:04:55Z",
+      "sha256": "129aff5fe6408c159e956b13f4ed4b71dd1564fefaf4909c2e91c54ebdc7bea1",
+      "item": "mcu-firmware"
+    },
+    {
+      "path": "mcu/f2/flipperone-mcu-firmware.uf2",
+      "size": 963072,
+      "mtime": "2026-11-09T21:05:01Z",
+      "sha256": "88c5d319ced25ed7167a8044506fef5ac6326cfcbf9b8ac40eba9c366bcfcf2d",
       "item": "mcu-firmware"
     },
     {

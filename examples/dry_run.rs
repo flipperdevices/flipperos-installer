@@ -106,6 +106,13 @@ fn main() {
             .map(|r| r.location)
             .unwrap_or_else(|| "(none)".to_string())
     );
+    // Empty on a host without the MCU, since the image is picked by its target.
+    println!(
+        "  mcu     : {}",
+        state
+            .mcu_summary()
+            .unwrap_or_else(|| "(no MCU firmware update interface)".to_string())
+    );
     println!(
         "  rootfs  : {}",
         state

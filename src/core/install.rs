@@ -18,7 +18,11 @@
 //!      base and snapshot a writable `@home` from it so /home starts populated.
 //!   6. For each selected profile: `btrfs receive` its snapshot stream, then
 //!      chroot into it and run `kernel-install` for every installed kernel.
-//!   7. Record the builds installed from in the metadata partition, through the
+//!   7. Upload the MCU firmware the source ships for this board's MCU, if any.
+//!      Last, so an installation that fails earlier never leaves the MCU on
+//!      firmware meant for a system that is not there; a failure here fails the
+//!      run even though the system is installed.
+//!   8. Record the builds installed from in the metadata partition, through the
 //!      Minimal profile's own `flipmeta`.
 
 use std::fs::OpenOptions;
@@ -29,10 +33,10 @@ use std::sync::Arc;
 use crate::core::controller::{Config, Controller};
 use crate::core::layout::{self, Layout};
 use crate::core::model::{
-    human_bytes, FetchMode, ImageFile, InstallMode, PackFile, ProfilePack, Source, StorageDevice,
-    StorageKind, UbootBuild,
+    human_bytes, FetchMode, ImageFile, InstallMode, McuInfo, PackFile, ProfilePack, Source,
+    StorageDevice, StorageKind, UbootBuild,
 };
-use crate::core::{catalog, fetch, metadata, stage, storage, ufs};
+use crate::core::{catalog, fetch, mcu, metadata, stage, storage, ufs};
 
 // GPT layout used by FlipperOS images, as byte offsets from the start of disk.
 // These are absolute byte offsets, independent of the device's sector size;
@@ -243,6 +247,9 @@ const MKFS_WEIGHT: u64 = 8 * 1024 * 1024;
 const SNAPSHOT_WEIGHT: u64 = 1024 * 1024;
 /// The chroot plus `kernel-install`, which copies a kernel and initrd into /boot.
 const KERNEL_WEIGHT: u64 = 64 * 1024 * 1024;
+/// The MCU firmware update, which takes about 25 s however small the image: the
+/// MCU erases its spare slot first, and the image crawls over I2C.
+const MCU_UPDATE_WEIGHT: u64 = 64 * 1024 * 1024;
 /// A transfer whose manifest publishes no size.
 const UNKNOWN_SIZE_WEIGHT: u64 = 64 * 1024 * 1024;
 
@@ -336,6 +343,8 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
         StorageKind::Ufs => (state.selected_boot_menu(), state.selected_recovery()),
         _ => (None, None),
     };
+    // The MCU is on the board, so its firmware goes wherever the system does.
+    let mut mcu_firmware = state.selected_mcu_firmware();
     // Extra profiles the user opted into, in build order.
     let extras: Vec<ProfilePack> = build
         .extra_profiles()
@@ -357,6 +366,14 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
             .join(", "),
         if cfg.dry_run { "  [DRY RUN]" } else { "" },
     ));
+    if let (Some(mcu), Some(image)) = (&state.mcu, &mcu_firmware) {
+        ctrl.log(format!(
+            "mcu firmware: {} ({}), uploaded once the system is installed (the MCU runs {} now)",
+            human_bytes(image.size_bytes),
+            image.source.label(),
+            mcu.version
+        ));
+    }
 
     // What the provisioning check found when the target was selected. Logged
     // before the guards, so it is on screen to explain a refusal; nothing here
@@ -401,6 +418,7 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
     let images = stage::RawImages {
         boot_menu: boot_menu.as_ref(),
         recovery: recovery.as_ref(),
+        mcu_firmware: mcu_firmware.as_ref(),
     };
     stage::guard_not_on_target(&uboot, images, &build, &extras, &device.path)?;
 
@@ -492,6 +510,7 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
             .as_ref()
             .map_or(0, |h| transfer_weight(h.size_bytes))
         + deploying
+        + mcu_firmware.as_ref().map_or(0, |_| MCU_UPDATE_WEIGHT)
         + METADATA_SIZE;
     let mut ticker = Ticker::new(total_weight);
 
@@ -511,6 +530,9 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
                 staged.localise_image(menu);
             }
             if let Some(image) = recovery.as_mut() {
+                staged.localise_image(image);
+            }
+            if let Some(image) = mcu_firmware.as_mut() {
                 staged.localise_image(image);
             }
             staged.localise_build(&mut build);
@@ -716,7 +738,18 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
             )?;
         }
 
-        // 6. Provenance. The system boots without it, so a failure here is
+        // 6. MCU firmware, last of what the run installs. Its outcome is held
+        // back until the provenance below is written, which a failed update
+        // must not cost an installed system.
+        let mcu_updated = install_mcu_firmware(
+            cfg,
+            ctrl,
+            state.mcu.as_ref(),
+            mcu_firmware.as_ref(),
+            &mut ticker,
+        );
+
+        // 7. Provenance. The system boots without it, so a failure here is
         // reported rather than allowed to fail an otherwise good install.
         ticker.begin(ctrl, "recording build metadata", METADATA_SIZE);
         let recorded = install_record
@@ -726,7 +759,7 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
         if let Err(e) = recorded {
             ctrl.log(format!("warning: metadata partition not written: {e}"));
         }
-        Ok(())
+        mcu_updated
     })();
 
     // Always unmount, then surface the deployment error (if any) in preference
@@ -738,6 +771,44 @@ pub fn run(ctrl: &Arc<Controller>) -> Result<()> {
     deploy?;
     unmounted?;
     Ok(())
+}
+
+/// Upload the MCU firmware, if the source ships any for this board's MCU.
+///
+/// The MCU stages the image in its spare slot and runs it once it restarts,
+/// which this installer leaves to the operator. A failed update leaves the MCU
+/// on the firmware it booted, but fails the run anyway: the system just
+/// installed may well need the new firmware, and a warning on a 256×144 screen is
+/// easy to miss.
+fn install_mcu_firmware(
+    cfg: &Config,
+    ctrl: &Controller,
+    mcu: Option<&McuInfo>,
+    image: Option<&ImageFile>,
+    ticker: &mut Ticker,
+) -> Result<()> {
+    let (Some(mcu), Some(image)) = (mcu, image) else {
+        return Ok(());
+    };
+    ticker.begin(ctrl, "updating the MCU firmware", MCU_UPDATE_WEIGHT);
+    let (base, span) = ticker.step_span();
+    let mut on_progress = |share: f32| ctrl.set_progress(base + span * share);
+    match mcu::upload(cfg, ctrl, image, &mut on_progress) {
+        Ok(()) => {
+            if !cfg.dry_run {
+                ctrl.log(format!(
+                    "MCU firmware staged; it runs once the MCU restarts (it runs {} until then)",
+                    mcu.version
+                ));
+            }
+            Ok(())
+        }
+        Err(e) => Err(format!(
+            "the system is installed, but the MCU firmware update failed: {e}; the MCU keeps \
+             running {}",
+            mcu.version
+        )),
+    }
 }
 
 /// Receive one profile's pack, snapshot a writable root from it, and run

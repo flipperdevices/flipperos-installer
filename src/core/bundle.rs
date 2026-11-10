@@ -13,7 +13,7 @@
 //! recovery/<board>/recovery-falcon.itb         UFS targets only
 //! profile-packs/<Profile>_<build>_stock[_inc]_pack.zst
 //! profile-packs/home_<build>_pack.zst
-//! mcu/…                                        not installed by this tool
+//! mcu/<target>/flipperone-mcu-firmware.uf2     the MCU's firmware build target
 //! <name>-<version>-<channel>-<n>.tar.zst        the same tree as one archive
 //! ```
 //!
@@ -32,7 +32,7 @@ use crate::core::model::{
     BuildDetails, BuildMeta, BundleLocation, BundleRef, ImageFile, PackFile, ProfilePack,
     SelectedBundle, SnapshotBuild, Source, SourceStamp, UbootBuild,
 };
-use crate::core::{archive, catalog, fetch};
+use crate::core::{archive, catalog, fetch, mcu};
 
 pub type Result<T> = std::result::Result<T, String>;
 
@@ -46,6 +46,8 @@ const BOOT_MENU_IMAGE: &str = "bootmenu-falcon.itb";
 const RECOVERY_DIR: &str = "recovery";
 /// The Falcon-mode recovery FIT inside a bundle's per-board recovery directory.
 const RECOVERY_IMAGE: &str = "recovery-falcon.itb";
+/// Directory inside a bundle that holds the per-target MCU firmware images.
+const MCU_DIR: &str = "mcu";
 /// Directory inside a bundle that holds the profile packs and the `/home` seed.
 const PACKS_DIR: &str = "profile-packs";
 /// Channel that holds per-developer topic branches rather than build dirs.
@@ -354,6 +356,7 @@ pub fn resolve(
     location: &BundleLocation,
     manifest: &Manifest,
     board_id: &str,
+    mcu_target: Option<&str>,
 ) -> Result<SelectedBundle> {
     let board_dir = manifest.board_dir(board_id);
     let details = manifest.details();
@@ -403,6 +406,22 @@ pub fn resolve(
             size_bytes: f.size,
             sha256: f.digest(),
         });
+    // The MCU firmware is per MCU build target rather than per board: one board
+    // takes either image depending on its revision, which only the kernel can
+    // tell. Without a target there is nothing to pick by.
+    let mcu_firmware = mcu_target.and_then(|target| {
+        let rel = format!("{MCU_DIR}/{target}/{}", mcu::IMAGE_NAME);
+        manifest
+            .files
+            .iter()
+            .find(|f| f.path == rel)
+            .map(|f| ImageFile {
+                location: location.join(&rel),
+                source: source.clone(),
+                size_bytes: f.size,
+                sha256: f.digest(),
+            })
+    });
 
     let uboot = UbootBuild {
         id: reference.id.clone(),
@@ -504,12 +523,17 @@ pub fn resolve(
         uboot,
         boot_menu,
         recovery,
+        mcu_firmware,
         build,
     })
 }
 
 /// Read and resolve a bundle in one step.
-pub fn load(reference: &BundleRef, board_id: &str) -> Result<SelectedBundle> {
+pub fn load(
+    reference: &BundleRef,
+    board_id: &str,
+    mcu_target: Option<&str>,
+) -> Result<SelectedBundle> {
     let manifest = match &reference.archive {
         Some(path) => {
             let bytes = archive::read_manifest(path)?;
@@ -523,7 +547,13 @@ pub fn load(reference: &BundleRef, board_id: &str) -> Result<SelectedBundle> {
             reference.dir, manifest.schema
         ));
     }
-    resolve(reference, &reference.location, &manifest, board_id)
+    resolve(
+        reference,
+        &reference.location,
+        &manifest,
+        board_id,
+        mcu_target,
+    )
 }
 
 /// Where an archive-backed bundle is unpacked to: a directory named after the
@@ -803,7 +833,14 @@ mod tests {
         let manifest = parse(MANIFEST);
         let repo = repo();
         let reference = remote_ref(&repo, "nightly", "20260812-83ddb68-15");
-        let bundle = resolve(&reference, &reference.location, &manifest, "flipper-one").unwrap();
+        let bundle = resolve(
+            &reference,
+            &reference.location,
+            &manifest,
+            "flipper-one",
+            None,
+        )
+        .unwrap();
 
         // U-Boot: the right board's image, with its published size and digest.
         assert_eq!(bundle.board_dir, "flipper-one");
@@ -940,7 +977,14 @@ mod tests {
             .retain(|f| !f.path.starts_with("u-boot/generic/"));
         let repo = repo();
         let reference = remote_ref(&repo, "nightly", "x");
-        let err = resolve(&reference, &reference.location, &manifest, "unknown-board").unwrap_err();
+        let err = resolve(
+            &reference,
+            &reference.location,
+            &manifest,
+            "unknown-board",
+            None,
+        )
+        .unwrap_err();
         assert!(err.contains("ships no u-boot/generic/"), "{err}");
     }
 
@@ -955,7 +999,14 @@ mod tests {
             .retain(|f| !f.path.starts_with("boot-menu/") && !f.path.starts_with("recovery/"));
         let repo = repo();
         let reference = remote_ref(&repo, "nightly", "x");
-        let bundle = resolve(&reference, &reference.location, &manifest, "flipper-one").unwrap();
+        let bundle = resolve(
+            &reference,
+            &reference.location,
+            &manifest,
+            "flipper-one",
+            None,
+        )
+        .unwrap();
         assert!(bundle.boot_menu.is_none());
         assert!(bundle.recovery.is_none());
     }
@@ -971,9 +1022,83 @@ mod tests {
         });
         let repo = repo();
         let reference = remote_ref(&repo, "nightly", "x");
-        let bundle = resolve(&reference, &reference.location, &manifest, "flipper-one").unwrap();
+        let bundle = resolve(
+            &reference,
+            &reference.location,
+            &manifest,
+            "flipper-one",
+            None,
+        )
+        .unwrap();
         assert!(bundle.boot_menu.is_none());
         assert!(bundle.recovery.is_none());
+    }
+
+    #[test]
+    fn the_mcu_firmware_is_picked_by_the_mcu_target() {
+        // One board takes either image depending on its revision, so the image
+        // follows the target the kernel reports rather than the board directory.
+        let manifest = parse(MANIFEST);
+        let repo = repo();
+        let reference = remote_ref(&repo, "nightly", "x");
+        for (target, size, digest) in [
+            (
+                "f1",
+                964096,
+                "5815d4534c58eefdc5139733df995878fc0d7f34781476e50a759cab08a4b9c6",
+            ),
+            (
+                "f2",
+                963072,
+                "88c5d319ced25ed7167a8044506fef5ac6326cfcbf9b8ac40eba9c366bcfcf2d",
+            ),
+        ] {
+            let bundle = resolve(
+                &reference,
+                &reference.location,
+                &manifest,
+                "flipper-one",
+                Some(target),
+            )
+            .unwrap();
+            let image = bundle.mcu_firmware.expect("an MCU image");
+            assert!(
+                image
+                    .location
+                    .ends_with(&format!("/mcu/{target}/flipperone-mcu-firmware.uf2")),
+                "{}",
+                image.location
+            );
+            assert_eq!(image.size_bytes, size);
+            assert_eq!(image.sha256.as_deref(), Some(digest));
+        }
+    }
+
+    #[test]
+    fn no_mcu_target_or_no_image_for_it_means_no_mcu_firmware() {
+        let manifest = parse(MANIFEST);
+        let repo = repo();
+        let reference = remote_ref(&repo, "nightly", "x");
+        // A board whose revision the kernel does not know has no target at all.
+        let bundle = resolve(
+            &reference,
+            &reference.location,
+            &manifest,
+            "flipper-one",
+            None,
+        )
+        .unwrap();
+        assert!(bundle.mcu_firmware.is_none());
+        // A target the bundle ships nothing for takes no other target's image.
+        let bundle = resolve(
+            &reference,
+            &reference.location,
+            &manifest,
+            "flipper-one",
+            Some("f3"),
+        )
+        .unwrap();
+        assert!(bundle.mcu_firmware.is_none());
     }
 
     #[test]
@@ -982,7 +1107,14 @@ mod tests {
         manifest.files.retain(|f| !f.path.contains("Minimal"));
         let repo = repo();
         let reference = remote_ref(&repo, "nightly", "x");
-        let err = resolve(&reference, &reference.location, &manifest, "flipper-one").unwrap_err();
+        let err = resolve(
+            &reference,
+            &reference.location,
+            &manifest,
+            "flipper-one",
+            None,
+        )
+        .unwrap_err();
         assert!(err.contains("no Minimal profile pack"), "{err}");
     }
 
@@ -1002,7 +1134,7 @@ mod tests {
             },
             archive: None,
         };
-        let bundle = resolve(&reference, &location, &manifest, "flipper-one").unwrap();
+        let bundle = resolve(&reference, &location, &manifest, "flipper-one", None).unwrap();
         assert_eq!(
             bundle.uboot.image_location,
             "/mnt/sd/bundle/u-boot/flipper-one/u-boot-rockchip.bin"

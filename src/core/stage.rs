@@ -54,6 +54,8 @@ pub struct Artifact {
 pub struct RawImages<'a> {
     pub boot_menu: Option<&'a ImageFile>,
     pub recovery: Option<&'a ImageFile>,
+    /// Uploaded to the MCU rather than written to the target, and last.
+    pub mcu_firmware: Option<&'a ImageFile>,
 }
 
 /// Everything the run will read, in install order.
@@ -93,6 +95,9 @@ pub fn plan(
         if let Some(inc) = &p.incremental {
             out.push(pack_artifact(&format!("{} (incremental)", p.name), inc));
         }
+    }
+    if let Some(mcu) = images.mcu_firmware {
+        out.push(image_artifact("MCU firmware", mcu));
     }
     out
 }
@@ -614,6 +619,7 @@ mod tests {
             RawImages {
                 boot_menu: Some(&menu),
                 recovery: Some(&rec),
+                ..RawImages::default()
             },
             &b,
             &[],
@@ -637,6 +643,36 @@ mod tests {
         assert_eq!(p[2].rel, "recovery-falcon.itb");
         assert_eq!(p[2].size, 55);
         assert_eq!(p[2].sha256.as_deref(), Some("ff"));
+    }
+
+    #[test]
+    fn plans_the_mcu_firmware_last() {
+        // The upload is the last install step, after the packs, and the plan is
+        // in install order.
+        let b = build();
+        let extras = vec![b.profiles[1].clone()];
+        let mcu = ImageFile {
+            location: "https://example.invalid/mcu=abc/f1/flipperone-mcu-firmware.uf2".into(),
+            source: Source::Server,
+            size_bytes: 33,
+            sha256: Some("cc".into()),
+        };
+        let p = plan(
+            &uboot(),
+            RawImages {
+                mcu_firmware: Some(&mcu),
+                ..RawImages::default()
+            },
+            &b,
+            &extras,
+        );
+
+        let last = p.last().expect("a plan");
+        assert_eq!(last.label, "MCU firmware");
+        assert_eq!(last.rel, "flipperone-mcu-firmware.uf2");
+        assert_eq!(last.size, 33);
+        assert_eq!(last.sha256.as_deref(), Some("cc"));
+        assert_eq!(p[p.len() - 2].label, "Desktop (incremental)");
     }
 
     #[test]

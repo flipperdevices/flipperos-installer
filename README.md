@@ -201,8 +201,9 @@ and each build directory holds a `manifest.json`, the flashable
 `boot-menu/<board>/bootmenu-falcon.itb` (see [The boot menu](#the-boot-menu)) and
 `recovery/<board>/recovery-falcon.itb` (see [The recovery system](#the-recovery-system)),
 the `profile-packs/` (the same `<Profile>_<build>_stock[_inc]_pack.zst` and
-`home_<build>_pack.zst` files the image server publishes), MCU firmware the
-installer ignores, and a `*.tar.zst` of the whole tree.
+`home_<build>_pack.zst` files the image server publishes), the MCU firmware
+`mcu/<target>/flipperone-mcu-firmware.uf2` for every MCU build target (see
+[The MCU firmware](#the-mcu-firmware)), and a `*.tar.zst` of the whole tree.
 
 Directory listing is not available on the public object host, so the installer
 **lists** through the bucket's object API (`--bundle-bucket`, or
@@ -224,14 +225,16 @@ The **Fetch** row chooses when artifacts are checked:
 
 - `verify first` (the default) downloads exactly what the run needs — the U-Boot
   image, the boot menu and recovery system on a UFS target, the Minimal full
-  pack, each selected incremental and the `/home` seed —
+  pack, each selected incremental, the `/home` seed and the MCU firmware —
   into `--cache-dir`, compares each against its manifest digest, and only then
   starts partitioning. A bad or truncated artifact therefore cannot leave a wiped
   device behind. The space needed (~0.9–1.5 GiB, the higher end of it on UFS,
   which also stages the two Falcon images) is checked up front.
 - `stream` writes as it downloads, hashing on the way through. The verdict
   necessarily arrives after the bytes have landed, so a mismatch is reported as a
-  warning that says the target must not be booted.
+  warning that says the target must not be booted. The MCU firmware is the
+  exception: it is checked before the MCU receives any of it, so a mismatch
+  fails the run in this mode too.
 
 Either way, an artifact whose manifest publishes no digest is installed with a
 warning that verification was skipped. Both modes also work for the *custom
@@ -435,6 +438,41 @@ so it is read off the device and checked **before** anything is erased. A device
 with no LU 3 at all is installed without a recovery system, with a warning — the
 rest of the installation is unaffected by its absence, so refusing would help
 nobody.
+
+## The MCU firmware
+
+The Flipper One's MCU runs firmware of its own, and kernels with the
+`flipper-one-mcu-update` driver can update it from Linux through the firmware
+upload class at `/sys/class/firmware/flipper-one-mcu/`. The installer does so
+whenever the source ships an image for this board's MCU, on every kind of target
+— the MCU is on the board, not on the disk.
+
+Which image fits is decided by the MCU's firmware **build target** (`f1`, `f2`),
+which follows the board revision rather than the board, and which the driver
+reports as the `target` attribute of its platform device. An image does not say
+which target it was built for, so nothing else can choose: a bundle's
+`mcu/<target>/flipperone-mcu-firmware.uf2` is the one taken.
+
+A kernel without the driver, or a board revision the driver does not know, leaves
+the MCU alone, with a warning on a Flipper One.
+
+The update is the **last** install step, after every profile is deployed; only the
+record in the metadata partition comes after it. It takes about 25 s: the MCU erases its spare
+firmware slot, takes the image over I2C, and checks it. The firmware it booted
+stays where it is, so an update that fails leaves it exactly as it was — and still
+**fails the run**, with a message that the system itself is installed: the system
+may need the new firmware, and a warning is easy to miss on the device's screen.
+
+The image is checked against its manifest digest before the driver is told to
+start, and a mismatch drops it with `-1 > loading`, so the MCU never receives a
+bad image in either fetch mode. The installer never writes `cancel`: an abort that
+reaches the MCU during its erase has been seen to wedge the CPU–MCU I2C link until
+the MCU loses power. An update that outlives the installer's three-minute backstop
+is reported and left to finish.
+
+The new firmware runs **once the MCU restarts**, which the installer does not do:
+rebooting the CPU leaves the MCU running. `firmware_version` beside `target` tells
+which firmware it runs.
 
 ## Btrfs layout
 

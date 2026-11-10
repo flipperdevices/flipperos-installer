@@ -187,8 +187,14 @@ mod tests {
             source: Source::Local { root: "/m".into() },
             archive: None,
         };
-        let selected =
-            bundle::resolve(&reference, &reference.location, &manifest, "flipper-one").unwrap();
+        let selected = bundle::resolve(
+            &reference,
+            &reference.location,
+            &manifest,
+            "flipper-one",
+            None,
+        )
+        .unwrap();
         let state = AppState {
             bundle: Some(selected),
             selection: Selection {

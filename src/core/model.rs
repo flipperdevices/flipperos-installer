@@ -537,6 +537,9 @@ pub struct SelectedBundle {
     /// The Falcon recovery image for [`Self::board_dir`], if the bundle ships
     /// one.
     pub recovery: Option<ImageFile>,
+    /// The MCU firmware for the board's MCU build target, if the bundle ships
+    /// one for it.
+    pub mcu_firmware: Option<ImageFile>,
     pub build: SnapshotBuild,
 }
 
@@ -932,6 +935,38 @@ impl AppState {
             human_bytes(image.size_bytes),
             image.source.label()
         ))
+    }
+
+    /// The MCU firmware this run would upload: the image a bundle ships for the
+    /// board's MCU build target.
+    ///
+    /// `None` without an MCU the kernel can update, or without a target to pick
+    /// an image by. Unlike the Falcon images this does not depend on the target
+    /// device: the MCU is on the board, whatever the system is installed onto.
+    pub fn selected_mcu_firmware(&self) -> Option<ImageFile> {
+        self.mcu.as_ref()?.target.as_ref()?;
+        match self.selection.mode {
+            InstallMode::Bundle => self.bundle.as_ref()?.mcu_firmware.clone(),
+            InstallMode::Custom => None,
+        }
+    }
+
+    /// Value for the MCU status line: the firmware the MCU runs now, and what
+    /// this run would upload to it.
+    pub fn mcu_summary(&self) -> Option<String> {
+        let mcu = self.mcu.as_ref()?;
+        let Some(target) = mcu.target.as_deref() else {
+            return Some(format!("{}, unknown target: not updated", mcu.version));
+        };
+        let update = match self.selected_mcu_firmware() {
+            Some(image) => format!(
+                "{} ({})",
+                human_bytes(image.size_bytes),
+                image.source.label()
+            ),
+            None => "not updated".to_string(),
+        };
+        Some(format!("{} ({target}) \u{2192} {update}", mcu.version))
     }
 
     /// The currently selected snapshot build: the one a bundle pins, or the one

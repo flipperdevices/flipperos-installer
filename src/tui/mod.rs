@@ -705,14 +705,7 @@ fn render_status(state: &AppState) -> String {
         .unwrap_or_else(|| "—".to_string());
     let boot_menu = state.boot_menu_summary().unwrap_or_else(|| "—".to_string());
     let recovery = state.recovery_summary().unwrap_or_else(|| "—".to_string());
-    let mcu = match &state.mcu {
-        Some(m) => format!(
-            "{} (target {})",
-            m.version,
-            m.target.as_deref().unwrap_or("unknown")
-        ),
-        None => "—".to_string(),
-    };
+    let mcu = state.mcu_summary().unwrap_or_else(|| "—".to_string());
     let build = state
         .selected_build()
         .map(|b| b.summary())

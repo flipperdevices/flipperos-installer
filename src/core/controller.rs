@@ -687,15 +687,19 @@ impl Controller {
     /// Read a bundle's manifest and resolve it into the pinned pair the install
     /// pipeline consumes.
     fn load_bundle(&self, id: &str) {
-        let (reference, board_id) = {
+        let (reference, board_id, mcu_target) = {
             let s = self.state.lock().unwrap();
             match s.bundle_ref_by_id(id) {
-                Some(r) => (r.clone(), s.board.board_id.clone()),
+                Some(r) => (
+                    r.clone(),
+                    s.board.board_id.clone(),
+                    s.mcu.as_ref().and_then(|m| m.target.clone()),
+                ),
                 None => return,
             }
         };
         self.log(format!("reading bundle {}…", reference.dir));
-        match bundle::load(&reference, &board_id) {
+        match bundle::load(&reference, &board_id, mcu_target.as_deref()) {
             Ok(bundle) => {
                 self.log(format!(
                     "bundle {} {}: {} profile(s), u-boot for {}",
@@ -709,6 +713,12 @@ impl Controller {
                         "device type '{board_id}' not shipped by this bundle; \
                          using the {} U-Boot",
                         bundle.board_dir
+                    ));
+                }
+                if let (Some(target), None) = (&mcu_target, &bundle.mcu_firmware) {
+                    self.log(format!(
+                        "warning: this bundle ships no MCU firmware for target {target}; \
+                         the MCU will keep the firmware it has"
                     ));
                 }
                 self.update(|s| {

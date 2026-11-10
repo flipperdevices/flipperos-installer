@@ -7,6 +7,7 @@
 //!   `--channel <path>`   list a channel other than the first non-dev one
 //!   `--archive <path>`   read a local `*.tar.zst` bundle instead of the bucket
 //!   `--board <id>`       resolve for a board other than `flipper-one`
+//!   `--mcu-target <t>`   pick the MCU firmware for a target other than `f1`
 
 use flipperos_installer::core::bundle::{self, Repo};
 use flipperos_installer::core::model::{human_bytes, BundleLocation, BundleRef, Source};
@@ -15,12 +16,14 @@ fn main() {
     let mut channel: Option<String> = None;
     let mut archive: Option<String> = None;
     let mut board = "flipper-one".to_string();
+    let mut mcu_target = "f1".to_string();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--channel" => channel = args.next(),
             "--archive" => archive = args.next(),
             "--board" => board = args.next().unwrap_or(board),
+            "--mcu-target" => mcu_target = args.next().unwrap_or(mcu_target),
             other => {
                 eprintln!("unknown argument: {other}");
                 std::process::exit(2);
@@ -50,7 +53,7 @@ fn main() {
             archive: Some(path.clone()),
         };
         println!("== Local archive: {path} ==");
-        match bundle::load(&reference, &board) {
+        match bundle::load(&reference, &board, Some(&mcu_target)) {
             Ok(b) => print_bundle(&b),
             Err(e) => println!("  error: {e}"),
         }
@@ -107,7 +110,7 @@ fn main() {
     };
 
     println!("\n== Resolving {} (board {board}) ==", newest.id);
-    match bundle::load(&newest, &board) {
+    match bundle::load(&newest, &board, Some(&mcu_target)) {
         Ok(b) => print_bundle(&b),
         Err(e) => println!("  error: {e}"),
     }
@@ -147,6 +150,16 @@ fn print_bundle(b: &flipperos_installer::core::model::SelectedBundle) {
             );
         }
         None => println!("  recovery: (none)"),
+    }
+    match &b.mcu_firmware {
+        Some(m) => {
+            println!("  mcu     : {} ({})", m.location, human_bytes(m.size_bytes));
+            println!(
+                "            sha256 {}",
+                m.sha256.as_deref().unwrap_or("(none)")
+            );
+        }
+        None => println!("  mcu     : (none)"),
     }
     println!("  profiles: {}", b.build.profiles.len());
     for p in &b.build.profiles {
