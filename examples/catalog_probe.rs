@@ -77,11 +77,7 @@ fn main() {
             Ok(c) => println!(
                 "      image {} B, branch {}",
                 c.size,
-                c.details
-                    .sourcestamps
-                    .iter()
-                    .find(|s| s.codebase == "mcu-firmware")
-                    .map_or("?", |s| s.branch.as_str())
+                catalog::mcu_branch(&c.details).unwrap_or("?")
             ),
             Err(e) => println!("      manifest error: {e}"),
         }

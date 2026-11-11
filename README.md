@@ -458,7 +458,10 @@ which target it was built for, so nothing else can choose:
 
 - bundle: `mcu/<target>/flipperone-mcu-firmware.uf2`;
 - custom development build: `<target>/flipperone-mcu-firmware.uf2` from the
-  `mcu-firmware/` build the operator picked, the newest by default.
+  `mcu-firmware/` build the operator picked. The default is the newest build
+  from `dev`, not the newest overall: every pushed branch is built, and a topic
+  branch's build is not what an unattended pick should flash. When none of the
+  listed builds is from `dev`, nothing is picked and the MCU keeps its firmware.
 
 A kernel without the driver, or a board revision the driver does not know, leaves
 the MCU alone, with a warning on a Flipper One.

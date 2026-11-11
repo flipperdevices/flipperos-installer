@@ -517,11 +517,8 @@ impl Controller {
                     s.selection.recovery = Some(b.id.clone());
                 }
             }
-            if s.selection.mcu.is_none() {
-                if let Some(b) = s.mcu_builds.first() {
-                    s.selection.mcu = Some(b.id.clone());
-                }
-            }
+            // The MCU firmware pick is defaulted by `default_mcu_build` below,
+            // which has to read manifests to do it.
             if s.selection.snapshot_build.is_none() {
                 if let Some(b) = s.snapshot_builds.first() {
                     s.selection.snapshot_build = Some(b.id.clone());
@@ -544,9 +541,57 @@ impl Controller {
         if let Some(id) = selection.recovery {
             self.load_recovery_contents(&id);
         }
-        if let Some(id) = selection.mcu {
-            self.load_mcu_contents(&id);
+        match selection.mcu {
+            Some(id) => self.load_mcu_contents(&id),
+            None => self.default_mcu_build(),
         }
+    }
+
+    /// Pick the newest MCU firmware build from [`catalog::MCU_DEFAULT_BRANCH`].
+    ///
+    /// The branch is only in each build's own manifest, so the builds are read
+    /// newest first until one matches; the ones read on the way are loaded for
+    /// the picker anyway. When no listed build matches, nothing is picked and
+    /// the MCU keeps its firmware unless the operator picks a build by hand.
+    fn default_mcu_build(&self) {
+        let ids: Vec<String> = self
+            .snapshot()
+            .mcu_builds
+            .iter()
+            .map(|b| b.id.clone())
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        for id in &ids {
+            self.load_mcu_contents(id);
+            let mut s = self.state.lock().unwrap();
+            // The operator got there first.
+            if s.selection.mcu.is_some() {
+                return;
+            }
+            let Some(build) = s.mcu_builds.iter().find(|b| &b.id == id) else {
+                continue;
+            };
+            let branch = build.details.as_ref().and_then(catalog::mcu_branch);
+            if branch == Some(catalog::MCU_DEFAULT_BRANCH) {
+                let name = build.display_name();
+                s.selection.mcu = Some(id.clone());
+                drop(s);
+                self.notify();
+                self.log(format!(
+                    "mcu: defaulting to {name}, the newest {} build",
+                    catalog::MCU_DEFAULT_BRANCH
+                ));
+                return;
+            }
+        }
+        self.log(format!(
+            "warning: mcu: none of the {} newest MCU firmware builds is from {}, so \
+             none is picked and the MCU keeps its firmware unless one is picked by hand",
+            ids.len(),
+            catalog::MCU_DEFAULT_BRANCH
+        ));
     }
 
     // --- update bundles --------------------------------------------------
@@ -1394,6 +1439,92 @@ mod tests {
         // Clearing it is broadcast, so the other frontend's popup comes down;
         // taking nothing broadcasts nothing.
         assert_eq!(seen.load(Ordering::SeqCst), before + 1);
+    }
+
+    /// A media mirror of `mcu-firmware/` with one f1 build per `(sha, mtime,
+    /// branch)`, listed through the catalog as `refresh_catalog` lists it.
+    fn mcu_mirror(name: &str, builds: &[(&str, &str, &str)]) -> Vec<ImageBuild> {
+        let root = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&root);
+        let top = root.join("mcu-firmware");
+        let mut dirs = Vec::new();
+        for (sha, mtime, branch) in builds {
+            let dir = format!("mcu={sha}/");
+            std::fs::create_dir_all(top.join(&dir)).unwrap();
+            std::fs::write(
+                top.join(&dir).join("manifest.json"),
+                format!(
+                    r#"{{ "sourcestamps": [ {{ "codebase": "mcu-firmware", "branch": "{branch}" }} ],
+                         "files": [ {{ "path": "f1/flipperone-mcu-firmware.uf2", "size": 1 }} ] }}"#
+                ),
+            )
+            .unwrap();
+            dirs.push(format!(r#"{{ "name": "{dir}", "mtime": "{mtime}" }}"#));
+        }
+        std::fs::write(
+            top.join("manifest.json"),
+            format!(r#"{{ "directories": [ {} ] }}"#, dirs.join(", ")),
+        )
+        .unwrap();
+        let origin = catalog::Origin::Media {
+            device: "/dev/sdz1".to_string(),
+            root: root.to_string_lossy().into_owned(),
+        };
+        catalog::mcu_builds(&origin, "f1", 100)
+    }
+
+    #[test]
+    fn the_mcu_firmware_defaults_to_the_newest_dev_build() {
+        let ctrl = Controller::new(Config::default());
+        ctrl.update(|s| {
+            s.mcu_builds = mcu_mirror(
+                "flipperos-controller-mcu-dev",
+                &[
+                    ("cccc", "2026-11-11T00:00:00Z", "hedger/updater"),
+                    ("bbbb", "2026-11-10T00:00:00Z", "dev"),
+                    ("aaaa", "2026-11-09T00:00:00Z", "dev"),
+                ],
+            );
+        });
+        ctrl.default_mcu_build();
+        let s = ctrl.snapshot();
+        assert_eq!(s.selection.mcu.as_deref(), Some("mcu=bbbb/"));
+        // Reading stops at the pick, so the older builds stay unread.
+        let loaded: Vec<bool> = s.mcu_builds.iter().map(|b| b.loaded).collect();
+        assert_eq!(loaded, [true, true, false]);
+
+        // A pick the operator already made is kept.
+        let ctrl = Controller::new(Config::default());
+        ctrl.update(|s| {
+            s.mcu_builds = mcu_mirror(
+                "flipperos-controller-mcu-kept",
+                &[("bbbb", "2026-11-10T00:00:00Z", "dev")],
+            );
+            s.selection.mcu = Some("mcu=elsewhere/".to_string());
+        });
+        ctrl.default_mcu_build();
+        assert_eq!(
+            ctrl.snapshot().selection.mcu.as_deref(),
+            Some("mcu=elsewhere/")
+        );
+    }
+
+    #[test]
+    fn no_dev_mcu_build_means_no_default() {
+        let ctrl = Controller::new(Config::default());
+        ctrl.update(|s| {
+            s.mcu_builds = mcu_mirror(
+                "flipperos-controller-mcu-nodev",
+                &[
+                    ("cccc", "2026-11-11T00:00:00Z", "hedger/updater"),
+                    ("bbbb", "2026-11-10T00:00:00Z", "refs/pull/240/head"),
+                ],
+            );
+        });
+        ctrl.default_mcu_build();
+        let s = ctrl.snapshot();
+        assert_eq!(s.selection.mcu, None);
+        assert!(s.log.iter().any(|l| l.contains("none of the 2 newest")));
     }
 
     #[test]

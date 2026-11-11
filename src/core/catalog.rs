@@ -42,6 +42,12 @@ const RECOVERY_IMAGE: &str = "recovery-falcon.itb";
 /// Top-level directory listing the MCU firmware builds, whose sub-directories
 /// are MCU build targets rather than boards.
 const MCU_DIR: &str = "mcu-firmware";
+/// The MCU firmware repository's codebase name in a build's sourcestamps.
+const MCU_CODEBASE: &str = "mcu-firmware";
+/// The branch whose MCU firmware the custom flow picks by default. Every pushed
+/// branch is built, so the newest build is as often as not someone's topic
+/// branch — and the MCU gets flashed with whatever is picked.
+pub const MCU_DEFAULT_BRANCH: &str = "dev";
 
 /// A place to read the catalog from.
 #[derive(Clone, Debug)]
@@ -265,6 +271,15 @@ pub fn load_recovery_contents(build: &ImageBuild) -> Result<ImageContents, Strin
 pub fn load_mcu_contents(build: &ImageBuild) -> Result<ImageContents, String> {
     let bm: BuildManifest = fetch_json(&build.manifest_location)?;
     image_contents(&bm, build, mcu::IMAGE_NAME)
+}
+
+/// The MCU firmware branch `details` were built from, if the manifest says.
+pub fn mcu_branch(details: &BuildDetails) -> Option<&str> {
+    details
+        .sourcestamps
+        .iter()
+        .find(|s| s.codebase == MCU_CODEBASE)
+        .map(|s| s.branch.as_str())
 }
 
 /// Parsed contents of an image build manifest: the image's size and digest, and
@@ -777,10 +792,7 @@ mod tests {
         }
         // The branch is what tells one developer's build from another's.
         let c = image_contents(&bm, &falcon("f1", mcu::IMAGE_NAME), mcu::IMAGE_NAME).unwrap();
-        assert_eq!(
-            c.details.sourcestamps[0].branch,
-            "imalkav/bug-report-template"
-        );
+        assert_eq!(mcu_branch(&c.details), Some("imalkav/bug-report-template"));
         // A target the build has nothing for is an error, not another target's
         // image.
         let err = image_contents(&bm, &falcon("f3", mcu::IMAGE_NAME), mcu::IMAGE_NAME).unwrap_err();
