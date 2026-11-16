@@ -73,9 +73,19 @@ fn sockaddr(addr: Ipv4Addr) -> libc::sockaddr {
     unsafe { std::mem::transmute::<libc::sockaddr_in, libc::sockaddr>(sin) }
 }
 
-fn ioctl(sock: &OwnedFd, request: libc::Ioctl, req: &mut libc::ifreq) -> io::Result<()> {
+/// `request` is a `SIOC*` constant, which `libc` types as `c_ulong` on every
+/// Linux libc, while `ioctl(2)` itself takes a `c_ulong` from glibc but a
+/// `c_int` from musl (`libc::Ioctl`). The numbers all fit in 16 bits, so the
+/// cast loses nothing on either.
+fn ioctl(sock: &OwnedFd, request: libc::c_ulong, req: &mut libc::ifreq) -> io::Result<()> {
     // SAFETY: every request used here takes a pointer to an ifreq.
-    let rc = unsafe { libc::ioctl(sock.as_raw_fd(), request, req as *mut libc::ifreq) };
+    let rc = unsafe {
+        libc::ioctl(
+            sock.as_raw_fd(),
+            request as libc::Ioctl,
+            req as *mut libc::ifreq,
+        )
+    };
     if rc < 0 {
         Err(io::Error::last_os_error())
     } else {
