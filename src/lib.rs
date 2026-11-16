@@ -10,3 +10,6 @@ pub mod tui;
 
 #[cfg(feature = "web")]
 pub mod net;
+
+#[cfg(feature = "web")]
+pub mod web;

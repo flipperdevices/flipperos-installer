@@ -280,6 +280,13 @@ impl Controller {
         self.notify();
     }
 
+    /// Change the state directly, for tests elsewhere in the crate that need a
+    /// board the host running them does not have.
+    #[cfg(test)]
+    pub(crate) fn update_for_test<F: FnOnce(&mut AppState)>(&self, f: F) {
+        self.update(f);
+    }
+
     /// Append a line to the shared activity log.
     pub fn log(&self, line: impl Into<String>) {
         let line = line.into();

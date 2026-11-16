@@ -309,14 +309,21 @@ fn free_space(dir: &Path) -> Result<u64> {
 /// headroom. Checked up front so a long transfer or unpack is not wasted, and so
 /// the operator can still choose to stream instead.
 pub fn ensure_space(dir: &str, needed: u64, what: &str) -> Result<()> {
+    ensure_room(dir, needed, what).map_err(|e| {
+        format!("{e} — free up space, pass --cache-dir elsewhere, or switch Fetch to 'stream'")
+    })
+}
+
+/// [`ensure_space`] without its advice, for a caller with other options to
+/// offer.
+pub fn ensure_room(dir: &str, needed: u64, what: &str) -> Result<()> {
     let path = Path::new(dir);
     let available = free_space(path)?;
     if available >= needed.saturating_add(FREE_SPACE_MARGIN) {
         return Ok(());
     }
     Err(format!(
-        "not enough space in {dir} to {what}: need {} plus {} headroom, {} available — \
-         free up space, pass --cache-dir elsewhere, or switch Fetch to 'stream'",
+        "not enough space in {dir} to {what}: need {} plus {} headroom, {} available",
         human_bytes(needed),
         human_bytes(FREE_SPACE_MARGIN),
         human_bytes(available),
