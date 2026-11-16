@@ -226,19 +226,34 @@ pub fn guard_not_on_target(
     extras: &[ProfilePack],
     disk: &str,
 ) -> Result<()> {
-    let mounts = crate::core::removable::mounts_on(disk);
-    check_not_on_mounts(&plan(uboot, images, build, extras), &mounts, disk)
+    let on_target = crate::core::removable::mounts_on(disk);
+    let all = crate::core::removable::mountpoints();
+    check_not_on_mounts(&plan(uboot, images, build, extras), &on_target, &all, disk)
 }
 
 /// The decision [`guard_not_on_target`] makes, separated from reading
 /// `/proc/mounts` so it can be exercised directly.
-fn check_not_on_mounts(plan: &[Artifact], mounts: &[String], disk: &str) -> Result<()> {
+///
+/// What holds a file is the deepest mount above it, not every mount above it:
+/// a target mounted at `/` contains every path by prefix, yet a file in a
+/// `tmpfs` on `/run` is nowhere near it.
+fn check_not_on_mounts(
+    plan: &[Artifact],
+    on_target: &[String],
+    all: &[String],
+    disk: &str,
+) -> Result<()> {
     for a in plan {
         // A remote artifact is unaffected by what the target disk holds.
         if fetch::is_url(&a.location) {
             continue;
         }
-        if let Some(mp) = mounts.iter().find(|mp| under(&a.location, mp)) {
+        let holder = all
+            .iter()
+            .chain(on_target)
+            .filter(|mp| under(&a.location, mp))
+            .max_by_key(|mp| mp.trim_end_matches('/').len());
+        if let Some(mp) = holder.filter(|mp| on_target.contains(mp)) {
             return Err(format!(
                 "{} is read from {mp}, which lives on the target {disk}; \
                  copy the bundle elsewhere or pick another target",
@@ -696,6 +711,36 @@ mod tests {
         assert_eq!(last.size, 33);
         assert_eq!(last.sha256.as_deref(), Some("cc"));
         assert_eq!(p[p.len() - 2].label, "Desktop (incremental)");
+    }
+
+    #[test]
+    fn refuses_only_what_the_target_actually_holds() {
+        let local = |location: &str| Artifact {
+            label: "u-boot image".into(),
+            location: location.into(),
+            source: Source::Local { root: "/".into() },
+            sha256: None,
+            size: 1,
+            rel: "u-boot-rockchip.bin".into(),
+        };
+        let on_target = ["/".to_string(), "/home".to_string()];
+        let all = [
+            "/".to_string(),
+            "/home".to_string(),
+            "/run".to_string(),
+            "/mnt/stick".to_string(),
+        ];
+        let check = |path: &str| check_not_on_mounts(&[local(path)], &on_target, &all, "/dev/sda");
+
+        // Booted from the target: its root and /home hold these…
+        assert!(check("/var/tmp/b/u-boot.bin").is_err());
+        let err = check("/home/user/b/u-boot.bin").unwrap_err();
+        assert!(err.contains("read from /home"), "{err}");
+        // …but not a tmpfs or a stick mounted on top of them.
+        assert!(check("/run/flipperos-cache/upload/u-boot.bin").is_ok());
+        assert!(check("/mnt/stick/b/u-boot.bin").is_ok());
+        // Nothing of the target mounted at all: nothing to refuse.
+        assert!(check_not_on_mounts(&[local("/home/x")], &[], &all, "/dev/sda").is_ok());
     }
 
     #[test]

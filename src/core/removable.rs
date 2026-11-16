@@ -122,6 +122,15 @@ pub fn mounts_on(disk: &str) -> Vec<String> {
         .collect()
 }
 
+/// The mountpoint of every filesystem, block-backed or not (`tmpfs`, `proc`, …).
+pub fn mountpoints() -> Vec<String> {
+    fs::read_to_string("/proc/mounts")
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| line.split_whitespace().nth(1).map(unescape_mount))
+        .collect()
+}
+
 struct Mount {
     device: String,
     mountpoint: String,
