@@ -7,3 +7,6 @@ pub mod gui;
 
 #[cfg(feature = "tui")]
 pub mod tui;
+
+#[cfg(feature = "web")]
+pub mod net;

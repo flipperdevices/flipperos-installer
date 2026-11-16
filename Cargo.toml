@@ -19,9 +19,12 @@ strip = true
 # By default we ship both frontends so a single binary can drive the serial
 # console (TUI) and the on-device screen (GUI) at the same time. Slim builds can
 # select a single frontend, e.g. `--no-default-features --features tui`.
-default = ["tui", "gui"]
+default = ["tui", "gui", "web"]
 tui = ["dep:cursive"]
 gui = ["dep:slint", "dep:flipper-ui"]
+# Installing over USB: an NCM gadget on the dual-role Type-C port, a DHCP server
+# handing the host its address, and an HTTP server taking the bundle upload.
+web = ["dep:edge-dhcp"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -54,6 +57,16 @@ ring = "0.17"
 # statvfs(3) for the free-space precheck before staging ~1 GiB of artifacts.
 # Already in the dependency graph via zstd-sys.
 libc = "0.2"
+
+# DHCP for the USB link (the `web` feature). Without its default `io` feature the
+# crate is sans-IO — packets in, packets out, plus the lease table — so it drags
+# in no async runtime (embassy) and no network abstraction (edge-nal); we drive
+# it from a plain blocking UDP socket. It omits the router and DNS options when
+# given none, which is what keeps the host's default route and resolver alone.
+[dependencies.edge-dhcp]
+version = "0.8"
+default-features = false
+optional = true
 
 # TUI frontend (serial console / any terminal).
 [dependencies.cursive]

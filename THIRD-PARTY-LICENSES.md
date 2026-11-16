@@ -9,7 +9,7 @@ a whole is licensed under GPL-3.0-only**. All sources remain publicly buildable.
 This file is generated from `Cargo.lock` by `scripts/gen-third-party-licenses.sh`
 — do not edit it by hand.
 
-- **MIT License** — 241 crate(s)
+- **MIT License** — 247 crate(s)
 - **Unicode License v3** — 26 crate(s)
 - **GNU General Public License v3.0 only** — 8 crate(s)
 - **Apache License 2.0** — 6 crate(s)
@@ -1983,6 +1983,41 @@ SOFTWARE.
 ## MIT License (MIT)
 
 Used by:
+  * heapless 0.9.3 (https://github.com/rust-embedded/heapless)
+
+```
+Copyright (c) 2017 Jorge Aparicio
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+```
+--------------------------------------------------------------------------------
+
+## MIT License (MIT)
+
+Used by:
   * by_address 1.2.1 (https://github.com/mbrubeck/by_address)
 
 ```
@@ -2119,6 +2154,41 @@ OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
 IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
+
+```
+--------------------------------------------------------------------------------
+
+## MIT License (MIT)
+
+Used by:
+  * hash32 0.3.1 (https://github.com/japaric/hash32)
+
+```
+Copyright (c) 2018 Jorge Aparicio
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
 
 ```
 --------------------------------------------------------------------------------
@@ -2374,6 +2444,41 @@ Used by:
 ```
 Copyright (c) 2018-2025 The rust-random Project Developers
 Copyright (c) 2014 The Rust Project Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+```
+--------------------------------------------------------------------------------
+
+## MIT License (MIT)
+
+Used by:
+  * rand_core 0.10.1 (https://github.com/rust-random/rand_core)
+
+```
+Copyright (c) 2018-2026 The Rand Project Developers
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -3886,6 +3991,8 @@ Used by:
   * const-field-offset-macro 0.2.0 (https://github.com/slint-ui/slint)
   * cursive-macros 0.1.0 (https://github.com/gyscos/cursive)
   * drm-fourcc 2.2.0 (https://github.com/danielzfranklin/drm-fourcc-rs)
+  * edge-dhcp 0.8.0 (https://github.com/sysgrok/edge-net)
+  * edge-raw 0.8.0 (https://github.com/sysgrok/edge-net)
   * integer-sqrt 0.1.5 (https://github.com/derekdreery/integer-sqrt-rs)
   * libm 0.2.16 (https://github.com/rust-lang/compiler-builtins)
   * lyon_algorithms 1.0.20 (https://github.com/nical/lyon)
@@ -4419,6 +4526,7 @@ THE SOFTWARE.
 
 Used by:
   * byteorder-lite 0.1.0 (https://github.com/image-rs/byteorder-lite)
+  * byteorder 1.5.0 (https://github.com/BurntSushi/byteorder)
   * jiff 0.2.32 (https://github.com/BurntSushi/jiff)
   * memchr 2.8.3 (https://github.com/BurntSushi/memchr)
 
