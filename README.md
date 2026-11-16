@@ -23,6 +23,9 @@ It can:
 - Present a **TUI** (Cursive + Crossterm) for serial-console operation.
 - Present a **GUI** (Slint's software renderer, straight onto DRM/KMS) on the
   Flipper One 256×144 screen, driven by the on-device buttons (read from evdev).
+- Present a **web page and an HTTP API** over a USB network link on the Type-C
+  port, taking an uploaded update bundle — no Ethernet needed (see
+  [Installing over USB](#installing-over-usb)).
 - **Run the installation**: `blkdiscard`, write a fresh GPT, `mkfs.btrfs` with a
   subvolume skeleton, `btrfs receive` the selected profile snapshots, and
   install a kernel for each.
@@ -77,7 +80,10 @@ selection.
   before the target is touched.
 - [`core::install`](src/core/install.rs) — the destructive install pipeline
   (honours `--dry-run`).
-- [`tui`](src/tui/mod.rs) / [`gui`](src/gui/mod.rs) — the two frontends.
+- [`tui`](src/tui/mod.rs) / [`gui`](src/gui/mod.rs) — the two menu frontends.
+- [`web`](src/web/mod.rs) — a third frontend for a host on the other end of a
+  USB cable, with no menus of its own: it takes a whole installation request at
+  once. [`net`](src/net/mod.rs) brings up the link it is served on.
 
 ## Building
 
@@ -139,6 +145,10 @@ Cargo feature flags:
 |---------|-----------------------------------|
 | `tui`   | Cursive/Crossterm (serial)        |
 | `gui`   | Slint/DRM-KMS (on-device screen)  |
+| `web`   | USB NCM link + HTTP (host browser or script) |
+
+All three are on by default. The `web` feature adds a single small dependency,
+`edge-dhcp` (rustc 1.88), and is left out of the slim TUI-only build above.
 
 ## Running
 
@@ -160,6 +170,12 @@ sudo ./flipperos-installer --no-dry-run --fetch stream \
 
 # Hand-picked U-Boot + rootfs pair from the image server:
 sudo ./flipperos-installer --custom --server https://images.flipperos.example
+
+# On a development host: the web frontend alone, on localhost, dry-run. With no
+# terminal and no screen it is the only frontend, and the installer stays up
+# serving it.
+./flipperos-installer --web-listen 127.0.0.1:8080 --no-automount \
+    --cache-dir /tmp/flipperos-cache </dev/null
 ```
 
 By default the installer runs in **dry-run** mode: every destructive command is
@@ -167,10 +183,11 @@ logged but not executed. Pass `--no-dry-run` to actually flash. `--help` lists
 every flag; the bundle-specific ones are described under
 [Update bundles](#update-bundles).
 
-Once a real install has finished, both frontends offer to reboot: `<ReBoot>`
-(Alt+B) in the serial console's button bar, and the RUN soft button on the
-device, where it replaces Install. Use it instead of power-cycling — it closes
-both frontends first, which is what leaves the serial console usable afterwards
+Once a real install has finished, every frontend offers to reboot: `<ReBoot>`
+(Alt+B) in the serial console's button bar, the RUN soft button on the
+device, where it replaces Install, and a Reboot button under the web log. Use it
+instead of power-cycling — it closes the frontends first, which is what leaves
+the serial console usable afterwards
 (a terminal still in raw mode / the alternate screen survives a power cut). The
 action is absent in a dry run, since nothing was written to boot into.
 
@@ -184,6 +201,71 @@ cargo run --example bundle_probe --no-default-features
 # Drive a whole installation headlessly, in dry-run mode.
 cargo run --example dry_run --no-default-features
 ```
+
+## Installing over USB
+
+Once loaded, the installer turns the dual-role **Type-C port** (the fusb302
+`USB-C` connector, DWC3 `23000000.usb`) into a **USB NCM network adapter** and
+serves an install page on it. Plug the board into a computer and open
+**<http://192.168.241.1/>** — no Ethernet, no removable media.
+
+- **The link.** The gadget is created through configfs as `37c1:f121`, a
+  single-function CDC device with no driver to install on Linux, macOS, or
+  Windows 11 (and Windows 10 from 20H1). Its MAC addresses come from the board's
+  serial number, so a host sees the same adapter on every boot. Should a host
+  need the composite (IAD) presentation instead, it goes with product ID
+  `f12f`; both are kept together in [`net::gadget`](src/net/gadget.rs).
+- **Addressing.** The board takes `192.168.241.1/24` (241 is `0xf1`) and leases
+  the host `192.168.241.2` over DHCP — with **no router and no DNS server**, so
+  a laptop plugged in keeps its own default route and resolver. `--usb-net`
+  picks another subnet.
+- **The page** sets the target, the profiles (`all`, `none` or names) and
+  whether to reprovision UFS, and takes the bundle `*.tar.zst`. It works without
+  JavaScript; with it, an upload progress bar shows and the log appears in
+  place. Once a valid request is in, the browser follows the installation log
+  live.
+- **The bundle is never stored.** It is unpacked as it arrives, keeping only
+  this board's images, its MCU target's firmware and the selected profiles'
+  packs, and every file is checked against the manifest on the way. A ~2 GB
+  bundle thus costs only what it installs in the RAM-backed scratch directory.
+  The manifest is normally the archive's first member, which lets a bundle
+  that cannot be installed (wrong board, unknown profile, no room) be refused
+  within its first kilobytes. If it comes later, everything is unpacked until
+  it arrives and the surplus is deleted then.
+- **The device's screen and serial console** show the upload and the install
+  as they happen; the web frontend drives the same installer state as they do.
+
+### The HTTP API
+
+Every path answers a browser (which asks for `text/html`) with a page and
+anything else with plain text or JSON, so a script needs no more than the
+form's field names:
+
+```sh
+# The bundle as the body, the settings in the query string:
+curl -T flipperone-update-….tar.zst \
+    'http://192.168.241.1/install?target=/dev/sda&profiles=all'
+
+# Or the same fields the page posts (settings first, the bundle last):
+curl -F target=/dev/sda -F profiles=Desktop,Router -F ufs=reprovision \
+    -F bundle=@flipperone-update-….tar.zst http://192.168.241.1/install
+```
+
+| Path | Does |
+|---|---|
+| `POST`/`PUT /install` | Takes `target` (default: the current selection), `profiles` (default `all`) and `ufs` (`keep`, the default, or `reprovision`) with the bundle. Streams back the installation log as `text/plain`, ending in `status: done` or `status: failed: <reason>`. A request refused before the install starts gets a 4xx and `error: <reason>`: `409` when the installer is busy, `422` for a bundle or setting that cannot be installed, `507` when it does not fit. With `Expect: 100-continue` (which curl sends for large uploads) the query-string settings are checked before a byte of the bundle is sent. |
+| `GET /log` | The activity log; `?since=N` starts after line `N`, and it follows a running install to its end (`?follow=1`: until the client hangs up). |
+| `GET /status` | JSON: phase, progress, board, MCU, devices, selection, `log_seq`, `can_reboot`. |
+| `POST /reboot` | Reboot into the installed system, once a real install is done. |
+
+The kernel booting the installer needs the configfs NCM gadget built in
+(`CONFIG_USB_CONFIGFS`, `CONFIG_USB_LIBCOMPOSITE`, `CONFIG_USB_F_NCM`,
+`CONFIG_USB_CONFIGFS_NCM`), as the initramfs carries no modules. Without it,
+or with no USB device controller, the installer logs why and carries on with
+its other frontends. `--no-web` leaves the port alone, `--usb-udc` picks a
+controller where there are several, and `--web-listen ADDR:PORT` serves the
+same page somewhere else (Ethernet, or a development host) without touching
+USB at all.
 
 ## Update bundles
 

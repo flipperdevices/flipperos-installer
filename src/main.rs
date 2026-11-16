@@ -25,7 +25,15 @@ enum FrontendChoice {
 struct Args {
     config: Config,
     frontend: FrontendChoice,
+    /// Where to serve the web frontend; `None` with `--no-web`.
+    #[cfg(feature = "web")]
+    web: Option<flipperos_installer::web::Settings>,
 }
+
+/// The web frontend's thread, which returns once the server stops — or at
+/// once, with `false`, if it never started. `None` when there is no web
+/// frontend at all.
+type WebHandle = Option<std::thread::JoinHandle<bool>>;
 
 fn main() -> ExitCode {
     let args = match parse_args() {
@@ -50,7 +58,12 @@ fn main() -> ExitCode {
         });
     }
 
-    let result = run_frontends(Arc::clone(&controller), args.frontend);
+    #[cfg(feature = "web")]
+    let web = args.web.map(|settings| start_web(&controller, settings));
+    #[cfg(not(feature = "web"))]
+    let web: WebHandle = None;
+
+    let result = run_frontends(Arc::clone(&controller), args.frontend, web);
 
     // Every frontend's event loop has returned by now, so the TUI has left the
     // alternate screen and taken the terminal out of raw mode. Only here is it
@@ -76,7 +89,36 @@ fn main() -> ExitCode {
     }
 }
 
-fn run_frontends(ctrl: Arc<Controller>, choice: FrontendChoice) -> Result<(), String> {
+/// Bring up the USB link and the web server on a thread of their own, so the
+/// gadget's setup holds up neither the screen nor the console.
+#[cfg(feature = "web")]
+fn start_web(
+    ctrl: &Arc<Controller>,
+    settings: flipperos_installer::web::Settings,
+) -> std::thread::JoinHandle<bool> {
+    let ctrl = Arc::clone(ctrl);
+    std::thread::spawn(move || {
+        let started = flipperos_installer::web::start(&ctrl, settings);
+        match started {
+            Ok(running) => {
+                running.wait();
+                true
+            }
+            Err(e) => {
+                // Into the shared log, where the other frontends show it;
+                // stderr is about to be covered by the TUI.
+                ctrl.log(format!("web frontend unavailable: {e}"));
+                false
+            }
+        }
+    })
+}
+
+fn run_frontends(
+    ctrl: Arc<Controller>,
+    choice: FrontendChoice,
+    web: WebHandle,
+) -> Result<(), String> {
     let has_tui = cfg!(feature = "tui");
     let has_gui = cfg!(feature = "gui");
 
@@ -96,7 +138,7 @@ fn run_frontends(ctrl: Arc<Controller>, choice: FrontendChoice) -> Result<(), St
     if want_gui && !has_gui {
         return Err("this build has no GUI frontend".to_string());
     }
-    if !want_tui && !want_gui {
+    if !want_tui && !want_gui && web.is_none() {
         return Err("built without any frontend".to_string());
     }
 
@@ -119,9 +161,19 @@ fn run_frontends(ctrl: Arc<Controller>, choice: FrontendChoice) -> Result<(), St
         (true, true) => run_both(ctrl),
         (true, false) => run_tui(ctrl),
         (false, true) => run_gui(ctrl),
-        (false, false) => {
-            Err("no usable frontend: no display device and no interactive terminal".to_string())
-        }
+        // Nothing local to drive the installer from, which is the very case the
+        // web frontend is for: serve until it is told to stop.
+        (false, false) => match web.map(|h| h.join().unwrap_or(false)) {
+            Some(true) => Ok(()),
+            Some(false) => Err(
+                "no usable frontend: no display device, no interactive terminal, and the \
+                 web frontend did not start"
+                    .to_string(),
+            ),
+            None => {
+                Err("no usable frontend: no display device and no interactive terminal".to_string())
+            }
+        },
     }
 }
 
@@ -211,6 +263,8 @@ fn run_both(_ctrl: Arc<Controller>) -> Result<(), String> {
 fn parse_args() -> Result<Option<Args>, String> {
     let mut config = Config::default();
     let mut frontend = FrontendChoice::Auto;
+    #[cfg(feature = "web")]
+    let mut web = Some(flipperos_installer::web::Settings::default());
 
     let mut iter = std::env::args().skip(1);
     while let Some(arg) = iter.next() {
@@ -281,11 +335,38 @@ fn parse_args() -> Result<Option<Args>, String> {
                 config.ufs_scheme =
                     Some(iter.next().ok_or("--ufs-scheme requires a path argument")?);
             }
+            #[cfg(feature = "web")]
+            "--no-web" => web = None,
+            #[cfg(feature = "web")]
+            "--web-listen" => {
+                let addr = iter.next().ok_or("--web-listen requires ADDR:PORT")?;
+                let addr = addr
+                    .parse()
+                    .map_err(|e| format!("--web-listen: '{addr}' is not ADDR:PORT: {e}"))?;
+                web.get_or_insert_with(Default::default).listen = Some(addr);
+            }
+            #[cfg(feature = "web")]
+            "--usb-udc" => {
+                web.get_or_insert_with(Default::default).udc =
+                    Some(iter.next().ok_or("--usb-udc requires a controller name")?);
+            }
+            #[cfg(feature = "web")]
+            "--usb-net" => {
+                let net = iter.next().ok_or("--usb-net requires ADDR/PREFIX")?;
+                web.get_or_insert_with(Default::default).subnet =
+                    flipperos_installer::net::Subnet::parse(&net)
+                        .map_err(|e| format!("--usb-net: {e}"))?;
+            }
             other => return Err(format!("unknown argument: {other}")),
         }
     }
 
-    Ok(Some(Args { config, frontend }))
+    Ok(Some(Args {
+        config,
+        frontend,
+        #[cfg(feature = "web")]
+        web,
+    }))
 }
 
 fn print_usage() {
@@ -322,6 +403,16 @@ UFS PROVISIONING (only for UFS targets):\n\
                           DESTRUCTIVE: everything on the device is lost\n\
     --ufs-scheme <PATH>   Read the scheme from this TOML file instead of the\n\
                           one compiled into the installer\n\
+\n\
+INSTALLING OVER USB (the web frontend, on by default):\n\
+    --no-web              Neither bring up the USB link nor serve the web page\n\
+    --usb-net <A/P>       The board's address and prefix on the USB link; the\n\
+                          host is leased the next address (default\n\
+                          192.168.241.1/24)\n\
+    --usb-udc <NAME>      USB device controller for the gadget (default: the\n\
+                          only one, e.g. 23000000.usb)\n\
+    --web-listen <A:P>    Serve on this address instead, and leave the USB port\n\
+                          alone (Ethernet, or a development host)\n\
 \n\
 OPTIONS:\n\
     --server <URL>     Image server base URL (custom development builds)\n\
