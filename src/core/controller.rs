@@ -1347,11 +1347,13 @@ impl Controller {
         }
         self.notify();
         let this = Arc::clone(self);
+        // The outcome is logged before the phase announces it, so whoever stops
+        // reading the log when the phase changes has read all of it.
         std::thread::spawn(move || match install::run(&this) {
             Ok(()) => {
                 this.set_progress(1.0);
-                this.set_phase(Phase::Done);
                 this.log("installation complete");
+                this.set_phase(Phase::Done);
             }
             Err(e) => {
                 this.log(format!("installation failed: {e}"));
