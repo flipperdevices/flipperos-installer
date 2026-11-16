@@ -588,6 +588,99 @@ pub fn unpack(reference: &BundleRef, on_progress: &mut dyn FnMut(u64)) -> Result
     Ok(written)
 }
 
+/// What to keep of an uploaded bundle archive: the files an install of `extras`
+/// onto this board can read, and everything the installer does not know to be
+/// unneeded.
+///
+/// The filter only ever *skips* what it recognises as someone else's — other
+/// boards' images, other MCU targets' firmware, profile packs nobody selected —
+/// and keeps anything else (a layout file, notes, files a newer bundle format
+/// adds), since dropping a file the install turns out to need would only show up
+/// once the target has been wiped.
+pub fn upload_filter(
+    manifest: &Manifest,
+    board_dir: &str,
+    mcu_target: Option<&str>,
+    extras: &[String],
+) -> archive::Keep {
+    let board_dir = board_dir.to_string();
+    let mcu_target = mcu_target.map(str::to_string);
+    let extras = extras.to_vec();
+    let filter = move |rel: &std::path::Path| -> bool {
+        let mut parts = rel.iter().map(|c| c.to_str().unwrap_or(""));
+        let top = parts.next().unwrap_or("");
+        let second = parts.next();
+        match top {
+            "u-boot" | BOOT_MENU_DIR | RECOVERY_DIR => second.is_none_or(|d| d == board_dir),
+            MCU_DIR => second.is_none_or(|t| mcu_target.as_deref() == Some(t)),
+            PACKS_DIR => {
+                let Some(fname) = second.filter(|_| parts.next().is_none()) else {
+                    return true;
+                };
+                if catalog::parse_home_pack(fname).is_some() {
+                    return true;
+                }
+                match catalog::parse_pack(fname) {
+                    Some((name, _, false)) => name.eq_ignore_ascii_case("minimal"),
+                    Some((name, _, true)) => extras.contains(&name),
+                    None => true,
+                }
+            }
+            _ => true,
+        }
+    };
+    let expected = manifest
+        .files
+        .iter()
+        .map(|f| (std::path::PathBuf::from(&f.path), f.digest()))
+        .filter(|(path, _)| filter(path))
+        .collect();
+    archive::Keep {
+        filter: Box::new(filter),
+        expected,
+    }
+}
+
+/// The extra profiles an operator asked for by name, as the build spells them.
+///
+/// `spec` is `all` (every extra profile; also what an empty spec means), `none`
+/// (Minimal alone), or names separated by commas or whitespace, matched without
+/// regard to case. Minimal is always deployed, so naming it is accepted and
+/// adds nothing. An unknown name is an error that lists the valid ones, so a
+/// typo cannot silently install less than was asked for.
+pub fn parse_profiles(spec: &str, build: &SnapshotBuild) -> Result<Vec<String>> {
+    let available: Vec<&str> = build.extra_profiles().map(|p| p.name.as_str()).collect();
+    let spec = spec.trim();
+    if spec.is_empty() || spec.eq_ignore_ascii_case("all") {
+        return Ok(available.iter().map(|s| s.to_string()).collect());
+    }
+    if spec.eq_ignore_ascii_case("none") {
+        return Ok(Vec::new());
+    }
+    let mut out: Vec<String> = Vec::new();
+    for word in spec
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|w| !w.is_empty())
+    {
+        if word.eq_ignore_ascii_case("minimal") {
+            continue;
+        }
+        let Some(name) = available.iter().find(|n| n.eq_ignore_ascii_case(word)) else {
+            return Err(format!(
+                "this bundle has no profile '{word}' (it has: Minimal{})",
+                available
+                    .iter()
+                    .map(|n| format!(", {n}"))
+                    .collect::<String>()
+            ));
+        };
+        if !out.iter().any(|o| o == name) {
+            out.push(name.to_string());
+        }
+    }
+    Ok(out)
+}
+
 // --- local discovery -------------------------------------------------------
 
 /// Find bundles on mounted removable media and at explicitly given paths.
@@ -1180,5 +1273,90 @@ mod tests {
         // No manifest version to go on: fall back to the path's last segment.
         let empty = Manifest::default();
         assert_eq!(local_label(&empty, "/mnt/sd/thing/"), "thing");
+    }
+
+    #[test]
+    fn an_upload_keeps_this_boards_files_and_the_picked_profiles() {
+        let manifest = parse(MANIFEST);
+        let keep = upload_filter(&manifest, "flipper-one", Some("f1"), &["Desktop".into()]);
+        let kept = |p: &str| (keep.filter)(std::path::Path::new(p));
+
+        assert!(kept("manifest.json"));
+        assert!(kept("u-boot/flipper-one/u-boot-rockchip.bin"));
+        assert!(kept("u-boot/flipper-one/idbloader.img"));
+        assert!(!kept("u-boot/evb/u-boot-rockchip.bin"));
+        assert!(kept("boot-menu/flipper-one/bootmenu-falcon.itb"));
+        assert!(!kept("boot-menu/generic/bootmenu-falcon.itb"));
+        assert!(kept("recovery/flipper-one/recovery-falcon.itb"));
+        assert!(!kept("recovery/nanopi-m5/recovery-falcon.itb"));
+        assert!(kept("mcu/f1/flipperone-mcu-firmware.uf2"));
+        assert!(!kept("mcu/f2/flipperone-mcu-firmware.uf2"));
+        assert!(kept("profile-packs/Minimal_917_stock_pack.zst"));
+        assert!(kept("profile-packs/home_917_pack.zst"));
+        assert!(kept("profile-packs/Desktop_917_stock_inc_pack.zst"));
+        assert!(!kept("profile-packs/Router_917_stock_inc_pack.zst"));
+        assert!(!kept("profile-packs/Desktop_917_stock_pack.zst"));
+        // Anything it does not recognise as someone else's stays.
+        assert!(kept("flipperos-btrfs.toml"));
+        assert!(kept("profile-packs/README"));
+
+        // Every listed file that is kept must turn up, with its digest.
+        let mut expected: Vec<_> = keep
+            .expected
+            .keys()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        expected.sort();
+        assert_eq!(
+            expected,
+            [
+                "boot-menu/flipper-one/bootmenu-falcon.itb",
+                "mcu/f1/flipperone-mcu-firmware.elf",
+                "mcu/f1/flipperone-mcu-firmware.uf2",
+                "profile-packs/Desktop_917_stock_inc_pack.zst",
+                "profile-packs/Minimal_917_stock_pack.zst",
+                "profile-packs/home_917_pack.zst",
+                "recovery/flipper-one/recovery-falcon.itb",
+                "u-boot/flipper-one/idbloader.img",
+                "u-boot/flipper-one/u-boot-rockchip.bin",
+            ]
+        );
+        assert!(keep.expected.values().all(|d| d.is_some()));
+
+        // Without an MCU the kernel can update, no MCU firmware is kept at all.
+        let keep = upload_filter(&manifest, "flipper-one", None, &[]);
+        assert!(!(keep.filter)(std::path::Path::new(
+            "mcu/f1/flipperone-mcu-firmware.uf2"
+        )));
+    }
+
+    #[test]
+    fn parses_a_profile_selection() {
+        let manifest = parse(MANIFEST);
+        let repo = repo();
+        let reference = remote_ref(&repo, "nightly", "20260812-83ddb68-15");
+        let bundle = resolve(
+            &reference,
+            &reference.location,
+            &manifest,
+            "flipper-one",
+            None,
+        )
+        .unwrap();
+        let build = &bundle.build;
+        let all = ["Desktop", "No-Graphics", "Router", "TV-Media-Box"];
+
+        assert_eq!(parse_profiles("all", build).unwrap(), all);
+        assert_eq!(parse_profiles("", build).unwrap(), all);
+        assert_eq!(parse_profiles(" ALL ", build).unwrap(), all);
+        assert!(parse_profiles("none", build).unwrap().is_empty());
+        assert!(parse_profiles("minimal", build).unwrap().is_empty());
+        assert_eq!(
+            parse_profiles("desktop, router  Desktop", build).unwrap(),
+            ["Desktop", "Router"]
+        );
+        let err = parse_profiles("Desktop,Gaming", build).unwrap_err();
+        assert!(err.contains("no profile 'Gaming'"), "{err}");
+        assert!(err.contains("Minimal, Desktop, No-Graphics"), "{err}");
     }
 }

@@ -709,6 +709,9 @@ pub enum Phase {
     Ready,
     /// Rewriting a UFS target's logical units before an install can start.
     Provisioning,
+    /// Receiving an update bundle uploaded over the network. `progress` tracks
+    /// the upload; the install that follows it starts from zero.
+    Receiving,
     /// Installation in progress.
     Installing,
     /// Installation finished successfully.
@@ -723,6 +726,7 @@ impl Phase {
             Phase::Discovering => "discovering…".to_string(),
             Phase::Ready => "ready".to_string(),
             Phase::Provisioning => "provisioning…".to_string(),
+            Phase::Receiving => "receiving bundle…".to_string(),
             Phase::Installing => "installing…".to_string(),
             Phase::Done => "done".to_string(),
             Phase::Failed(e) => format!("failed: {e}"),
@@ -732,7 +736,7 @@ impl Phase {
     pub fn is_busy(&self) -> bool {
         matches!(
             self,
-            Phase::Discovering | Phase::Provisioning | Phase::Installing
+            Phase::Discovering | Phase::Provisioning | Phase::Receiving | Phase::Installing
         )
     }
 }
@@ -837,8 +841,13 @@ impl AppState {
     /// Whether the current selection is complete enough to start flashing.
     /// Minimal is always deployed, so no extra profile selection is required.
     pub fn can_install(&self) -> bool {
-        !self.phase.is_busy()
-            && self.selection.target_device.is_some()
+        !self.phase.is_busy() && self.selection_complete()
+    }
+
+    /// Whether the selection names everything an install needs, whatever the
+    /// installer happens to be doing.
+    pub fn selection_complete(&self) -> bool {
+        self.selection.target_device.is_some()
             && self.selected_uboot().is_some()
             && self.selected_build().and_then(|b| b.minimal()).is_some()
     }

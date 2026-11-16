@@ -134,6 +134,54 @@ pub struct Controller {
     /// Whether the operator asked to reboot. Read once the frontends are gone,
     /// so it is not part of [`AppState`]: no view renders it.
     reboot_requested: AtomicBool,
+    /// Bundle directories registered while running (an uploaded bundle), listed
+    /// alongside [`Config::bundle_paths`] so a Refresh does not lose them.
+    extra_bundles: Mutex<Vec<String>>,
+}
+
+/// An installation asked for in one go, by a frontend that cannot walk the
+/// menus: everything the operator would otherwise pick, then Install.
+#[derive(Clone, Debug, Default)]
+pub struct InstallRequest {
+    /// Directory of an unpacked bundle to install from.
+    pub bundle_root: String,
+    /// Target whole-disk device; `None` keeps the current selection.
+    pub target: Option<String>,
+    /// Extra profiles to deploy on top of Minimal, as the bundle spells them.
+    pub profiles: Vec<String>,
+    /// Bring a UFS target to the Flipper scheme first if it does not match it,
+    /// or provision a blank one. Destructive, so never implied.
+    pub reprovision_ufs: bool,
+}
+
+/// Holds the installer in [`Phase::Receiving`] while a bundle is uploaded.
+///
+/// Dropping it hands the installer back — to [`Phase::Ready`], unless the
+/// upload went on to start an install, which then owns the phase.
+pub struct Receiving<'a> {
+    ctrl: &'a Controller,
+}
+
+impl Receiving<'_> {
+    /// Report how much of the upload has arrived, `0.0..=1.0`.
+    pub fn set_progress(&self, progress: f32) {
+        self.ctrl.update(|s| {
+            if s.phase == Phase::Receiving {
+                s.progress = progress.clamp(0.0, 1.0);
+            }
+        });
+    }
+}
+
+impl Drop for Receiving<'_> {
+    fn drop(&mut self) {
+        self.ctrl.update(|s| {
+            if s.phase == Phase::Receiving {
+                s.phase = Phase::Ready;
+                s.progress = 0.0;
+            }
+        });
+    }
 }
 
 impl Controller {
@@ -154,6 +202,7 @@ impl Controller {
             inflight: Mutex::new(HashSet::new()),
             exit_hooks: Mutex::new(Vec::new()),
             reboot_requested: AtomicBool::new(false),
+            extra_bundles: Mutex::new(Vec::new()),
         })
     }
 
@@ -737,8 +786,14 @@ impl Controller {
     fn load_local(&self) {
         self.begin_listing(|c| &mut c.local.state);
         let media = removable::media_roots();
-        let items =
-            bundle::discover_local(&self.config.bundle_paths, &media, &self.config.cache_dir);
+        let paths: Vec<String> = self
+            .config
+            .bundle_paths
+            .iter()
+            .chain(self.extra_bundles.lock().unwrap().iter())
+            .cloned()
+            .collect();
+        let items = bundle::discover_local(&paths, &media, &self.config.cache_dir);
         if !items.is_empty() {
             self.log(format!("{} local bundle(s) found", items.len()));
         }
@@ -1168,23 +1223,31 @@ impl Controller {
         }
         let this = Arc::clone(self);
         std::thread::spawn(move || {
-            this.set_phase(Phase::Provisioning);
-            let (scheme, origin) = provision::Scheme::resolve(&this.config);
-            let result = provision::apply(&this.config, &this, &target, &scheme, &origin);
-            match result {
-                Ok(()) => {
-                    // The logical units may have changed size, been renamed by the
-                    // rescan, or — on a device that had none — appeared for the
-                    // first time, so the device list has to be rebuilt.
-                    this.rediscover_storage(&target);
-                    this.set_phase(Phase::Ready);
-                }
-                Err(e) => {
-                    this.log(format!("reprovisioning failed: {e}"));
-                    this.set_phase(Phase::Failed(e));
-                }
-            }
+            let _ = this.reprovision(&target);
         });
+    }
+
+    /// Rewrite a UFS target's logical units on the calling thread, and
+    /// re-enumerate storage afterwards. The caller has checked the installer is
+    /// free.
+    fn reprovision(self: &Arc<Self>, target: &provision::Target) -> Result<(), String> {
+        self.set_phase(Phase::Provisioning);
+        let (scheme, origin) = provision::Scheme::resolve(&self.config);
+        match provision::apply(&self.config, self, target, &scheme, &origin) {
+            Ok(()) => {
+                // The logical units may have changed size, been renamed by the
+                // rescan, or — on a device that had none — appeared for the first
+                // time, so the device list has to be rebuilt.
+                self.rediscover_storage(target);
+                self.set_phase(Phase::Ready);
+                Ok(())
+            }
+            Err(e) => {
+                self.log(format!("reprovisioning failed: {e}"));
+                self.set_phase(Phase::Failed(e.clone()));
+                Err(e)
+            }
+        }
     }
 
     /// Re-enumerate storage after a device was reprovisioned, keeping the previous
@@ -1334,12 +1397,19 @@ impl Controller {
     /// of two requests racing each other — a double submit, or two frontends
     /// pressing Install at once — exactly one starts a run.
     pub fn try_start_install(self: &Arc<Self>) -> Result<(), String> {
+        self.start_install_from(false)
+    }
+
+    /// [`Self::try_start_install`], optionally taking over from an upload in
+    /// [`Phase::Receiving`] — which only the upload's own request may do.
+    fn start_install_from(self: &Arc<Self>, receiving: bool) -> Result<(), String> {
         {
             let mut state = self.state.lock().unwrap();
-            if state.phase.is_busy() {
+            let handover = receiving && state.phase == Phase::Receiving;
+            if state.phase.is_busy() && !handover {
                 return Err(format!("the installer is busy ({})", state.phase.label()));
             }
-            if !state.can_install() {
+            if !state.selection_complete() {
                 return Err("incomplete selection".to_string());
             }
             state.phase = Phase::Installing;
@@ -1360,6 +1430,154 @@ impl Controller {
                 this.set_phase(Phase::Failed(e.to_string()));
             }
         });
+        Ok(())
+    }
+
+    // --- Headless installs ----------------------------------------------
+
+    /// Claim the installer for a bundle upload: [`Phase::Receiving`] until the
+    /// returned guard is dropped, or until [`Self::install_request`] turns it
+    /// into an install. Refused while anything else is running, including
+    /// another upload.
+    pub fn begin_receiving(&self) -> Result<Receiving<'_>, String> {
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.phase.is_busy() {
+                return Err(format!("the installer is busy ({})", state.phase.label()));
+            }
+            state.phase = Phase::Receiving;
+            state.progress = 0.0;
+        }
+        self.notify();
+        Ok(Receiving { ctrl: self })
+    }
+
+    /// Select everything `req` names and start the install, on the calling
+    /// thread, the way an operator would through the menus — or say why not.
+    ///
+    /// Unlike the menu actions, nothing here is left to a background thread: the
+    /// bundle is resolved and the UFS target checked before this returns, so the
+    /// caller learns about a bad request rather than finding an incomplete
+    /// selection later. Called while holding [`Receiving`], whose phase it takes
+    /// over; otherwise the installer must be idle.
+    pub fn install_request(self: &Arc<Self>, req: &InstallRequest) -> Result<(), String> {
+        {
+            let state = self.state.lock().unwrap();
+            if state.phase.is_busy() && state.phase != Phase::Receiving {
+                return Err(format!("the installer is busy ({})", state.phase.label()));
+            }
+        }
+
+        // The bundle: list it among the local ones, so it survives a Refresh and
+        // both frontends show what is being installed, then resolve it here.
+        let root = req.bundle_root.trim_end_matches('/').to_string();
+        {
+            let mut extra = self.extra_bundles.lock().unwrap();
+            if !extra.contains(&root) {
+                extra.push(root.clone());
+            }
+        }
+        self.load_local();
+        if self.snapshot().bundle_ref_by_id(&root).is_none() {
+            return Err(format!("{root} does not hold a bundle"));
+        }
+        self.update(|s| {
+            s.selection.mode = InstallMode::Bundle;
+            s.selection.bundle = Some(root.clone());
+            s.bundle = None;
+            s.bundle_error = None;
+        });
+        self.load_bundle(&root);
+        if let Some(e) = self.snapshot().bundle_error {
+            return Err(e);
+        }
+        self.update(|s| s.selection.profiles = req.profiles.clone());
+
+        // The target.
+        if let Some(path) = &req.target {
+            let state = self.snapshot();
+            let Some(device) = state.devices.iter().find(|d| &d.path == path) else {
+                return Err(format!("{path} is not an installable device"));
+            };
+            // The install would refuse it too, but only after the request had
+            // been taken; say so while the caller can still pick another.
+            if !device.boot_rom_capable() {
+                return Err(format!(
+                    "{} is not a device the boot ROM can boot from",
+                    device.summary()
+                ));
+            }
+            self.update(|s| {
+                s.selection.target_device = Some(path.clone());
+                s.ufs = None;
+            });
+            self.log(format!("target device: {path}"));
+        }
+        self.ensure_ufs_ready(req.reprovision_ufs)?;
+
+        self.start_install_from(true)
+    }
+
+    /// Bring the target's UFS device in line before a headless install, which
+    /// has nobody to answer the prompt the menus would raise.
+    ///
+    /// With `reprovision` a mismatched target is rewritten, and with no target
+    /// at all a blank UFS device is provisioned (which is what creates one).
+    /// Without it a mismatch is only reported, as for a target the operator did
+    /// not pick, and the install goes ahead on the layout the device has.
+    fn ensure_ufs_ready(self: &Arc<Self>, reprovision: bool) -> Result<(), String> {
+        if !self.config.ufs_check {
+            return Ok(());
+        }
+        let state = self.snapshot();
+        let target = match &state.selection.target_device {
+            Some(path) => {
+                let is_ufs = state
+                    .devices
+                    .iter()
+                    .any(|d| &d.path == path && d.kind == StorageKind::Ufs);
+                if !is_ufs {
+                    return Ok(());
+                }
+                provision::Target::for_disk(path).map_err(|e| probe_failure(path, &e))?
+            }
+            None if reprovision => match ufs::endpoints()
+                .iter()
+                .map(provision::Target::for_endpoint)
+                .find(|t| t.disk.is_none())
+            {
+                Some(blank) => blank,
+                None => return Err("no target device".to_string()),
+            },
+            None => return Err("no target device".to_string()),
+        };
+
+        let (scheme, origin) = provision::Scheme::resolve(&self.config);
+        let status = provision::probe(&target, &scheme, &origin)
+            .map_err(|e| probe_failure(&target.label(), &e))?;
+        for line in status.report() {
+            self.log(line);
+        }
+        let provisioned = status.is_provisioned();
+        self.update(|s| s.ufs = Some(status));
+        if provisioned {
+            return Ok(());
+        }
+        if !reprovision {
+            self.log(format!(
+                "warning: {} is not provisioned for FlipperOS; installing onto it as it is",
+                target.label()
+            ));
+            return Ok(());
+        }
+        self.log(format!(
+            "{}: reprovisioning, as the request asked",
+            target.label()
+        ));
+        self.reprovision(&target)?;
+        if self.snapshot().selection.target_device.is_none() {
+            return Err("no target device after provisioning".to_string());
+        }
         Ok(())
     }
 }
@@ -1588,6 +1806,119 @@ mod tests {
         assert!(err.contains("busy"), "{err}");
         // Refused requests leave the running install's phase alone.
         assert_eq!(ctrl.snapshot().phase, Phase::Installing);
+    }
+
+    /// An unpacked bundle with a generic U-Boot and two profiles, and a
+    /// controller that sees one eMMC to install it onto.
+    fn headless_fixture(name: &str) -> (Arc<Controller>, String) {
+        let root = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("manifest.json"),
+            r#"{ "schema": 1, "bundle": { "name": "t", "version": "1" }, "files": [
+                 { "path": "u-boot/generic/u-boot-rockchip.bin", "size": 5 },
+                 { "path": "profile-packs/Minimal_9_stock_pack.zst", "size": 4 },
+                 { "path": "profile-packs/Desktop_9_stock_inc_pack.zst", "size": 3 },
+                 { "path": "profile-packs/Router_9_stock_inc_pack.zst", "size": 3 } ] }"#,
+        )
+        .unwrap();
+        let ctrl = Controller::new(Config {
+            automount: false,
+            ufs_check: false,
+            cache_dir: std::env::temp_dir()
+                .join(format!("{name}-cache"))
+                .to_string_lossy()
+                .into_owned(),
+            ..Config::default()
+        });
+        ctrl.update(|s| {
+            s.phase = Phase::Ready;
+            s.devices = vec![StorageDevice {
+                path: "/dev/fake-emmc".into(),
+                kind: StorageKind::Emmc,
+                model: "fake".into(),
+                size_bytes: 32 << 30,
+                removable: false,
+                logical_block_size: 512,
+            }];
+        });
+        (ctrl, root.to_string_lossy().into_owned())
+    }
+
+    fn wait_until_idle(ctrl: &Controller) {
+        for _ in 0..200 {
+            if !ctrl.snapshot().phase.is_busy() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        panic!("the install never finished");
+    }
+
+    #[test]
+    fn a_headless_request_takes_over_from_its_upload() {
+        let (ctrl, root) = headless_fixture("flipperos-controller-headless");
+        let receiving = ctrl.begin_receiving().unwrap();
+        assert_eq!(ctrl.snapshot().phase, Phase::Receiving);
+        // Only one upload at a time, and nothing else while it runs.
+        assert!(ctrl.begin_receiving().is_err());
+        assert!(ctrl.try_start_install().is_err());
+
+        ctrl.install_request(&InstallRequest {
+            bundle_root: root.clone(),
+            target: Some("/dev/fake-emmc".into()),
+            profiles: vec!["Router".into()],
+            reprovision_ufs: false,
+        })
+        .unwrap();
+        let s = ctrl.snapshot();
+        assert_ne!(s.phase, Phase::Receiving);
+        assert_eq!(s.selection.bundle.as_deref(), Some(root.as_str()));
+        assert_eq!(s.selection.target_device.as_deref(), Some("/dev/fake-emmc"));
+        // The request's profiles, not the select-all a fresh bundle gets.
+        assert_eq!(s.selection.profiles, ["Router"]);
+        // The upload is listed among the local bundles, and stays there.
+        assert!(s.catalog.local.items.iter().any(|b| b.id == root));
+
+        // Letting go of the upload must not knock the install off its phase.
+        drop(receiving);
+        assert_ne!(ctrl.snapshot().phase, Phase::Ready);
+        wait_until_idle(&ctrl);
+        ctrl.load_local();
+        assert!(ctrl
+            .snapshot()
+            .catalog
+            .local
+            .items
+            .iter()
+            .any(|b| b.id == root));
+    }
+
+    #[test]
+    fn a_bad_headless_request_hands_the_installer_back() {
+        let (ctrl, root) = headless_fixture("flipperos-controller-headless-bad");
+        {
+            let _receiving = ctrl.begin_receiving().unwrap();
+            let err = ctrl
+                .install_request(&InstallRequest {
+                    bundle_root: root.clone(),
+                    target: Some("/dev/nonexistent".into()),
+                    profiles: Vec::new(),
+                    reprovision_ufs: false,
+                })
+                .unwrap_err();
+            assert!(err.contains("not an installable device"), "{err}");
+        }
+        assert_eq!(ctrl.snapshot().phase, Phase::Ready);
+
+        let err = ctrl
+            .install_request(&InstallRequest {
+                bundle_root: "/nonexistent/bundle".into(),
+                ..InstallRequest::default()
+            })
+            .unwrap_err();
+        assert!(err.contains("does not hold a bundle"), "{err}");
     }
 
     #[test]

@@ -556,10 +556,12 @@ fn render(siv: &mut Cursive, state: &AppState) {
 
     // Once installation starts, the details pane becomes a dedicated install
     // view: a progress bar plus the auto-scrolling activity log. It stays up
-    // through Done/Failed so the outcome (and any error) remain visible.
+    // through Done/Failed so the outcome (and any error) remain visible. A bundle
+    // uploaded over the network gets the same view while it arrives, since its
+    // install follows straight on.
     if matches!(
         state.phase,
-        Phase::Installing | Phase::Done | Phase::Failed(_)
+        Phase::Receiving | Phase::Installing | Phase::Done | Phase::Failed(_)
     ) {
         ensure_install_pane(siv);
         siv.call_on_name("inst_bar", |v: &mut TextView| {

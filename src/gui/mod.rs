@@ -484,10 +484,11 @@ fn apply(win: &MainWindow, state: &AppState) {
     win.set_can_reboot(state.can_reboot());
 
     // The progress bar + log line only appear once installation has started;
-    // until then the freed line shows a discovery/summary count instead.
+    // until then the freed line shows a discovery/summary count instead. A bundle
+    // uploaded over the network shows its upload there too.
     let installing = matches!(
         state.phase,
-        Phase::Installing | Phase::Done | Phase::Failed(_)
+        Phase::Receiving | Phase::Installing | Phase::Done | Phase::Failed(_)
     );
     win.set_installing(installing);
     // Hide Refresh while discovery / install is in flight.
