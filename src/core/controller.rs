@@ -237,6 +237,7 @@ impl Controller {
         log::info!("{line}");
         self.update(|s| {
             s.log.push(line);
+            s.log_seq += 1;
             const MAX: usize = 500;
             if s.log.len() > MAX {
                 let drop = s.log.len() - MAX;
@@ -1537,6 +1538,39 @@ mod tests {
         let s = ctrl.snapshot();
         assert_eq!(s.selection.mcu, None);
         assert!(s.log.iter().any(|l| l.contains("none of the 2 newest")));
+    }
+
+    #[test]
+    fn log_lines_are_numbered_across_the_buffer_cap() {
+        let ctrl = Controller::new(Config::default());
+        ctrl.log("one");
+        ctrl.log("two");
+        let s = ctrl.snapshot();
+        assert_eq!(s.log_seq, 2);
+        assert_eq!(
+            s.log_since(0),
+            (0, &["one".to_string(), "two".to_string()][..])
+        );
+        assert_eq!(s.log_since(1), (0, &["two".to_string()][..]));
+        assert_eq!(s.log_since(2).1.len(), 0);
+        // A cursor from some other numbering is simply up to date.
+        assert_eq!(s.log_since(99), (0, &[][..]));
+
+        // Past the cap the front of the buffer is gone, and a reader whose
+        // cursor points into it learns how many lines it missed.
+        for i in 0..600 {
+            ctrl.log(format!("line {i}"));
+        }
+        let s = ctrl.snapshot();
+        assert_eq!(s.log_seq, 602);
+        assert_eq!(s.log.len(), 500);
+        let (dropped, lines) = s.log_since(2);
+        assert_eq!(dropped, 100);
+        assert_eq!(lines.len(), 500);
+        assert_eq!(lines[0], "line 100");
+        let (dropped, lines) = s.log_since(600);
+        assert_eq!(dropped, 0);
+        assert_eq!(lines, ["line 598".to_string(), "line 599".to_string()]);
     }
 
     #[test]

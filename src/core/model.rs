@@ -790,6 +790,11 @@ pub struct AppState {
     pub progress: f32,
     /// Rolling activity log shared by both frontends.
     pub log: Vec<String>,
+    /// How many lines have ever been logged, including those since dropped from
+    /// the front of [`Self::log`]. The last line of `log` is line `log_seq`, so a
+    /// reader that remembers this number can tell exactly which lines are new
+    /// even after the buffer has wrapped; see [`Self::log_since`].
+    pub log_seq: u64,
     /// Device types we can install onto: in bundle mode the boards the selected
     /// bundle ships U-Boot for, otherwise those from the image server's latest
     /// U-Boot build manifest. Empty until a catalog has been fetched.
@@ -815,6 +820,20 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// The log lines after line `seq`, and how many lines past `seq` are no
+    /// longer in the buffer to be returned.
+    ///
+    /// `seq` is a value of [`Self::log_seq`] seen earlier; `0` asks for
+    /// everything still held. A `seq` from the future (another run's numbering)
+    /// is treated as up to date.
+    pub fn log_since(&self, seq: u64) -> (u64, &[String]) {
+        let new = self.log_seq.saturating_sub(seq);
+        let held = self.log.len() as u64;
+        let dropped = new.saturating_sub(held);
+        let start = (held - new.min(held)) as usize;
+        (dropped, &self.log[start..])
+    }
+
     /// Whether the current selection is complete enough to start flashing.
     /// Minimal is always deployed, so no extra profile selection is required.
     pub fn can_install(&self) -> bool {
