@@ -1322,30 +1322,42 @@ impl Controller {
     /// Kick off the installation on a background thread. Progress and log
     /// updates are pushed to both frontends via the subscriber mechanism.
     pub fn start_install(self: &Arc<Self>) {
-        {
-            let state = self.state.lock().unwrap();
-            if !state.can_install() {
-                drop(state);
-                self.log("cannot start install: incomplete selection");
-                return;
-            }
+        if let Err(e) = self.try_start_install() {
+            self.log(format!("cannot start install: {e}"));
         }
+    }
+
+    /// Start the installation, or say why it cannot start.
+    ///
+    /// The check and the move to [`Phase::Installing`] happen under one lock, so
+    /// of two requests racing each other — a double submit, or two frontends
+    /// pressing Install at once — exactly one starts a run.
+    pub fn try_start_install(self: &Arc<Self>) -> Result<(), String> {
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.phase.is_busy() {
+                return Err(format!("the installer is busy ({})", state.phase.label()));
+            }
+            if !state.can_install() {
+                return Err("incomplete selection".to_string());
+            }
+            state.phase = Phase::Installing;
+            state.progress = 0.0;
+        }
+        self.notify();
         let this = Arc::clone(self);
-        std::thread::spawn(move || {
-            this.set_phase(Phase::Installing);
-            this.set_progress(0.0);
-            match install::run(&this) {
-                Ok(()) => {
-                    this.set_progress(1.0);
-                    this.set_phase(Phase::Done);
-                    this.log("installation complete");
-                }
-                Err(e) => {
-                    this.log(format!("installation failed: {e}"));
-                    this.set_phase(Phase::Failed(e.to_string()));
-                }
+        std::thread::spawn(move || match install::run(&this) {
+            Ok(()) => {
+                this.set_progress(1.0);
+                this.set_phase(Phase::Done);
+                this.log("installation complete");
+            }
+            Err(e) => {
+                this.log(format!("installation failed: {e}"));
+                this.set_phase(Phase::Failed(e.to_string()));
             }
         });
+        Ok(())
     }
 }
 
@@ -1525,6 +1537,21 @@ mod tests {
         let s = ctrl.snapshot();
         assert_eq!(s.selection.mcu, None);
         assert!(s.log.iter().any(|l| l.contains("none of the 2 newest")));
+    }
+
+    #[test]
+    fn an_install_is_refused_while_another_runs() {
+        let ctrl = Controller::new(Config::default());
+        ctrl.update(|s| s.phase = Phase::Ready);
+        assert_eq!(
+            ctrl.try_start_install(),
+            Err("incomplete selection".to_string())
+        );
+        ctrl.update(|s| s.phase = Phase::Installing);
+        let err = ctrl.try_start_install().unwrap_err();
+        assert!(err.contains("busy"), "{err}");
+        // Refused requests leave the running install's phase alone.
+        assert_eq!(ctrl.snapshot().phase, Phase::Installing);
     }
 
     #[test]
