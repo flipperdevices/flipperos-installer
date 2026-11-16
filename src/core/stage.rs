@@ -361,6 +361,22 @@ pub(crate) fn unpack_bundle(
     Ok(())
 }
 
+/// Whether the artifact at `location` is verified where it lies rather than
+/// copied to `dest`.
+///
+/// Anything already inside the scratch directory is ours — an unpacked bundle,
+/// or a previous run's copy kept with `--keep-cache` — so copying it again
+/// would only double its footprint on a filesystem that is usually RAM. Files
+/// anywhere else (removable media, a directory passed with `--bundle`) are
+/// still copied, so the install reads bytes nobody can change under it.
+fn verify_in_place(location: &str, dir: &Path, dest: &Path) -> bool {
+    if fetch::is_url(location) {
+        return false;
+    }
+    let path = Path::new(location);
+    path == dest || path.starts_with(dir)
+}
+
 /// Fetch and verify every artifact in `plan` into the scratch directory.
 pub(crate) fn run(
     cfg: &Config,
@@ -369,13 +385,19 @@ pub(crate) fn run(
     ticker: &mut Ticker,
 ) -> Result<Staged> {
     let dir = PathBuf::from(&cfg.cache_dir);
-    let needed: u64 = plan.iter().map(|a| a.size).sum();
+    let total: u64 = plan.iter().map(|a| a.size).sum();
+    // Only what is copied takes space; what is verified in place has it.
+    let needed: u64 = plan
+        .iter()
+        .filter(|a| !verify_in_place(&a.location, &dir, &dir.join(&a.rel)))
+        .map(|a| a.size)
+        .sum();
 
     if cfg.dry_run {
         ctrl.log(format!(
             "[dry-run] would verify {} artifact(s), {} total, into {}",
             plan.len(),
-            human_bytes(needed),
+            human_bytes(total),
             dir.display()
         ));
         for a in plan {
@@ -400,7 +422,7 @@ pub(crate) fn run(
     ctrl.log(format!(
         "verifying {} artifact(s), {} total, in {}",
         plan.len(),
-        human_bytes(needed),
+        human_bytes(total),
         dir.display(),
     ));
 
@@ -422,9 +444,7 @@ pub(crate) fn run(
             receive_progress(ctrl, format!("verifying {}", a.label), base, span, a.size);
 
         let dest = dir.join(&a.rel);
-        // An artifact already staged locally (an unpacked bundle, or a previous
-        // run with --keep-cache) is verified in place rather than copied.
-        let in_place = !fetch::is_url(&a.location) && Path::new(&a.location) == dest;
+        let in_place = verify_in_place(&a.location, &dir, &dest);
         let mut sha = fetch::Sha256::new();
         {
             let mut reader = fetch::Digesting {
@@ -452,9 +472,12 @@ pub(crate) fn run(
             fetch::verify(sha, a.sha256.as_deref()),
             OnMismatch::Fail,
         )?;
-        staged
-            .map
-            .push((a.location.clone(), dest.to_string_lossy().into_owned()));
+        let at = if in_place {
+            a.location.clone()
+        } else {
+            dest.to_string_lossy().into_owned()
+        };
+        staged.map.push((a.location.clone(), at));
     }
 
     ctrl.log("all artifacts verified; starting the install".to_string());
@@ -673,6 +696,38 @@ mod tests {
         assert_eq!(last.size, 33);
         assert_eq!(last.sha256.as_deref(), Some("cc"));
         assert_eq!(p[p.len() - 2].label, "Desktop (incremental)");
+    }
+
+    #[test]
+    fn verifies_what_is_already_in_the_scratch_dir_in_place() {
+        let dir = Path::new("/run/cache");
+        let dest = dir.join("Minimal_9_stock_pack.zst");
+        // An unpacked bundle lives in a subdirectory of the scratch dir, never at
+        // the staged name itself; copying it again would double its RAM.
+        assert!(verify_in_place(
+            "/run/cache/upload/profile-packs/Minimal_9_stock_pack.zst",
+            dir,
+            &dest
+        ));
+        // A previous run's staged copy.
+        assert!(verify_in_place(
+            "/run/cache/Minimal_9_stock_pack.zst",
+            dir,
+            &dest
+        ));
+        // Removable media and downloads are still copied.
+        assert!(!verify_in_place(
+            "/run/flipperos-media/sda1/b/profile-packs/Minimal_9_stock_pack.zst",
+            dir,
+            &dest
+        ));
+        assert!(!verify_in_place(
+            "https://example.invalid/run/cache/x",
+            dir,
+            &dest
+        ));
+        // A sibling whose name merely starts with the scratch dir's is not in it.
+        assert!(!verify_in_place("/run/cache-other/x", dir, &dest));
     }
 
     #[test]
