@@ -791,13 +791,17 @@ impl Controller {
 
     /// Scan removable media and the `--bundle` paths for local bundles.
     fn load_local(&self) {
+        // Held until the listing is published: a Refresh scanning alongside an
+        // upload must not publish a listing from before the upload was added
+        // over the one that has it.
+        let extra = self.extra_bundles.lock().unwrap();
         self.begin_listing(|c| &mut c.local.state);
         let media = removable::media_roots();
         let paths: Vec<String> = self
             .config
             .bundle_paths
             .iter()
-            .chain(self.extra_bundles.lock().unwrap().iter())
+            .chain(extra.iter())
             .cloned()
             .collect();
         let items = bundle::discover_local(&paths, &media, &self.config.cache_dir);
@@ -811,11 +815,19 @@ impl Controller {
                 state: LoadState::Loaded,
             };
         });
+        drop(extra);
     }
 
     /// Read a bundle's manifest and resolve it into the pinned pair the install
     /// pipeline consumes.
+    ///
+    /// Reading a remote manifest takes a while, so by the time it is in, another
+    /// bundle may have been selected and resolved — by the operator, or by an
+    /// upload taking over from the startup default. The result then describes a
+    /// bundle nobody wants any more and is dropped, rather than replacing the
+    /// one that is selected.
     fn load_bundle(&self, id: &str) {
+        let wanted = |s: &AppState| s.selection.bundle.as_deref().is_none_or(|sel| sel == id);
         let (reference, board_id, mcu_target) = {
             let s = self.state.lock().unwrap();
             match s.bundle_ref_by_id(id) {
@@ -851,6 +863,9 @@ impl Controller {
                     ));
                 }
                 self.update(|s| {
+                    if !wanted(s) {
+                        return;
+                    }
                     s.supported_device_types = bundle.device_types.clone();
                     s.bundle = Some(bundle);
                     s.bundle_error = None;
@@ -860,6 +875,9 @@ impl Controller {
             Err(e) => {
                 self.log(format!("bundle {}: {e}", reference.dir));
                 self.update(|s| {
+                    if !wanted(s) {
+                        return;
+                    }
                     s.bundle = None;
                     s.bundle_error = Some(e);
                 });
@@ -1900,6 +1918,30 @@ mod tests {
             .items
             .iter()
             .any(|b| b.id == root));
+    }
+
+    #[test]
+    fn a_bundle_resolved_after_another_was_picked_is_dropped() {
+        let (ctrl, root) = headless_fixture("flipperos-controller-stale-bundle");
+        ctrl.extra_bundles.lock().unwrap().push(root.clone());
+        ctrl.load_local();
+
+        // Picked while this one was still being read: the pick stands.
+        ctrl.update(|s| s.selection.bundle = Some("nightly/elsewhere".into()));
+        ctrl.load_bundle(&root);
+        let s = ctrl.snapshot();
+        assert!(s.bundle.is_none());
+        assert_eq!(s.selection.bundle.as_deref(), Some("nightly/elsewhere"));
+
+        // The startup default, with nothing picked, and a pick of its own.
+        for selected in [None, Some(root.clone())] {
+            ctrl.update(|s| {
+                s.selection.bundle = selected.clone();
+                s.bundle = None;
+            });
+            ctrl.load_bundle(&root);
+            assert_eq!(ctrl.snapshot().bundle.map(|b| b.name), Some("t".into()));
+        }
     }
 
     #[test]
