@@ -255,7 +255,7 @@ curl -F target=/dev/sda -F profiles=Desktop,Router -F ufs=reprovision \
 |---|---|
 | `POST`/`PUT /install` | Takes `target` (default: the current selection), `profiles` (default `all`) and `ufs` (`keep`, the default, or `reprovision`) with the bundle. Streams back the installation log as `text/plain`, ending in `status: done` or `status: failed: <reason>`. A request refused before the install starts gets a 4xx and `error: <reason>`: `409` when the installer is busy (still probing the hardware, or installing — but not merely looking for bundles of its own, which an upload does not wait for), `422` for a bundle or setting that cannot be installed, `507` when it does not fit. With `Expect: 100-continue` (which curl sends for large uploads) the query-string settings are checked before a byte of the bundle is sent. |
 | `GET /log` | The activity log; `?since=N` starts after line `N`, and it follows a running install to its end (`?follow=1`: until the client hangs up). |
-| `GET /status` | JSON: phase, progress, board, MCU, devices, selection, `log_seq`, `can_reboot`. |
+| `GET /status` | JSON: phase, progress, board, MCU, devices, selection, `log_seq`, `can_reboot`, and `can_upload`, which says whether `/install` would take a bundle now — the thing to wait for before sending one. (`can_install` answers for the device's own menus, which also need a bundle selected there, so it stays false on an installer that found none of its own.) |
 | `POST /reboot` | Reboot into the installed system, once a real install is done. |
 
 The kernel booting the installer needs the configfs NCM gadget built in

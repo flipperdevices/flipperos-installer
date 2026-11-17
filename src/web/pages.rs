@@ -229,7 +229,7 @@ pub fn index(state: &AppState, values: &FormValues, error: Option<&str>, host: &
          <code>status: done</code> or <code>status: failed: …</code>. A request refused \
          before the install starts gets a 4xx status and one line <code>error: …</code>. \
          Add <code>ufs=reprovision</code> to rewrite a mismatched UFS device.</p>\n\
-         <pre>curl {base}/status            # JSON: phase, progress, devices…\n\
+         <pre>curl {base}/status            # JSON: can_upload, phase, progress, devices…\n\
          curl '{base}/log?follow=1'      # the log, following a running install\n\
          curl -X POST {base}/reboot      # once an install is done</pre>\n</details>\n"
     );

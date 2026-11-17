@@ -421,6 +421,11 @@ fn status(s: &AppState) -> serde_json::Value {
         })),
         "profiles": s.selection.profiles,
         "log_seq": s.log_seq,
+        // Whether `/install` would take a bundle now. `can_install` is a
+        // different question — whether Install on the device's own menus would
+        // start, which also needs a bundle selected there — and stays false
+        // for an idle installer that has found no bundle of its own.
+        "can_upload": s.phase.accepts_upload(),
         "can_install": s.can_install(),
         "can_reboot": s.can_reboot(),
     })
@@ -689,5 +694,27 @@ mod tests {
         assert_eq!(status_line(&s), "status: failed: disk on fire\n");
         s.phase = Phase::Done;
         assert_eq!(status_line(&s), "status: done\n");
+    }
+
+    #[test]
+    fn says_when_an_upload_would_be_taken() {
+        for (phase, upload) in [
+            (Phase::Discovering, false),
+            (Phase::Searching, true),
+            (Phase::Ready, true),
+            (Phase::Receiving, false),
+            (Phase::Installing, false),
+            (Phase::Done, true),
+            (Phase::Failed("x".into()), true),
+        ] {
+            let s = AppState {
+                phase,
+                ..AppState::default()
+            };
+            let v = status(&s);
+            assert_eq!(v["can_upload"], upload, "{}", v["phase"]);
+            // Nothing selected on the device, so its menus could not install.
+            assert_eq!(v["can_install"], false);
+        }
     }
 }
