@@ -201,10 +201,13 @@ pub struct Keep {
 /// A bundle lists the manifest first, so normally nothing unwanted is ever
 /// written; a manifest at the end costs a transient full unpack, not a failure.
 ///
-/// Every kept file is hashed as it is written. The unpack fails if there was no
-/// manifest, if a file the manifest lists and the filter keeps is missing, or if
-/// one's digest does not match. On any failure `dest` is removed, so nothing is
-/// left behind on what is usually a tmpfs.
+/// Every kept file is hashed as it is written, and checked against the manifest
+/// as soon as both are in: at once, behind the manifest, or when the manifest
+/// arrives, ahead of it. So a corrupt file fails the unpack before the rest of
+/// the stream is read, not at its end. The unpack also fails if there was no
+/// manifest, or if a file the manifest lists and the filter keeps is missing.
+/// On any failure `dest` is removed, so nothing is left behind on what is
+/// usually a tmpfs.
 ///
 /// `on_progress` is called with the running total of uncompressed bytes written.
 pub fn unpack_stream<R: Read>(
@@ -260,7 +263,8 @@ fn unpack_stream_inner<R: Read>(
                 return Err(format!("{MANIFEST} is larger than {MANIFEST_MAX} bytes"));
             }
             let k = on_manifest(&bytes)?;
-            // Drop what arrived ahead of the manifest and is not wanted.
+            // Drop what arrived ahead of the manifest and is not wanted, and
+            // check what is.
             written.retain(|rel, _| {
                 let wanted = (k.filter)(rel);
                 if !wanted {
@@ -268,6 +272,11 @@ fn unpack_stream_inner<R: Read>(
                 }
                 wanted
             });
+            let mut early: Vec<_> = written.iter().collect();
+            early.sort();
+            for (rel, got) in early {
+                check_digest(&k, rel, got)?;
+            }
             let out_path = dest.join(&rel);
             fs::write(&out_path, &bytes)
                 .map_err(|e| format!("write {}: {e}", out_path.display()))?;
@@ -303,32 +312,44 @@ fn unpack_stream_inner<R: Read>(
             total += n as u64;
             on_progress(total);
         }
-        written.insert(rel, sha.finish_hex());
+        let got = sha.finish_hex();
+        // With the manifest in, a corrupt file ends the upload now rather than
+        // after the gigabytes behind it.
+        if let Some(k) = &keep {
+            check_digest(k, &rel, &got)?;
+        }
+        written.insert(rel, got);
     }
 
     let Some(keep) = keep else {
         return Err(format!("no {MANIFEST} in {what}"));
     };
-    let mut expected: Vec<_> = keep.expected.iter().collect();
+    // Every file written was checked as it came; what is left is whether
+    // every file wanted came at all.
+    let mut expected: Vec<_> = keep.expected.keys().collect();
     expected.sort();
-    for (rel, digest) in expected {
-        let Some(got) = written.get(rel) else {
+    for rel in expected {
+        if !written.contains_key(rel) {
             return Err(format!(
                 "{} is listed in the manifest but missing from the archive",
                 rel.display()
             ));
-        };
-        if let Some(want) = digest {
-            if !want.eq_ignore_ascii_case(got) {
-                return Err(format!(
-                    "{} is corrupt: SHA-256 {got}, the manifest says {}",
-                    rel.display(),
-                    want.to_ascii_lowercase()
-                ));
-            }
         }
     }
     Ok(total)
+}
+
+/// Check a file's SHA-256 against the one the manifest publishes for it. A file
+/// the manifest does not list, or lists with no digest, passes.
+fn check_digest(keep: &Keep, rel: &Path, got: &str) -> Result<()> {
+    match keep.expected.get(rel) {
+        Some(Some(want)) if !want.eq_ignore_ascii_case(got) => Err(format!(
+            "{} is corrupt: SHA-256 {got}, the manifest says {}",
+            rel.display(),
+            want.to_ascii_lowercase()
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// Delete `dest/rel`, then each directory above it that this leaves empty, up to
@@ -563,6 +584,37 @@ mod tests {
         let err = r.unwrap_err();
         assert!(err.contains("Minimal_9_stock_pack.zst is corrupt"), "{err}");
         assert!(!dest.exists());
+    }
+
+    #[test]
+    fn a_corrupt_member_ends_the_unpack_at_once() {
+        let tail = vec![0u8; 1 << 20];
+        // Corrupt behind the manifest, and corrupt ahead of it: either way the
+        // megabyte that follows is never read.
+        for manifest_first in [true, false] {
+            let mut members: Vec<(&str, &[u8])> = vec![
+                ("b/u-boot/flipper-one/u-boot-rockchip.bin", b"uboot"),
+                ("b/profile-packs/Minimal_9_stock_pack.zst", b"fu11"),
+            ];
+            let manifest = ("b/manifest.json", &br#"{"schema":1}"#[..]);
+            if manifest_first {
+                members.insert(0, manifest);
+            } else {
+                members.push(manifest);
+            }
+            members.push(("b/profile-packs/Desktop_9_stock_inc_pack.zst", &tail));
+            let dest = scratch("stream-corrupt-early").join("out");
+            let mut furthest = 0;
+            let r = unpack_stream(
+                &tar_zst(&members)[..],
+                &dest,
+                &mut keep_flipper_one,
+                &mut |n| furthest = n,
+            );
+            let err = r.unwrap_err();
+            assert!(err.contains("Minimal_9_stock_pack.zst is corrupt"), "{err}");
+            assert!(furthest < tail.len() as u64, "read {furthest} bytes");
+        }
     }
 
     #[test]
