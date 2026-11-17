@@ -254,7 +254,11 @@ impl Verdict {
 /// Compare a computed digest against the expected one from a manifest,
 /// case-insensitively. `expected` of `None` means the manifest published none.
 pub fn verify(computed: Sha256, expected: Option<&str>) -> Verdict {
-    let got = computed.finish_hex();
+    verdict(computed.finish_hex(), expected)
+}
+
+/// [`verify`] for a digest already in hex, taken elsewhere.
+pub fn verdict(got: String, expected: Option<&str>) -> Verdict {
     match expected {
         None => Verdict::Unpublished,
         Some(want) if want.eq_ignore_ascii_case(&got) => Verdict::Match,

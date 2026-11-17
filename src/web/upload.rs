@@ -340,12 +340,13 @@ fn receive<'a>(
     let result = archive::unpack_stream(&mut counted, &dest, &mut on_manifest, &mut |_| {});
     let received = counted.n;
     match result {
-        Ok(written) => {
+        Ok(unpacked) => {
             ctx.ctrl.log(format!(
-                "upload: received {} ({} unpacked)",
+                "upload: received {} ({} unpacked, every file checked)",
                 human_bytes(received),
-                human_bytes(written)
+                human_bytes(unpacked.bytes)
             ));
+            ctx.ctrl.note_unpacked(&dest, unpacked.sha256);
             Ok(Received {
                 _guard: guard,
                 dest,

@@ -467,6 +467,21 @@ pub(crate) fn run(
 
         let dest = dir.join(&a.rel);
         let in_place = verify_in_place(&a.location, &dir, &dest);
+        // Hashed already as it was unpacked here, and unchanged since.
+        let noted = in_place
+            .then(|| ctrl.unpacked_sha256(Path::new(&a.location)))
+            .flatten();
+        if let Some(got) = noted {
+            on_progress(a.size);
+            match fetch::verdict(got, a.sha256.as_deref()) {
+                fetch::Verdict::Match => {
+                    ctrl.log(format!("{}: sha256 verified as it arrived", a.label))
+                }
+                verdict => apply_verdict(ctrl, &a.label, verdict, OnMismatch::Fail)?,
+            }
+            staged.map.push((a.location.clone(), a.location.clone()));
+            continue;
+        }
         let mut sha = fetch::Sha256::new();
         {
             let mut reader = fetch::Digesting {
@@ -547,6 +562,7 @@ fn copy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn pack(name: &str, size: u64, sha: Option<&str>) -> PackFile {
         PackFile {
@@ -941,6 +957,57 @@ mod tests {
             log.contains("no sha256 published for home_9_pack.zst"),
             "an unpublished digest must be called out: {log}"
         );
+    }
+
+    #[test]
+    fn takes_the_digest_of_what_was_unpacked_here() {
+        let cache = Scratch::new("unpacked-cache");
+        let ctrl = controller(&cache);
+        fs::create_dir_all(cache.path("upload")).unwrap();
+        let in_upload = |name: &str, body: &[u8], sha: String| {
+            let path = cache.path(&format!("upload/{name}"));
+            fs::write(&path, body).unwrap();
+            Artifact {
+                label: name.to_string(),
+                location: path.to_string_lossy().into_owned(),
+                source: Source::Local { root: cache.str() },
+                sha256: Some(sha),
+                size: body.len() as u64,
+                rel: name.to_string(),
+            }
+        };
+        let plan = vec![
+            in_upload("kept.zst", b"pack bytes", digest(b"pack bytes")),
+            in_upload("changed.zst", b"old bytes", digest(b"new bytes, longer")),
+        ];
+        ctrl.note_unpacked(
+            &cache.path("upload"),
+            HashMap::from([
+                (PathBuf::from("kept.zst"), digest(b"pack bytes")),
+                (PathBuf::from("changed.zst"), digest(b"old bytes")),
+            ]),
+        );
+        // Rewritten after it was noted: its digest no longer stands for it.
+        fs::write(cache.path("upload/changed.zst"), b"new bytes, longer").unwrap();
+
+        let mut ticker = Ticker::new(plan.iter().map(|a| a.size).sum());
+        run(ctrl.config(), &ctrl, &plan, &mut ticker).expect("staging succeeds");
+        let log = ctrl.snapshot().log.join("\n");
+        assert!(
+            log.contains("kept.zst: sha256 verified as it arrived"),
+            "{log}"
+        );
+        assert!(log.contains("changed.zst: sha256 verified\n"), "{log}");
+
+        // A noted digest is held to the manifest like a computed one.
+        let plan = vec![in_upload("kept.zst", b"pack bytes", digest(b"other"))];
+        ctrl.note_unpacked(
+            &cache.path("upload"),
+            HashMap::from([(PathBuf::from("kept.zst"), digest(b"pack bytes"))]),
+        );
+        let mut ticker = Ticker::new(plan[0].size);
+        let err = run(ctrl.config(), &ctrl, &plan, &mut ticker).err().unwrap();
+        assert!(err.contains("sha256 mismatch for kept.zst"), "{err}");
     }
 
     #[test]

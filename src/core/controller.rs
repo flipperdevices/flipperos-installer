@@ -7,9 +7,11 @@
 //! on-device screen). All mutation goes through methods on `Controller`, which
 //! lock the state, apply the change and then notify subscribers.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use crate::core::menu::LoadRequest;
 use crate::core::model::*;
@@ -142,6 +144,16 @@ pub struct Controller {
     /// back to that rather than to [`Phase::Ready`]. Changed and read only
     /// under the state lock, together with the phase.
     searching: AtomicBool,
+    /// The SHA-256 of files written into the scratch directory, taken as they
+    /// were written, by absolute path. See [`Controller::note_unpacked`].
+    unpacked: Mutex<HashMap<PathBuf, Unpacked>>,
+}
+
+/// A file's digest as it was written, and how the file looked then.
+struct Unpacked {
+    sha256: String,
+    len: u64,
+    modified: SystemTime,
 }
 
 /// An installation asked for in one go, by a frontend that cannot walk the
@@ -215,7 +227,46 @@ impl Controller {
             reboot_requested: AtomicBool::new(false),
             extra_bundles: Mutex::new(Vec::new()),
             searching: AtomicBool::new(false),
+            unpacked: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Remember the SHA-256 of every file just unpacked into `dest`, by path
+    /// relative to it, replacing whatever was noted there before.
+    ///
+    /// Staging verifies a file it finds noted from the digest, rather than
+    /// reading it back: the bytes were hashed on their way in, and reading a
+    /// gigabyte of tmpfs again would only hash them twice.
+    pub fn note_unpacked(&self, dest: &Path, sha256: HashMap<PathBuf, String>) {
+        let mut noted = self.unpacked.lock().unwrap();
+        noted.retain(|path, _| !path.starts_with(dest));
+        for (rel, sha256) in sha256 {
+            let path = dest.join(rel);
+            let Ok(meta) = std::fs::metadata(&path) else {
+                continue;
+            };
+            let Ok(modified) = meta.modified() else {
+                continue;
+            };
+            noted.insert(
+                path,
+                Unpacked {
+                    sha256,
+                    len: meta.len(),
+                    modified,
+                },
+            );
+        }
+    }
+
+    /// The SHA-256 noted for `path` by [`Self::note_unpacked`], unless the file
+    /// has changed since, by its size or modification time.
+    pub fn unpacked_sha256(&self, path: &Path) -> Option<String> {
+        let noted = self.unpacked.lock().unwrap();
+        let entry = noted.get(path)?;
+        let meta = std::fs::metadata(path).ok()?;
+        (meta.len() == entry.len && meta.modified().ok()? == entry.modified)
+            .then(|| entry.sha256.clone())
     }
 
     pub fn config(&self) -> &Config {

@@ -186,6 +186,17 @@ pub struct Keep {
     pub expected: HashMap<PathBuf, Option<String>>,
 }
 
+/// What [`unpack_stream`] wrote.
+#[derive(Debug)]
+pub struct Unpacked {
+    /// Uncompressed bytes written.
+    pub bytes: u64,
+    /// The SHA-256 of every file kept, by its path relative to `dest`, taken
+    /// as it was written — so whoever verifies them next need not read them
+    /// back to know it.
+    pub sha256: HashMap<PathBuf, String>,
+}
+
 /// Unpack a `tar.zst` *stream* into `dest`, keeping only what the manifest calls
 /// for, and verifying every kept file against the manifest on the way.
 ///
@@ -215,7 +226,7 @@ pub fn unpack_stream<R: Read>(
     dest: &Path,
     on_manifest: &mut dyn FnMut(&[u8]) -> Result<Keep>,
     on_progress: &mut dyn FnMut(u64),
-) -> Result<u64> {
+) -> Result<Unpacked> {
     let result = unpack_stream_inner(reader, dest, on_manifest, on_progress);
     if result.is_err() {
         let _ = fs::remove_dir_all(dest);
@@ -228,7 +239,7 @@ fn unpack_stream_inner<R: Read>(
     dest: &Path,
     on_manifest: &mut dyn FnMut(&[u8]) -> Result<Keep>,
     on_progress: &mut dyn FnMut(u64),
-) -> Result<u64> {
+) -> Result<Unpacked> {
     let what = "the bundle";
     fs::create_dir_all(dest).map_err(|e| format!("create {}: {e}", dest.display()))?;
     let mut ar = entries(reader, what)?;
@@ -336,7 +347,10 @@ fn unpack_stream_inner<R: Read>(
             ));
         }
     }
-    Ok(total)
+    Ok(Unpacked {
+        bytes: total,
+        sha256: written,
+    })
 }
 
 /// Check a file's SHA-256 against the one the manifest publishes for it. A file
@@ -528,7 +542,7 @@ mod tests {
         name: &str,
         members: &[(&str, &[u8])],
         on_manifest: &mut dyn FnMut(&[u8]) -> Result<Keep>,
-    ) -> (PathBuf, Result<u64>) {
+    ) -> (PathBuf, Result<Unpacked>) {
         let dir = scratch(name);
         let dest = dir.join("out");
         let bytes = tar_zst(members);
@@ -545,7 +559,25 @@ mod tests {
             seen = Some(m.to_vec());
             keep_flipper_one(m)
         });
-        r.unwrap();
+        let unpacked = r.unwrap();
+        // The digest of every file kept, and only of those.
+        assert_eq!(
+            unpacked.sha256,
+            HashMap::from([
+                (
+                    PathBuf::from("u-boot/flipper-one/u-boot-rockchip.bin"),
+                    sha(b"uboot")
+                ),
+                (
+                    PathBuf::from("profile-packs/Minimal_9_stock_pack.zst"),
+                    sha(b"full")
+                ),
+                (
+                    PathBuf::from("notes.txt"),
+                    sha(b"kept, though nobody asked")
+                ),
+            ])
+        );
         assert_eq!(seen.as_deref(), Some(&br#"{"schema":1}"#[..]));
         assert!(dest.join("manifest.json").is_file());
         assert_eq!(
@@ -562,7 +594,10 @@ mod tests {
         let mut members = MEMBERS.to_vec();
         members.push(("b/manifest.json", br#"{"schema":1}"#));
         let (dest, r) = stream_into("stream-last", &members, &mut keep_flipper_one);
-        r.unwrap();
+        let unpacked = r.unwrap();
+        assert!(!unpacked
+            .sha256
+            .contains_key(Path::new("u-boot/evb/u-boot-rockchip.bin")));
         assert!(dest.join("manifest.json").is_file());
         assert!(dest
             .join("profile-packs/Minimal_9_stock_pack.zst")
