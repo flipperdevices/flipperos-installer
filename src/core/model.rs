@@ -702,9 +702,13 @@ pub struct Selection {
 /// High-level state machine of the installer.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Phase {
-    /// Probing hardware and sources.
+    /// Probing the board, its MCU and its storage.
     #[default]
     Discovering,
+    /// The hardware is known; looking for bundles on removable media and the
+    /// update server. The menus wait, as their lists are still filling, but an
+    /// upload, which brings its own bundle, need not.
+    Searching,
     /// Idle, waiting for the operator to make selections.
     Ready,
     /// Rewriting a UFS target's logical units before an install can start.
@@ -724,6 +728,7 @@ impl Phase {
     pub fn label(&self) -> String {
         match self {
             Phase::Discovering => "discovering…".to_string(),
+            Phase::Searching => "looking for bundles…".to_string(),
             Phase::Ready => "ready".to_string(),
             Phase::Provisioning => "provisioning…".to_string(),
             Phase::Receiving => "receiving bundle…".to_string(),
@@ -736,8 +741,18 @@ impl Phase {
     pub fn is_busy(&self) -> bool {
         matches!(
             self,
-            Phase::Discovering | Phase::Provisioning | Phase::Receiving | Phase::Installing
+            Phase::Discovering
+                | Phase::Searching
+                | Phase::Provisioning
+                | Phase::Receiving
+                | Phase::Installing
         )
+    }
+
+    /// Whether a bundle upload may start: whenever the installer is idle, and
+    /// already while it is still looking for bundles of its own.
+    pub fn accepts_upload(&self) -> bool {
+        *self == Phase::Searching || !self.is_busy()
     }
 }
 

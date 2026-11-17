@@ -93,7 +93,7 @@ pub fn index(state: &AppState, values: &FormValues, error: Option<&str>, host: &
          cable and install it onto the device's storage — no network needed.</p>\n",
     );
     out.push_str(dry_run_callout(state));
-    if state.phase.is_busy() {
+    if !state.phase.accepts_upload() {
         let _ = writeln!(
             out,
             "<div class=\"callout warn\"><p>The installer is busy ({}). \

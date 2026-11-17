@@ -137,6 +137,11 @@ pub struct Controller {
     /// Bundle directories registered while running (an uploaded bundle), listed
     /// alongside [`Config::bundle_paths`] so a Refresh does not lose them.
     extra_bundles: Mutex<Vec<String>>,
+    /// Whether the startup search for bundles is still running, so an upload
+    /// that took the installer from [`Phase::Searching`] and failed hands it
+    /// back to that rather than to [`Phase::Ready`]. Changed and read only
+    /// under the state lock, together with the phase.
+    searching: AtomicBool,
 }
 
 /// An installation asked for in one go, by a frontend that cannot walk the
@@ -156,7 +161,8 @@ pub struct InstallRequest {
 
 /// Holds the installer in [`Phase::Receiving`] while a bundle is uploaded.
 ///
-/// Dropping it hands the installer back — to [`Phase::Ready`], unless the
+/// Dropping it hands the installer back — to [`Phase::Ready`], or to
+/// [`Phase::Searching`] if the startup search is not done yet — unless the
 /// upload went on to start an install, which then owns the phase.
 pub struct Receiving<'a> {
     ctrl: &'a Controller,
@@ -175,9 +181,14 @@ impl Receiving<'_> {
 
 impl Drop for Receiving<'_> {
     fn drop(&mut self) {
+        let searching = &self.ctrl.searching;
         self.ctrl.update(|s| {
             if s.phase == Phase::Receiving {
-                s.phase = Phase::Ready;
+                s.phase = if searching.load(Ordering::Relaxed) {
+                    Phase::Searching
+                } else {
+                    Phase::Ready
+                };
                 s.progress = 0.0;
             }
         });
@@ -203,6 +214,7 @@ impl Controller {
             exit_hooks: Mutex::new(Vec::new()),
             reboot_requested: AtomicBool::new(false),
             extra_bundles: Mutex::new(Vec::new()),
+            searching: AtomicBool::new(false),
         })
     }
 
@@ -379,6 +391,31 @@ impl Controller {
             self.check_ufs_provisioning(&path, Offer::ReportOnly);
         }
         self.discover_blank_ufs();
+
+        self.begin_search();
+    }
+
+    /// Move on from discovery to [`Phase::Searching`]: everything an upload
+    /// is checked against is known now, and the search for bundles that
+    /// follows is for the menus.
+    fn begin_search(&self) {
+        self.update(|s| {
+            if s.phase == Phase::Discovering {
+                self.searching.store(true, Ordering::Relaxed);
+                s.phase = Phase::Searching;
+            }
+        });
+    }
+
+    /// End the search for bundles, and with it the startup, unless an upload
+    /// has taken the installer meanwhile.
+    fn end_search(&self) {
+        self.update(|s| {
+            self.searching.store(false, Ordering::Relaxed);
+            if matches!(s.phase, Phase::Discovering | Phase::Searching) {
+                s.phase = Phase::Ready;
+            }
+        });
     }
 
     /// Look for a UFS controller whose device has no logical units at all.
@@ -462,11 +499,7 @@ impl Controller {
             }
         }
 
-        self.update(|s| {
-            if matches!(s.phase, Phase::Discovering) {
-                s.phase = Phase::Ready;
-            }
-        });
+        self.end_search();
     }
 
     /// Query the image server and any removable-media mirror for U-Boot and
@@ -1463,11 +1496,12 @@ impl Controller {
     /// Claim the installer for a bundle upload: [`Phase::Receiving`] until the
     /// returned guard is dropped, or until [`Self::install_request`] turns it
     /// into an install. Refused while anything else is running, including
-    /// another upload.
+    /// another upload, but not while the installer is still looking for
+    /// bundles of its own: an upload needs none of them.
     pub fn begin_receiving(&self) -> Result<Receiving<'_>, String> {
         {
             let mut state = self.state.lock().unwrap();
-            if state.phase.is_busy() {
+            if !state.phase.accepts_upload() {
                 return Err(format!("the installer is busy ({})", state.phase.label()));
             }
             state.phase = Phase::Receiving;
@@ -1918,6 +1952,30 @@ mod tests {
             .items
             .iter()
             .any(|b| b.id == root));
+    }
+
+    #[test]
+    fn an_upload_need_not_wait_for_the_search_for_bundles() {
+        let (ctrl, _) = headless_fixture("flipperos-controller-searching");
+        // Discovery proper is another matter: the upload is checked against it.
+        ctrl.update(|s| s.phase = Phase::Discovering);
+        assert!(ctrl.begin_receiving().is_err());
+
+        // Where discovery leaves it: the hardware known, the search under way.
+        ctrl.begin_search();
+        assert_eq!(ctrl.snapshot().phase, Phase::Searching);
+        assert!(ctrl.try_start_install().is_err());
+
+        // An upload that comes to nothing hands back the search still running.
+        drop(ctrl.begin_receiving().unwrap());
+        assert_eq!(ctrl.snapshot().phase, Phase::Searching);
+
+        // The search ends under an upload: the upload hands back an idle one.
+        let receiving = ctrl.begin_receiving().unwrap();
+        ctrl.end_search();
+        assert_eq!(ctrl.snapshot().phase, Phase::Receiving);
+        drop(receiving);
+        assert_eq!(ctrl.snapshot().phase, Phase::Ready);
     }
 
     #[test]

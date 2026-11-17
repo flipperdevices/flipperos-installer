@@ -235,7 +235,7 @@ fn set_field(values: &mut FormValues, name: &str, value: &str) -> Result<(), Ref
 
 /// What can be checked before a byte of the bundle has been read.
 fn precheck(state: &AppState, values: &FormValues) -> Result<(), Refusal> {
-    if state.phase.is_busy() {
+    if !state.phase.accepts_upload() {
         return Err(Refusal::new(
             409,
             format!("the installer is busy ({})", state.phase.label()),
@@ -583,5 +583,10 @@ mod tests {
         v.target = Some("/dev/mmcblk0".into());
         s.phase = crate::core::model::Phase::Installing;
         assert_eq!(precheck(&s, &v).unwrap_err().status, 409);
+        s.phase = crate::core::model::Phase::Discovering;
+        assert_eq!(precheck(&s, &v).unwrap_err().status, 409);
+        // Still looking for bundles, which an upload does not need.
+        s.phase = crate::core::model::Phase::Searching;
+        assert!(precheck(&s, &v).is_ok());
     }
 }

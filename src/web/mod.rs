@@ -386,6 +386,7 @@ fn status_line(state: &AppState) -> String {
 fn status(s: &AppState) -> serde_json::Value {
     let phase = match s.phase {
         Phase::Discovering => "discovering",
+        Phase::Searching => "searching",
         Phase::Ready => "ready",
         Phase::Provisioning => "provisioning",
         Phase::Receiving => "receiving",
