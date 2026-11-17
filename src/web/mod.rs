@@ -42,6 +42,7 @@ use serde_json::json;
 use crate::core::model::{AppState, Phase};
 use crate::core::Controller;
 use crate::net::{self, Subnet};
+use crate::version;
 
 use hub::Hub;
 
@@ -399,6 +400,8 @@ fn status(s: &AppState) -> serde_json::Value {
         _ => None,
     };
     json!({
+        "version": version::VERSION,
+        "revision": version::revision(),
         "phase": phase,
         "phase_label": s.phase.label(),
         "error": error,
@@ -687,6 +690,8 @@ mod tests {
             ..AppState::default()
         };
         let v = status(&s);
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(v["revision"].as_str(), version::revision());
         assert_eq!(v["phase"], "failed");
         assert_eq!(v["error"], "disk on fire");
         assert_eq!(v["log_seq"], 42);

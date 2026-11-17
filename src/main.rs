@@ -12,6 +12,7 @@ use std::sync::Arc;
 use flipperos_installer::core::model::{FetchMode, InstallMode};
 use flipperos_installer::core::power;
 use flipperos_installer::core::{Config, Controller};
+use flipperos_installer::version;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FrontendChoice {
@@ -38,7 +39,7 @@ type WebHandle = Option<std::thread::JoinHandle<bool>>;
 fn main() -> ExitCode {
     let args = match parse_args() {
         Ok(Some(args)) => args,
-        Ok(None) => return ExitCode::SUCCESS, // --help
+        Ok(None) => return ExitCode::SUCCESS, // --help, --version
         Err(e) => {
             eprintln!("error: {e}\n");
             print_usage();
@@ -47,6 +48,8 @@ fn main() -> ExitCode {
     };
 
     let controller = Controller::new(args.config);
+    // First in the log, so any report quoting the log says which build it was.
+    controller.log(format!("flipperos-installer {}", version::describe()));
 
     // Discover hardware and sources off the UI thread; results stream into both
     // frontends via the controller's subscribers.
@@ -273,6 +276,10 @@ fn parse_args() -> Result<Option<Args>, String> {
                 print_usage();
                 return Ok(None);
             }
+            "-V" | "--version" => {
+                println!("flipperos-installer {}", version::describe());
+                return Ok(None);
+            }
             "--tui" => frontend = FrontendChoice::Tui,
             "--gui" => frontend = FrontendChoice::Gui,
             "--both" => frontend = FrontendChoice::Both,
@@ -421,6 +428,7 @@ OPTIONS:\n\
     --dry-run          Log destructive steps without executing them (default)\n\
     --no-dry-run       Actually perform destructive operations\n\
     --debug-keys       Log each GUI keypress to stderr (input debugging)\n\
+    -V, --version      Print the version and the commit it was built from\n\
     -h, --help         Show this help\n"
     );
 }

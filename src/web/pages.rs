@@ -9,6 +9,7 @@
 use std::fmt::Write;
 
 use crate::core::model::{human_bytes, AppState, Phase};
+use crate::version;
 
 /// What the form was last submitted with, to put back on a page that refuses
 /// it.
@@ -134,7 +135,8 @@ pub fn index(state: &AppState, values: &FormValues, error: Option<&str>, host: &
     }
     let _ = writeln!(
         out,
-        "<dt>Installer</dt><dd>{}</dd></dl></section>",
+        "<dt>Installer</dt><dd>{}</dd><dt>State</dt><dd>{}</dd></dl></section>",
+        escape(&version::describe()),
         escape(&state.phase.label())
     );
 

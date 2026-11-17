@@ -1,6 +1,7 @@
 //! FlipperOS installer library: the installer engine plus optional frontends.
 
 pub mod core;
+pub mod version;
 
 #[cfg(feature = "gui")]
 pub mod gui;
